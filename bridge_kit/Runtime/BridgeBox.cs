@@ -11,10 +11,17 @@ namespace HtmlToUxml.Bridge
     //   --gg-gradient (string: linear-gradient(...))
     //
     // If none are set the element behaves exactly like a plain VisualElement.
+#if UNITY_2023_2_OR_NEWER
+    [UxmlElement]
+    public partial class BridgeBox : VisualElement
+#else
     public class BridgeBox : VisualElement
+#endif
     {
+#if !UNITY_2023_2_OR_NEWER
         public new class UxmlFactory : UxmlFactory<BridgeBox, UxmlTraits> { }
         public new class UxmlTraits : VisualElement.UxmlTraits { }
+#endif
 
         static readonly CustomStyleProperty<float> ShadowOffsetX = new CustomStyleProperty<float>("--gg-shadow-offset-x");
         static readonly CustomStyleProperty<float> ShadowOffsetY = new CustomStyleProperty<float>("--gg-shadow-offset-y");
@@ -22,6 +29,12 @@ namespace HtmlToUxml.Bridge
         static readonly CustomStyleProperty<Color> ShadowColor   = new CustomStyleProperty<Color>("--gg-shadow-color");
         static readonly CustomStyleProperty<string> Gradient     = new CustomStyleProperty<string>("--gg-gradient");
         static readonly CustomStyleProperty<string> ClipPolygon  = new CustomStyleProperty<string>("--gg-clip-polygon");
+        static readonly CustomStyleProperty<float>  RowGap        = new CustomStyleProperty<float>("--gg-row-gap");
+        static readonly CustomStyleProperty<float>  ColumnGap     = new CustomStyleProperty<float>("--gg-column-gap");
+
+        float _rowGap;
+        float _columnGap;
+        bool  _hasGap;
 
         Vector2 _shadowOffset;
         float   _shadowBlur;
@@ -35,6 +48,7 @@ namespace HtmlToUxml.Bridge
         public BridgeBox()
         {
             RegisterCallback<CustomStyleResolvedEvent>(OnStylesResolved);
+            RegisterCallback<GeometryChangedEvent>(_ => ApplyGap());
             generateVisualContent += OnGenerateVisualContent;
         }
 
@@ -63,7 +77,40 @@ namespace HtmlToUxml.Bridge
                 ? PolygonParser.Parse(clipStr)
                 : null;
 
+            float rg = 0f, cg = 0f;
+            bool gapAny = false;
+            if (style.TryGetValue(RowGap, out var rgv))    { rg = rgv; gapAny = true; }
+            if (style.TryGetValue(ColumnGap, out var cgv)) { cg = cgv; gapAny = true; }
+            _rowGap = rg;
+            _columnGap = cg;
+            _hasGap = gapAny;
+            ApplyGap();
+
             MarkDirtyRepaint();
+        }
+
+        void ApplyGap()
+        {
+            if (!_hasGap || childCount < 2) return;
+            // Pick spacing axis from flex-direction. Row -> column-gap as left margin
+            // on every child after the first; Column -> row-gap as top margin.
+            bool isColumn = resolvedStyle.flexDirection == FlexDirection.Column
+                         || resolvedStyle.flexDirection == FlexDirection.ColumnReverse;
+            float spacing = isColumn ? _rowGap : _columnGap;
+            for (int i = 0; i < childCount; i++)
+            {
+                var c = ElementAt(i);
+                if (i == 0)
+                {
+                    if (isColumn) c.style.marginTop = 0f;
+                    else          c.style.marginLeft = 0f;
+                }
+                else
+                {
+                    if (isColumn) c.style.marginTop = spacing;
+                    else          c.style.marginLeft = spacing;
+                }
+            }
         }
 
         void OnGenerateVisualContent(MeshGenerationContext ctx)

@@ -231,6 +231,17 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
     is_italic = False
     has_font_style_decl = False
 
+    input_props = {p.lower() for p, _ in decls}
+    # CSS default for `display: flex` is `flex-direction: row`. USS default is
+    # `column`. Backfill row when the author relied on the CSS default and didn't
+    # declare flex-direction explicitly.
+    needs_row_default = (
+        "display" in input_props
+        and "flex-direction" not in input_props
+        and any(p.lower() == "display" and v.strip().lower() in ("flex", "inline-flex")
+                for p, v in decls)
+    )
+
     for prop, value in decls:
         v = _coerce_units(value.strip())
         v = _coerce_modern_color(v)
@@ -269,6 +280,9 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
             out.append(("-unity-font-style", "italic"))
         else:
             out.append(("-unity-font-style", "normal"))
+
+    if needs_row_default and not any(k == "flex-direction" for k, _ in out):
+        out.append(("flex-direction", "row"))
 
     # Deduplicate keeping last occurrence.
     seen: dict[str, str] = {}
@@ -400,14 +414,23 @@ def _parse_box_shadow(value: str):
     nums = [n for n in nums if n.strip()]
     if len(nums) < 2:
         return None
-    ox = _ensure_unit(nums[0])
-    oy = _ensure_unit(nums[1])
-    blur = _ensure_unit(nums[2]) if len(nums) >= 3 else "0"
+    ox = _strip_unit(nums[0])
+    oy = _strip_unit(nums[1])
+    blur = _strip_unit(nums[2]) if len(nums) >= 3 else "0"
     return ox, oy, blur, color
 
 
 def _ensure_unit(n: str) -> str:
     return n if n.endswith(("px", "em", "rem", "%")) or n in ("0",) else f"{n}px"
+
+
+def _strip_unit(n: str) -> str:
+    """Drop length unit so the value parses as a plain number.
+    Used for bridge custom props typed as float (CustomStyleProperty<float>)."""
+    for u in ("px", "rem", "em", "%"):
+        if n.endswith(u):
+            return n[: -len(u)] or "0"
+    return n
 
 
 def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
@@ -485,7 +508,7 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         grad = _find_gradient(value)
         if grad:
             start, end, text = grad
-            out.append(("--gg-gradient", text))
+            out.append(("--gg-gradient", _quote_for_uss(text)))
             scrubbed = (value[:start] + value[end:]).strip(" ,")
         else:
             scrubbed = value
@@ -499,7 +522,7 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop == "background-image":
         grad = _find_gradient(value)
         if grad:
-            return [("--gg-gradient", grad[2])]
+            return [("--gg-gradient", _quote_for_uss(grad[2]))]
         return [("background-image", value)]
     if prop == "background-color":
         return [("background-color", value)]
@@ -571,14 +594,18 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop == "transform":
         return _split_transform(value, warnings)
 
-    # gap shorthand -> row-gap + column-gap (USS supports both).
+    # gap / row-gap / column-gap: USS doesn't support these. Bridge them by
+    # emitting --gg-row-gap / --gg-column-gap so BridgeBox can apply margin
+    # to direct children at runtime based on the parent's flex-direction.
     if prop == "gap":
         parts = value.split()
-        if len(parts) == 1:
-            return [("row-gap", parts[0]), ("column-gap", parts[0])]
-        return [("row-gap", parts[0]), ("column-gap", parts[1])]
-    if prop in ("row-gap", "column-gap"):
-        return [(prop, value)]
+        rg = _strip_unit(parts[0])
+        cg = _strip_unit(parts[1] if len(parts) > 1 else parts[0])
+        return [("--gg-row-gap", rg), ("--gg-column-gap", cg)]
+    if prop == "row-gap":
+        return [("--gg-row-gap", _strip_unit(value))]
+    if prop == "column-gap":
+        return [("--gg-column-gap", _strip_unit(value))]
 
     # inset shorthand -> top/right/bottom/left.
     if prop == "inset":
@@ -608,7 +635,7 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop == "clip-path":
         v = value.strip()
         if v.lower().startswith("polygon"):
-            return [("--gg-clip-polygon", v)]
+            return [("--gg-clip-polygon", _quote_for_uss(v))]
         warnings.append(f"clip-path: {value} -- only polygon() is bridged")
         return None
 
@@ -657,7 +684,7 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         "justify-content", "justify-self",
         "visibility",
         "letter-spacing", "font-size", "word-spacing",
-        "z-index", "transition", "transition-property",
+        "transition", "transition-property",
         "transition-duration", "transition-delay", "transition-timing-function",
         "translate", "rotate", "scale",
         "transform-origin",
@@ -676,6 +703,14 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _quote_for_uss(value: str) -> str:
+    """Wrap a raw CSS value as a USS string literal so the parser accepts it.
+    Bridge kit reads --gg-* as strings; functions like `linear-gradient(...)`
+    aren't recognized by the USS lexer otherwise."""
+    inner = value.replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{inner}"'
 
 
 def _extract_color(value: str) -> str | None:

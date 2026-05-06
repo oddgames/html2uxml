@@ -221,16 +221,24 @@ def _wrap_uxml(body: str, uss_filename: str, *, with_bridge: bool) -> str:
     )
 
 
+import re as _re
+_PROP_RE = _re.compile(r"\b([a-zA-Z][a-zA-Z0-9-]*)\s*:")
+
+
 def _record_warnings(state: _EmitState, warnings: list[str]) -> None:
     for w in warnings:
         state.warnings.append(w)
-        prop = ""
-        if any(token in w for token in ("dropped", "approximated", "unmapped", "unsupported")):
-            after = w.split(":", 2)
-            if len(after) >= 2:
-                prop = after[1].strip().split(":")[0]
-        if prop:
-            state.stats.dropped_props[prop] = state.stats.dropped_props.get(prop, 0) + 1
+        if not any(token in w for token in ("dropped", "approximated", "unmapped", "unsupported")):
+            continue
+        m = _PROP_RE.search(w)
+        if not m:
+            continue
+        prop = m.group(1)
+        if prop in ("unmapped", "CSS", "dropped", "approximated"):
+            tail = _PROP_RE.search(w[m.end():])
+            if tail:
+                prop = tail.group(1)
+        state.stats.dropped_props[prop] = state.stats.dropped_props.get(prop, 0) + 1
 
 
 def _emit_node_children(parent: Node, resolved: dict[int, ResolvedStyle],
@@ -370,13 +378,18 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
 
     # Build attributes
     attrs_out: list[tuple[str, str]] = []
-    for k, v in extra_attrs.items():
-        attrs_out.append((k, v))
     cls_list = list(classes)
+    for k, v in extra_attrs.items():
+        if k == "class":
+            cls_list.extend(v.split())
+        else:
+            attrs_out.append((k, v))
     if own_class:
         cls_list.append(own_class)
     if cls_list:
-        attrs_out.append(("class", " ".join(cls_list)))
+        seen = set()
+        deduped = [c for c in cls_list if not (c in seen or seen.add(c))]
+        attrs_out.append(("class", " ".join(deduped)))
     if "id" in node.attrs and node.attrs["id"]:
         attrs_out.append(("name", node.attrs["id"]))
     if foldout_text is not None:
