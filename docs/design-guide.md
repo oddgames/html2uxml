@@ -5,6 +5,11 @@ converter produces clean Unity UXML+USS. Every convention here is something
 the converter actively recognises. Code that follows the contract round-trips
 losslessly; code that drifts gets dropped or approximated.
 
+**Target runtime**: Unity 6.0 or newer. The bridge kit uses the
+`[UxmlElement]` source generator (Unity 2023.2+) and depends on
+`com.unity.vectorgraphics` for SVG asset import. Older Unity versions
+will see a deprecation warning and unusable SVG backgrounds.
+
 ---
 
 ## 1. Layout
@@ -24,6 +29,19 @@ approximated.
   absolute (use the document root as the offset parent yourself).
 - `box-sizing` is always **border-box** in USS — write to that assumption.
 
+### Z-ordering
+
+USS does **not** support `z-index`. Stacking is determined entirely by
+tree order: later siblings paint on top of earlier ones. To put one
+element in front of another:
+
+1. Make sure the visually-on-top element appears **after** its peer in
+   the DOM, or
+2. Lift it into a higher-up container that paints later.
+
+Don't author with `z-index: 999` and expect it to survive — the value is
+dropped at conversion. Plan stacking by source order.
+
 ## 2. Typography
 
 - Fonts must be available on Google Fonts; the converter downloads TTF/OTF
@@ -37,6 +55,18 @@ approximated.
   `hyphens`, `vertical-align`.
 
 ## 3. Color, Background, Borders
+
+### Supported color formats
+
+- Hex: `#fff`, `#ffffff`, `#ffffff80` (8-digit alpha is honoured).
+- `rgb(r, g, b)` and `rgba(r, g, b, a)`.
+- `hsl(h, s%, l%)` and `hsla(h, s%, l%, a)`.
+- Named CSS keywords (`red`, `transparent`, `cornflowerblue`, etc.).
+- `currentColor` is **not** supported — restate the color literally.
+- Modern color spaces (`oklch`, `lab`, `lch`, `hwb`, `color-mix()`,
+  relative-color syntax) are not parsed; see the Hard-No list.
+
+### Other rules
 
 - Solid backgrounds, `linear-gradient(...)` (single direction), and
   `repeating-linear-gradient(...)` are all supported. Other gradient
@@ -142,13 +172,28 @@ Each maps to a real Unity control:
 Use the right tag and you get a Unity control with the right styling
 hooks for free.
 
-## 9. Pseudo-elements
+## 9. Accessibility & Tooltip Hooks
+
+The converter forwards a small set of HTML attributes onto Unity controls:
+
+| HTML attribute     | Unity result |
+|--------------------|--------------|
+| `title="..."`      | `tooltip="..."` on any element. |
+| `alt="..."` (on `<img>`) | Falls back to `tooltip` if `title` is absent. |
+| `id="..."`         | `name="..."` on the UXML element so it's queryable via `Q<T>("id")`. |
+| `disabled`         | Honoured on `<button>`/`<input>` — emits `:disabled` style hooks. |
+| `placeholder=`     | Forwarded to TextField placeholder. |
+
+**Ignored** (no Unity equivalent): `aria-label`, `aria-describedby`,
+`role`, `tabindex`, `lang`. Use `title` for the same hover-text effect.
+
+## 10. Pseudo-elements
 
 - `::before` and `::after` are materialized as Label children with the
   rule's `content` text + the rest of the rule's styling.
 - CSS counters, attr() in content, and `::marker` aren't supported.
 
-## 10. Selectors
+## 11. Selectors
 
 Stick to:
 
@@ -162,7 +207,7 @@ Skip: attribute selectors (`[type="text"]`), `::part`, `::slotted`,
 container queries, `@layer`, `@scope`, `@media` (the converter strips
 them).
 
-## 11. File Layout the Converter Expects
+## 12. File Layout the Converter Expects
 
 ```
 your-design/
@@ -178,7 +223,7 @@ your-design/
   fetched (URL inputs) or read from disk (file inputs).
 - Image paths must resolve relative to the HTML file.
 
-## 12. Hard-No List (Avoid Entirely)
+## 13. Hard-No List (Avoid Entirely)
 
 Features in this list are **silently dropped** and have no bridge in
 flight. If the design depends on any of them, redesign the affected
@@ -290,7 +335,7 @@ If a design needs something on this list, treat it as a **redesign
 trigger**, not a converter bug. The closer the source sticks to the
 contract, the less hand-cleanup the Unity output needs.
 
-## 13. Quick Self-Check
+## 14. Quick Self-Check
 
 Before handing a design to the converter, run through:
 
@@ -306,3 +351,131 @@ Before handing a design to the converter, run through:
 
 If every box checks, conversion is high-fidelity. If a box fails, expect
 the matching feature to drop or approximate per `docs/unsupported.md`.
+
+## 15. CLI Reference
+
+```bash
+html2uxml <input> [-o OUT_DIR] [--name NAME] [--selector CSS]
+                  [--css FILE]+ [--bundle-assets] [--download-assets]
+                  [--download-fonts] [--timeout SECONDS] [-q]
+```
+
+- `<input>` — local HTML file path or an `http(s)://` URL.
+- `-o OUT_DIR` — where the converted `.uxml` / `.uss` and `Assets/UI/`
+  folders land. Defaults to the input's parent directory.
+- `--name NAME` — base name for the output files (default: input stem).
+- `--selector CSS` — convert only the first matching subtree (e.g.
+  `--selector "#chat-overlay"`). Useful for a multi-screen design canvas.
+- `--css FILE` — additional CSS files to merge in (repeatable).
+- `--bundle-assets` — copy referenced images into
+  `<out>/Assets/UI/Images/` and rewrite `url()` in USS.
+- `--download-assets` — also fetch remote `http(s)` image URLs (implies
+  `--bundle-assets`).
+- `--download-fonts` — pull TTFs for Google Fonts referenced in CSS into
+  `<out>/Assets/UI/Fonts/` and inject `-unity-font-definition` rules.
+- `--timeout` — network timeout in seconds (default 10).
+- `-q` — suppress the conversion report.
+
+Typical full conversion:
+
+```bash
+html2uxml http://localhost:8000/test.html \
+  -o my-unity-project \
+  --name MyScreen \
+  --bundle-assets --download-assets --download-fonts
+```
+
+Output layout:
+
+```
+my-unity-project/
+  MyScreen.uxml
+  MyScreen.uss
+  Assets/
+    UI/
+      Images/   # copied PNG/JPG and inlined svg-N.svg files
+      Fonts/    # downloaded TTFs from Google Fonts
+```
+
+Drop the contents into your Unity project's `Assets/` folder and pair
+with the bridge package (`bridge_kit/`).
+
+## 16. Minimal Compliant Sample
+
+Copy-paste skeleton showing a flex layout, gap, gradient background,
+animation, and a declarative toggle:
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; background: #0a0a0a; color: #fff;
+         font-family: 'Inter', sans-serif; }
+
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    width: 360px;
+    background: linear-gradient(180deg, #1f2937 0%, #0f172a 100%);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  }
+
+  .row {
+    display: flex;
+    flex-direction: row;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .pill {
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #2563eb;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .pulse {
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.4; }
+  }
+
+  /* Declarative toggle: clicking .menu-btn flips .open on .menu */
+  .menu { display: none; }
+  .menu.open { display: flex; }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <div class="row">
+      <span class="pill pulse">LIVE</span>
+      <span title="Toggle the menu"
+            class="menu-btn"
+            data-toggle-target=".menu"
+            data-toggle-class="open">☰</span>
+    </div>
+
+    <div class="menu" data-show-group="main">
+      <button>Profile</button>
+      <button>Settings</button>
+    </div>
+
+    <svg width="48" height="48" viewBox="0 0 48 48">
+      <circle cx="24" cy="24" r="20" fill="#22c55e" />
+    </svg>
+  </div>
+</body>
+</html>
+```
+
+Every feature in this snippet round-trips through the converter.
+Anything you'd add beyond this should be checked against the Hard-No
+list before committing time to it.
