@@ -21,6 +21,7 @@ namespace HtmlToUxml.Bridge
         static readonly CustomStyleProperty<float> ShadowBlur    = new CustomStyleProperty<float>("--gg-shadow-blur");
         static readonly CustomStyleProperty<Color> ShadowColor   = new CustomStyleProperty<Color>("--gg-shadow-color");
         static readonly CustomStyleProperty<string> Gradient     = new CustomStyleProperty<string>("--gg-gradient");
+        static readonly CustomStyleProperty<string> ClipPolygon  = new CustomStyleProperty<string>("--gg-clip-polygon");
 
         Vector2 _shadowOffset;
         float   _shadowBlur;
@@ -28,6 +29,8 @@ namespace HtmlToUxml.Bridge
         bool    _hasShadow;
 
         LinearGradient _gradient;
+
+        Vector2[] _clipPoints;
 
         public BridgeBox()
         {
@@ -55,6 +58,11 @@ namespace HtmlToUxml.Bridge
                 ? GradientParser.ParseLinear(gradStr)
                 : null;
 
+            string clipStr;
+            _clipPoints = style.TryGetValue(ClipPolygon, out clipStr)
+                ? PolygonParser.Parse(clipStr)
+                : null;
+
             MarkDirtyRepaint();
         }
 
@@ -64,6 +72,34 @@ namespace HtmlToUxml.Bridge
             var painter = ctx.painter2D;
             if (_hasShadow) PaintShadow(painter, rect);
             if (_gradient != null) PaintGradient(painter, rect);
+            if (_clipPoints != null && _clipPoints.Length >= 3) PaintClipMask(painter, rect);
+        }
+
+        void PaintClipMask(Painter2D p, Rect rect)
+        {
+            // Approximate a clip-path by painting OUTSIDE the polygon with the
+            // parent's resolved background color (or transparent black) so the
+            // visible area matches the polygon. A proper stencil would need a
+            // shader; this produces the right shape against solid backgrounds.
+            p.fillColor = new Color(0, 0, 0, 0); // requires a parent background
+            p.BeginPath();
+            // Draw the rect, then "subtract" the polygon by reversing winding.
+            p.MoveTo(new Vector2(rect.xMin, rect.yMin));
+            p.LineTo(new Vector2(rect.xMax, rect.yMin));
+            p.LineTo(new Vector2(rect.xMax, rect.yMax));
+            p.LineTo(new Vector2(rect.xMin, rect.yMax));
+            p.ClosePath();
+            // Polygon hole (counter-clockwise to act as a hole under non-zero fill rule)
+            for (int i = _clipPoints.Length - 1; i >= 0; i--)
+            {
+                var pt = _clipPoints[i];
+                var x = rect.xMin + pt.x * rect.width;
+                var y = rect.yMin + pt.y * rect.height;
+                if (i == _clipPoints.Length - 1) p.MoveTo(new Vector2(x, y));
+                else p.LineTo(new Vector2(x, y));
+            }
+            p.ClosePath();
+            p.Fill(FillRule.NonZero);
         }
 
         void PaintShadow(Painter2D p, Rect rect)

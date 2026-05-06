@@ -91,11 +91,24 @@ class ConvertBasicsTest(unittest.TestCase):
             '<button class="btn">go</button>'
         )
         r = convert(html)
-        # Inline class is preserved on the element so the .btn rule applies,
-        # but the converter consolidates resolved styles onto a generated class.
-        self.assertIn('class="btn ', r.uxml)
+        # Original class name preserved; the .btn rule emitted verbatim.
+        self.assertIn('class="btn"', r.uxml)
+        self.assertIn(".btn {", r.uss)
         self.assertIn("color: red", r.uss)
         self.assertIn("padding: 4px", r.uss)
+        # No h2u-N rule for an element without inline style overrides.
+        self.assertNotIn(".h2u-1", r.uss)
+
+    def test_inline_style_only_hoists_to_h2u(self):
+        r = convert(
+            '<style>.card { padding: 8px; }</style>'
+            '<div class="card" style="background: red;"></div>'
+        )
+        self.assertIn(".card {", r.uss)
+        self.assertIn("padding: 8px", r.uss)
+        self.assertIn(".h2u-1", r.uss)
+        self.assertIn("background-color: red", r.uss)
+        self.assertIn('class="card h2u-1"', r.uxml)
 
     def test_pseudo_classes_pass_through_with_generated_class(self):
         html = (
@@ -114,9 +127,95 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn("color: red", r.uss)
 
     def test_dropped_props_recorded_in_stats(self):
-        r = convert('<div style="float: left; clip-path: circle(50%);"></div>')
+        r = convert('<div style="float: left; mask: url(x.png);"></div>')
         self.assertIn("float", r.stats.dropped_props)
-        self.assertIn("clip-path", r.stats.dropped_props)
+        self.assertIn("mask", r.stats.dropped_props)
+
+    def test_clip_path_polygon_bridged(self):
+        r = convert(
+            '<div style="clip-path: polygon(0% 0%, 100% 0%, 50% 100%);"></div>'
+        )
+        self.assertIn("--gg-clip-polygon", r.uss)
+        self.assertIn("polygon(0% 0%, 100% 0%, 50% 100%)", r.uss)
+        self.assertIn("gg:BridgeBox", r.uxml)
+
+    def test_filter_drop_shadow_bridged(self):
+        r = convert(
+            '<div style="filter: drop-shadow(rgba(0,0,0,0.5) 2px 4px 6px);"></div>'
+        )
+        self.assertIn("--gg-shadow-offset-x: 2px", r.uss)
+        self.assertIn("--gg-shadow-offset-y: 4px", r.uss)
+        self.assertIn("--gg-shadow-blur: 6px", r.uss)
+
+    def test_outline_approximated_as_border(self):
+        r = convert('<div style="outline: 2px solid red;"></div>')
+        self.assertIn("border-top-width: 2px", r.uss)
+        self.assertIn("border-top-color: red", r.uss)
+
+    def test_white_space_pre_wrap_to_pre(self):
+        r = convert('<div style="white-space: pre-wrap;"></div>')
+        self.assertIn("white-space: pre", r.uss)
+
+    def test_overflow_auto_promotes_to_scrollview(self):
+        r = convert('<div style="overflow: auto;"><span>x</span></div>')
+        self.assertIn("ui:ScrollView", r.uxml)
+
+    def test_details_summary_to_foldout(self):
+        r = convert("<details><summary>Title</summary><span>body</span></details>")
+        self.assertIn('<ui:Foldout', r.uxml)
+        self.assertIn('text="Title"', r.uxml)
+        self.assertIn("body", r.uxml)
+        self.assertNotIn("ui:Label text=\"Title\"", r.uxml)  # summary consumed
+
+    def test_progress_to_progressbar(self):
+        r = convert('<progress value="40" max="100"></progress>')
+        self.assertIn("ui:ProgressBar", r.uxml)
+        self.assertIn('value="40"', r.uxml)
+        self.assertIn('high-value="100"', r.uxml)
+
+    def test_text_decoration_underline_in_label(self):
+        r = convert(
+            '<style>.u { text-decoration: underline; }</style>'
+            '<span class="u">hi</span>'
+        )
+        self.assertIn("&lt;u&gt;hi&lt;/u&gt;", r.uxml)
+
+    def test_attribute_selector_hoisted(self):
+        r = convert(
+            '<style>input[type="text"] { color: red; }</style>'
+            '<input type="text" />'
+        )
+        # Attribute selector won't survive into USS verbatim, but the
+        # declarations are hoisted onto the matched element's h2u-N rule.
+        self.assertIn(".h2u-1", r.uss)
+        self.assertIn("color: red", r.uss)
+
+    def test_sibling_combinator_matching(self):
+        r = convert(
+            '<style>.a + .b { color: red; }</style>'
+            '<div class="a"></div><div class="b"></div>'
+        )
+        # The original sibling-combinator rule emits verbatim.
+        self.assertIn(".a + .b", r.uss)
+        self.assertIn("color: red", r.uss)
+
+    def test_before_pseudo_synthesizes_label(self):
+        r = convert(
+            '<style>.tag::before { content: "★ "; color: gold; }</style>'
+            '<div class="tag"><span>name</span></div>'
+        )
+        # Synthetic Label appears as the first child.
+        self.assertIn('text="★ "', r.uxml)
+        self.assertIn("color: gold", r.uss)
+
+    def test_li_inside_ul_gets_bullet(self):
+        r = convert("<ul><li>one</li><li>two</li></ul>")
+        self.assertIn('text="•"', r.uxml)
+
+    def test_li_inside_ol_gets_number(self):
+        r = convert("<ol><li>a</li><li>b</li></ol>")
+        self.assertIn('text="1."', r.uxml)
+        self.assertIn('text="2."', r.uxml)
 
 
 if __name__ == "__main__":

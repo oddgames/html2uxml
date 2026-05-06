@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .css_parser import Declaration, parse_css
+from .css_parser import _parse_declarations, parse_css
 from .html_parser import Node, parse_html
 from .mappings import map_declarations, map_element
 from .resolver import _ParsedRule, parse_rules, resolve, ResolvedStyle
@@ -23,10 +23,14 @@ class ConvertStats:
     elements: int = 0
     labels: int = 0
     buttons: int = 0
+    images: int = 0
     bridge_boxes: int = 0
-    uss_rules: int = 0
-    bridged_props: dict = field(default_factory=dict)   # prop -> count
-    dropped_props: dict = field(default_factory=dict)   # prop -> count
+    inline_overrides: int = 0     # number of h2u-N rules emitted
+    css_class_rules: int = 0      # number of original CSS rules emitted
+    uss_rules: int = 0            # final rule count
+    bridged_props: dict = field(default_factory=dict)
+    dropped_props: dict = field(default_factory=dict)
+    skipped_at_rules: int = 0     # @media/@keyframes/@supports/@import
 
 
 def convert(
@@ -36,11 +40,6 @@ def convert(
     uss_filename: str = "styles.uss",
     base_dir: Path | None = None,
 ) -> ConvertResult:
-    """Convert HTML+CSS to UXML and USS strings.
-
-    `extra_css` is concatenated after any <style> blocks found in the HTML.
-    `base_dir` is used to resolve <link rel="stylesheet" href="...">.
-    """
     parsed = parse_html(html)
     css_chunks = list(parsed.inline_styles)
     if base_dir is not None:
@@ -56,7 +55,17 @@ def convert(
     resolved = resolve(parsed.root, parsed_rules)
 
     state = _EmitState()
-    body_xml = _emit_node_children(parsed.root, resolved, state, indent=2)
+
+    # Pre-flight: find which parsed rules contribute bridge custom props, so
+    # that any element matching them is promoted to gg:BridgeBox even if its
+    # own inline style has no --gg-* declaration.
+    rule_bridge_flags = _compute_rule_bridge_flags(parsed_rules)
+
+    # Emit class/id/tag rules from the parsed CSS verbatim, mapped through
+    # USS translation, so the original class names survive into the output.
+    _emit_css_rules(parsed_rules, state)
+
+    body_xml = _emit_node_children(parsed.root, resolved, state, rule_bridge_flags, indent=2)
     uxml = _wrap_uxml(body_xml, uss_filename, with_bridge=state.used_bridge)
     uss = _emit_uss(state)
     state.stats.uss_rules = len(state.uss_order)
@@ -64,15 +73,13 @@ def convert(
 
 
 # ---------------------------------------------------------------------------
-# Emit state: gathers per-node generated classes and the USS rules they yield.
+# Emit state
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class _EmitState:
-    # selector -> list of (prop, value)
     uss_rules: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
-    # rule order, for stable output
     uss_order: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     used_bridge: bool = False
@@ -83,7 +90,6 @@ class _EmitState:
         if not decls:
             return
         if selector in self.uss_rules:
-            # Append (later wins on dedup at write time).
             self.uss_rules[selector].extend(decls)
         else:
             self.uss_rules[selector] = list(decls)
@@ -95,11 +101,40 @@ class _EmitState:
 
 
 # ---------------------------------------------------------------------------
+# CSS rule emission (originally-named selectors)
+# ---------------------------------------------------------------------------
+
+
+def _emit_css_rules(parsed_rules: list[_ParsedRule], state: _EmitState) -> None:
+    for rule in parsed_rules:
+        mapped = map_declarations([(d.prop, d.value) for d in rule.declarations])
+        _record_warnings(state, mapped.warnings)
+        if not mapped.decls:
+            continue
+        for k, _ in mapped.decls:
+            if k.startswith("--gg-"):
+                state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
+                state.used_bridge = True
+        for sel in rule.selectors:
+            state.add_rule(sel.raw, mapped.decls)
+            state.stats.css_class_rules += 1
+
+
+def _compute_rule_bridge_flags(parsed_rules: list[_ParsedRule]) -> list[bool]:
+    """For each parsed rule (parallel to parsed_rules), True iff its mapped
+    declarations include any --gg-* custom property."""
+    flags = []
+    for rule in parsed_rules:
+        mapped = map_declarations([(d.prop, d.value) for d in rule.declarations])
+        flags.append(any(k.startswith("--gg-") for k, _ in mapped.decls))
+    return flags
+
+
+# ---------------------------------------------------------------------------
 # UXML emission
 # ---------------------------------------------------------------------------
 
 
-_INLINE_TAGS = {"b", "strong", "i", "em", "u"}
 _RICH_TEXT = {
     "b": "b", "strong": "b",
     "i": "i", "em": "i",
@@ -126,11 +161,8 @@ def _wrap_uxml(body: str, uss_filename: str, *, with_bridge: bool) -> str:
 def _record_warnings(state: _EmitState, warnings: list[str]) -> None:
     for w in warnings:
         state.warnings.append(w)
-        # Pull the property name out of "<verb>: <prop>: <value>" if present.
-        head, _, _rest = w.partition(":")
         prop = ""
-        if "dropped" in head or "approximated" in head or "unmapped" in head or "unsupported" in head:
-            # Form: "verb...: <prop>: <value>"
+        if any(token in w for token in ("dropped", "approximated", "unmapped", "unsupported")):
             after = w.split(":", 2)
             if len(after) >= 2:
                 prop = after[1].strip().split(":")[0]
@@ -139,68 +171,139 @@ def _record_warnings(state: _EmitState, warnings: list[str]) -> None:
 
 
 def _emit_node_children(parent: Node, resolved: dict[int, ResolvedStyle],
-                        state: _EmitState, indent: int) -> str:
+                        state: _EmitState, rule_bridge_flags: list[bool],
+                        indent: int) -> str:
     out_parts: list[str] = []
+    li_counter = 1
     for child in parent.children:
         if child.is_text:
-            # Top-level stray text becomes a Label.
             out_parts.append(_emit_text_label(child.text or "", indent))
             continue
-        out_parts.append(_emit_node(child, resolved, state, indent))
+        out_parts.append(
+            _emit_node(child, resolved, state, rule_bridge_flags, indent,
+                       parent=parent, li_index=li_counter)
+        )
+        if child.tag == "li":
+            li_counter += 1
     return "".join(out_parts)
 
 
 def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
-               state: _EmitState, indent: int) -> str:
+               state: _EmitState, rule_bridge_flags: list[bool],
+               indent: int, *, parent: Node | None = None,
+               li_index: int = 1) -> str:
     uxml_tag, extra_attrs, text_mode = map_element(node.tag, node.attrs)
     pad = " " * indent
-
-    # Pull HTML class= and any generated class for this node's resolved styles.
-    classes = node.classes()
+    classes = list(node.classes())
     style = resolved.get(id(node))
 
-    own_class = None
+    # Bridge promotion: triggered by either a matching CSS rule with --gg-* or
+    # an inline style="" with --gg-*. Compute both.
     needs_bridge = False
-    if style is not None and (style.base or style.pseudo_rules):
-        # Always emit per-element class so inline styles materialize as USS.
-        own_class = state.gen_class()
-        mapped = map_declarations(style.base)
-        _record_warnings(state, mapped.warnings)
-        for k, _ in mapped.decls:
-            if k.startswith("--gg-"):
+    if style is not None:
+        for rule_idx in style.matched_rule_indices:
+            if 0 <= rule_idx < len(rule_bridge_flags) and rule_bridge_flags[rule_idx]:
                 needs_bridge = True
-                state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
+                break
+
+    # Hoist inline style="" + unsupported-selector rule decls into h2u-N.
+    own_class = None
+    inline_pairs: list[tuple[str, str]] = []
+    if style is not None and style.unsupported_decls:
+        inline_pairs.extend((d.prop, d.value) for d in style.unsupported_decls)
+    inline = node.attrs.get("style", "")
+    if inline:
+        inline_pairs.extend((d.prop, d.value) for d in _parse_declarations(inline))
+    if inline_pairs:
+        mapped = map_declarations(inline_pairs)
+        _record_warnings(state, mapped.warnings)
         if mapped.decls:
+            own_class = state.gen_class()
             state.add_rule(f".{own_class}", mapped.decls)
-        for sel_raw, decls in style.pseudo_rules:
-            rewritten = _attach_pseudo_to_class(sel_raw, own_class)
-            mapped_pseudo = map_declarations([(d.prop, d.value) for d in decls])
-            _record_warnings(state, mapped_pseudo.warnings)
-            for k, _ in mapped_pseudo.decls:
+            state.stats.inline_overrides += 1
+            for k, _ in mapped.decls:
                 if k.startswith("--gg-"):
                     needs_bridge = True
                     state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
-            state.add_rule(rewritten, mapped_pseudo.decls)
+
+    # ScrollView promotion: any element with effective overflow auto/scroll
+    # gets emitted as a ScrollView so Unity scrolls instead of clipping.
+    overflow = _resolved_value(style, "overflow")
+    if overflow and overflow.lower() in ("auto", "scroll") and uxml_tag == "ui:VisualElement":
+        uxml_tag = "ui:ScrollView"
+
+    text_transform = _resolved_value(style, "text-transform")
+    text_decoration = _resolved_value(style, "text-decoration")
+
     if needs_bridge and uxml_tag == "ui:VisualElement":
         uxml_tag = "gg:BridgeBox"
         state.used_bridge = True
         state.stats.bridge_boxes += 1
-    if uxml_tag == "ui:VisualElement":
+    elif uxml_tag == "ui:VisualElement":
         state.stats.elements += 1
-    elif uxml_tag == "ui:Label":
+    if uxml_tag == "ui:Label":
         state.stats.labels += 1
     elif uxml_tag == "ui:Button":
         state.stats.buttons += 1
+    elif uxml_tag == "ui:Image":
+        state.stats.images += 1
+
+    # <img>: synthesize a per-element class with background-image so the URL
+    # ends up in USS where the user can swap it for a Unity asset reference.
+    if node.tag == "img":
+        src = node.attrs.get("src", "")
+        if src:
+            if own_class is None:
+                own_class = state.gen_class()
+                state.stats.inline_overrides += 1
+            state.add_rule(
+                f".{own_class}",
+                [("background-image", f'url("{src}")')],
+            )
+
+    # <select>: collect <option> text into the `choices` attribute (Unity
+    # DropdownField accepts a comma-separated list) and drop the children.
+    select_choices: list[str] | None = None
+    if node.tag == "select":
+        select_choices = []
+        for child in node.children:
+            if not child.is_text and child.tag == "option":
+                opt_text = _gather_inline_text(child)
+                if opt_text:
+                    select_choices.append(opt_text)
 
     # Text handling.
     text_attr = None
     inner_children = list(node.children)
+
+    # <details>: extract <summary> text into the Foldout's text= and skip it.
+    foldout_text: str | None = None
+    if node.tag == "details":
+        for child in node.children:
+            if not child.is_text and child.tag == "summary":
+                foldout_text = _gather_inline_text(child)
+                break
+        if foldout_text is not None:
+            inner_children = [c for c in node.children
+                              if c.is_text or c.tag != "summary"]
+
+    # <progress value=50 max=100>
+    progress_attrs: list[tuple[str, str]] = []
+    if node.tag in ("progress", "meter"):
+        if node.attrs.get("value"):
+            progress_attrs.append(("value", node.attrs["value"]))
+        if node.attrs.get("max"):
+            progress_attrs.append(("high-value", node.attrs["max"]))
+        if node.attrs.get("min"):
+            progress_attrs.append(("low-value", node.attrs["min"]))
+
     if text_mode == "text":
         text_attr = _gather_inline_text(node)
-        inner_children = []  # already folded in
-    elif text_mode == "label":
-        # We'll emit child Labels for stray text runs (handled in recursion).
-        pass
+        if text_transform:
+            text_attr = _apply_text_transform(text_attr, text_transform)
+        if text_decoration and "underline" in text_decoration.lower():
+            text_attr = f"<u>{text_attr}</u>"
+        inner_children = []
 
     # Build attributes
     attrs_out: list[tuple[str, str]] = []
@@ -213,9 +316,15 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         attrs_out.append(("class", " ".join(cls_list)))
     if "id" in node.attrs and node.attrs["id"]:
         attrs_out.append(("name", node.attrs["id"]))
+    if foldout_text is not None:
+        attrs_out.append(("text", foldout_text))
     if text_attr is not None:
         attrs_out.append(("text", text_attr))
-    # Forward title/alt as tooltip.
+    for k, v in progress_attrs:
+        attrs_out.append((k, v))
+    if select_choices is not None and select_choices:
+        attrs_out.append(("choices", ",".join(select_choices)))
+        inner_children = []  # don't render <option> children
     if "title" in node.attrs and node.attrs["title"]:
         attrs_out.append(("tooltip", node.attrs["title"]))
     elif "alt" in node.attrs and node.attrs["alt"]:
@@ -223,16 +332,40 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
 
     attr_str = "".join(f' {k}="{_xml_escape(v)}"' for k, v in attrs_out)
 
-    # Determine if there are rendered inner children.
     rendered_children: list[str] = []
+
+    # ::before pseudo-element synthesized as a leading Label child.
+    if style is not None and style.before_content is not None:
+        rendered_children.append(
+            _emit_synthetic_pseudo(style.before_content, style.before_decls, state, indent + 2)
+        )
+
+    # list-style marker for <li> based on parent <ul>/<ol>.
+    li_marker = _list_marker(node, parent=parent, ordinal=li_index)
+    if li_marker:
+        rendered_children.append(_emit_text_label(li_marker, indent + 2))
+
     if inner_children:
+        inner_li = 1
         for child in inner_children:
             if child.is_text:
                 t = (child.text or "").strip()
-                if t and uxml_tag == "ui:VisualElement":
+                if t and uxml_tag in ("ui:VisualElement", "gg:BridgeBox", "ui:ScrollView"):
+                    if text_transform:
+                        t = _apply_text_transform(t, text_transform)
                     rendered_children.append(_emit_text_label(t, indent + 2))
                 continue
-            rendered_children.append(_emit_node(child, resolved, state, indent + 2))
+            rendered_children.append(
+                _emit_node(child, resolved, state, rule_bridge_flags, indent + 2,
+                           parent=node, li_index=inner_li)
+            )
+            if child.tag == "li":
+                inner_li += 1
+
+    if style is not None and style.after_content is not None:
+        rendered_children.append(
+            _emit_synthetic_pseudo(style.after_content, style.after_decls, state, indent + 2)
+        )
 
     if not rendered_children:
         return f"{pad}<{uxml_tag}{attr_str} />\n"
@@ -240,8 +373,48 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     return f"{pad}<{uxml_tag}{attr_str}>\n{body}{pad}</{uxml_tag}>\n"
 
 
+def _emit_synthetic_pseudo(content: str, decls, state: _EmitState, indent: int) -> str:
+    """Emit a Label child that materializes a ::before / ::after rule's content."""
+    if not decls:
+        return _emit_text_label(content, indent)
+    own_class = state.gen_class()
+    mapped = map_declarations([(d.prop, d.value) for d in decls])
+    if mapped.decls:
+        state.add_rule(f".{own_class}", mapped.decls)
+        state.stats.inline_overrides += 1
+    pad = " " * indent
+    return f'{pad}<ui:Label class="{own_class}" text="{_xml_escape(content)}" />\n'
+
+
+def _list_marker(node: Node, parent: Node | None, ordinal: int) -> str | None:
+    if node.tag != "li" or parent is None:
+        return None
+    if parent.tag == "ol":
+        return f"{ordinal}. "
+    return "•  "  # bullet + two spaces
+
+
+def _resolved_value(style, prop: str) -> str | None:
+    if style is None:
+        return None
+    for k, v in style.base:
+        if k == prop:
+            return v
+    return None
+
+
+def _apply_text_transform(text: str, transform: str) -> str:
+    t = transform.strip().lower()
+    if t == "uppercase":
+        return text.upper()
+    if t == "lowercase":
+        return text.lower()
+    if t == "capitalize":
+        return text.title()
+    return text
+
+
 def _gather_inline_text(node: Node) -> str:
-    """Concatenate direct text and inline-tag descendants into a rich-text string."""
     parts: list[str] = []
     for child in node.children:
         if child.is_text:
@@ -284,7 +457,6 @@ def _emit_uss(state: _EmitState) -> str:
     lines: list[str] = []
     for sel in state.uss_order:
         decls = state.uss_rules[sel]
-        # Dedup: later wins.
         dedup: dict[str, str] = {}
         for k, v in decls:
             dedup[k] = v
@@ -296,29 +468,3 @@ def _emit_uss(state: _EmitState) -> str:
         lines.append("}")
         lines.append("")
     return "\n".join(lines)
-
-
-def _attach_pseudo_to_class(selector_raw: str, generated_class: str) -> str:
-    """Rewrite the rightmost compound of a selector to use our generated class.
-
-    `.btn:hover` -> `.h2u-3:hover`
-    `:hover`     -> `.h2u-3:hover`
-    """
-    raw = selector_raw.strip()
-    # Find the start of the rightmost compound.
-    # Walk backwards until whitespace or a combinator.
-    i = len(raw)
-    while i > 0 and raw[i - 1] not in " \t>+~":
-        i -= 1
-    head = raw[:i]
-    tail = raw[i:]
-    # Strip any tag/class/id from tail; keep only the pseudo suffix.
-    pseudo_start = 0
-    if tail.startswith(":"):
-        pseudo_start = 0
-    else:
-        # Find first ":" in tail.
-        idx = tail.find(":")
-        pseudo_start = idx if idx >= 0 else len(tail)
-    pseudo_part = tail[pseudo_start:] if pseudo_start < len(tail) else ""
-    return f"{head}.{generated_class}{pseudo_part}"

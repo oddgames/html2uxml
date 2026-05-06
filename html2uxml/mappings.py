@@ -37,6 +37,14 @@ ELEMENT_MAP: dict[str, tuple[str, dict, str | None]] = {
     "nav":     ("ui:VisualElement", {}, "label"),
     "aside":   ("ui:VisualElement", {}, "label"),
     "form":    ("ui:VisualElement", {}, "label"),
+    "details": ("ui:Foldout", {}, "label"),
+    "summary": ("ui:Label", {}, "text"),  # consumed by parent <details> handler
+    "progress":("ui:ProgressBar", {}, None),
+    "meter":   ("ui:ProgressBar", {}, None),
+    "dialog":  ("ui:VisualElement", {}, "label"),
+    "menu":    ("ui:VisualElement", {}, "label"),
+    "figure":  ("ui:VisualElement", {}, "label"),
+    "figcaption":("ui:Label", {}, "text"),
     "ul":      ("ui:VisualElement", {}, "label"),
     "ol":      ("ui:VisualElement", {}, "label"),
     "li":      ("ui:VisualElement", {}, "label"),
@@ -92,7 +100,14 @@ def map_input(attrs: dict) -> tuple[str, dict, str | None]:
     if t == "number":
         return "ui:FloatField", ({"value": value} if value else {}), None
     if t == "range":
-        return "ui:Slider", {}, None
+        slider_attrs = {}
+        if "min" in attrs:
+            slider_attrs["low-value"] = attrs["min"]
+        if "max" in attrs:
+            slider_attrs["high-value"] = attrs["max"]
+        if value:
+            slider_attrs["value"] = value
+        return "ui:Slider", slider_attrs, None
     if t == "checkbox":
         return "ui:Toggle", {}, None
     if t == "radio":
@@ -108,12 +123,19 @@ def map_input(attrs: dict) -> tuple[str, dict, str | None]:
     return "ui:TextField", {}, None
 
 
+SKIP_TAGS = {"svg", "canvas", "video", "audio", "iframe", "embed", "object",
+             "noscript", "script", "template", "math"}
+
+
 def map_element(tag: str, attrs: dict) -> tuple[str, dict, str | None]:
     if tag == "input":
         return map_input(attrs)
+    if tag in SKIP_TAGS:
+        # Replace with a placeholder VisualElement; children dropped at the
+        # converter level via the SKIP_TAGS guard.
+        return "ui:VisualElement", {"class": f"placeholder-{tag}"}, None
     if tag in ELEMENT_MAP:
         return ELEMENT_MAP[tag]
-    # Unknown tag -> generic visual element, keep children
     return "ui:VisualElement", {}, "label"
 
 
@@ -127,17 +149,19 @@ SKIP_VALUES = {"unset", "initial", "inherit", "revert", "revert-layer"}
 
 # CSS properties that USS does not support and we drop with a warning.
 DROP_PROPS = {
-    "clip-path", "filter", "backdrop-filter",
+    "backdrop-filter",
     "mask", "mask-image", "mask-type", "animation", "appearance",
     "float", "clear", "box-sizing", "user-select", "pointer-events",
     "perspective", "perspective-origin", "transform-style",
     "backface-visibility", "mix-blend-mode", "background-blend-mode",
     "isolation", "contain", "will-change",
-    "outline", "outline-offset", "list-style", "table-layout",
+    "outline-offset", "list-style", "table-layout",
     "border-collapse", "border-spacing", "caption-side",
     "scroll-behavior", "scroll-snap-type", "scroll-snap-align",
-    "touch-action", "writing-mode", "direction", "text-decoration",
-    "text-transform", "text-indent", "vertical-align",
+    "touch-action", "writing-mode", "direction",
+    "text-decoration",  # consumed by Label rich-text in the converter
+    "text-transform",   # consumed by Label text pre-processing
+    "text-indent", "vertical-align",
     "word-break", "overflow-wrap", "hyphens", "line-height",
 }
 
@@ -257,6 +281,27 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
 _LEN_RE = re.compile(r"^-?\d*\.?\d+(px|em|rem|%|vw|vh|)$")
 _GRAD_RE = re.compile(r"\b(linear|radial|conic|repeating-linear|repeating-radial)-gradient\s*\(",
                       re.IGNORECASE)
+
+
+def _extract_call_body(value: str, fn_name: str) -> str | None:
+    """Find `<fn_name>(...)` with balanced parens, return inner body or None."""
+    pat = re.compile(re.escape(fn_name) + r"\s*\(", re.IGNORECASE)
+    m = pat.search(value)
+    if not m:
+        return None
+    i = m.end()
+    depth = 1
+    start = i
+    while i < len(value) and depth > 0:
+        c = value[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return value[start:i]
+        i += 1
+    return None
 
 
 def _find_gradient(value: str) -> tuple[int, int, str] | None:
@@ -412,11 +457,16 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         return [("__font-normal__", "0")]
 
     if prop == "font-family":
-        warnings.append(
-            f"font-family: {value} -- USS needs a Unity font asset; "
-            "set -unity-font-definition manually"
-        )
-        return None
+        # Keep the primary family in a custom prop so an asset bundler can
+        # later swap it for `-unity-font-definition: url("...")`.
+        first = value.split(",", 1)[0].strip().strip('"').strip("'")
+        if not first or first.lower() in (
+            "serif", "sans-serif", "monospace", "cursive", "fantasy",
+            "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace",
+            "ui-rounded", "math", "emoji", "fangsong",
+        ):
+            return None
+        return [("--gg-font-family", f'"{first}"')]
 
     # font shorthand: too ambiguous; only pull font-size if obvious.
     if prop == "font":
@@ -543,8 +593,40 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         v = value.lower()
         if v in ("normal", "nowrap", "pre"):
             return [("white-space", v)]
+        if v in ("pre-wrap", "pre-line", "break-spaces"):
+            return [("white-space", "pre")]
         warnings.append(f"white-space: {value} approximated as normal")
         return [("white-space", "normal")]
+
+    # outline: USS has no outline; approximate as border on all sides + warn
+    # that outline (unlike border) doesn't normally occupy layout space.
+    if prop == "outline":
+        warnings.append(f"outline approximated as border (occupies layout space)")
+        return _split_border(value, sides=("top", "right", "bottom", "left"))
+
+    # clip-path: bridge polygon() via a custom prop the BridgeBox renders.
+    if prop == "clip-path":
+        v = value.strip()
+        if v.lower().startswith("polygon"):
+            return [("--gg-clip-polygon", v)]
+        warnings.append(f"clip-path: {value} -- only polygon() is bridged")
+        return None
+
+    # filter: only drop-shadow() routes into the box-shadow bridge.
+    if prop == "filter":
+        body = _extract_call_body(value, "drop-shadow")
+        if body is not None:
+            shadow = _parse_box_shadow(body)
+            if shadow:
+                ox, oy, blur, color = shadow
+                return [
+                    ("--gg-shadow-offset-x", ox),
+                    ("--gg-shadow-offset-y", oy),
+                    ("--gg-shadow-blur", blur),
+                    ("--gg-shadow-color", color),
+                ]
+        warnings.append(f"filter: {value} -- only drop-shadow() is bridged")
+        return None
 
     # text-overflow: USS supports clip and ellipsis.
     if prop == "text-overflow":

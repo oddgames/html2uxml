@@ -141,7 +141,8 @@ class CompoundSelector:
     tag: str = "*"          # "*" => any tag
     id: str | None = None
     classes: tuple[str, ...] = ()
-    pseudo: tuple[str, ...] = ()  # pseudo-classes/elements, kept for emit
+    pseudo: tuple[str, ...] = ()       # pseudo-classes/elements, kept for emit
+    attrs: tuple = ()                   # tuple of (op, name, value); op in {"", "=", "~=", "^=", "$=", "*=", "|="}
 
 
 @dataclass
@@ -152,9 +153,29 @@ class Selector:
 
     def specificity(self) -> tuple[int, int, int]:
         ids = sum(1 for _, c in self.chain if c.id)
-        classes = sum(len(c.classes) + len(c.pseudo) for _, c in self.chain)
+        classes = sum(len(c.classes) + len(c.pseudo) + len(c.attrs) for _, c in self.chain)
         tags = sum(1 for _, c in self.chain if c.tag != "*")
         return (ids, classes, tags)
+
+    def has_unsupported_features(self) -> bool:
+        """Return True if any compound has features USS won't parse (attribute
+        selectors, ::pseudo-elements, :nth-* / :not(...) etc.)."""
+        for _, c in self.chain:
+            if c.attrs:
+                return True
+            for ps in c.pseudo:
+                if ps.startswith("::"):
+                    return True
+                kw = ps.lstrip(":").split("(", 1)[0]
+                if kw not in _USS_PSEUDO_KEYWORDS:
+                    return True
+        return False
+
+
+_USS_PSEUDO_KEYWORDS = {
+    "hover", "active", "focus", "disabled", "enabled", "checked", "root",
+    "selected", "inactive",
+}
 
 
 _SEL_TOKEN = re.compile(r"""
@@ -217,9 +238,18 @@ def parse_selector(raw: str) -> Selector | None:
 
 _COMPOUND_RE = re.compile(r"""
     (?P<tag>^[a-zA-Z*][\w-]*)?
-    (?P<rest>(?:[#.][\w-]+|::?[\w-]+(?:\([^)]*\))?)*)
+    (?P<rest>(?:[#.][\w-]+|\[[^\]]*\]|::?[\w-]+(?:\([^)]*\))?)*)
     $
 """, re.VERBOSE)
+
+
+_ATTR_RE = re.compile(
+    r"""\[\s*(?P<name>[\w-]+)\s*
+        (?:(?P<op>[~|^$*]?=)\s*
+           (?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\]\s]+))
+        )?\s*\]""",
+    re.VERBOSE,
+)
 
 
 def _parse_compound(token: str) -> CompoundSelector | None:
@@ -230,6 +260,7 @@ def _parse_compound(token: str) -> CompoundSelector | None:
     rest = m.group("rest") or ""
     classes: list[str] = []
     pseudo: list[str] = []
+    attrs: list[tuple[str, str, str]] = []
     cid: str | None = None
     i = 0
     while i < len(rest):
@@ -246,6 +277,19 @@ def _parse_compound(token: str) -> CompoundSelector | None:
                 j += 1
             cid = rest[i + 1:j]
             i = j
+        elif c == "[":
+            j = rest.find("]", i)
+            if j == -1:
+                i = len(rest)
+                continue
+            seg = rest[i:j + 1]
+            am = _ATTR_RE.match(seg)
+            if am is not None:
+                name = am.group("name")
+                op = am.group("op") or ""
+                value = am.group("dq") or am.group("sq") or am.group("bare") or ""
+                attrs.append((op, name, value))
+            i = j + 1
         elif c == ":":
             j = i + 1
             if j < len(rest) and rest[j] == ":":
@@ -266,5 +310,7 @@ def _parse_compound(token: str) -> CompoundSelector | None:
         else:
             i += 1
     return CompoundSelector(
-        tag=tag, id=cid, classes=tuple(classes), pseudo=tuple(pseudo),
+        tag=tag, id=cid,
+        classes=tuple(classes), pseudo=tuple(pseudo),
+        attrs=tuple(attrs),
     )
