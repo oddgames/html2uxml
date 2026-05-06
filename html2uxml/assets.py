@@ -63,6 +63,9 @@ def collect_and_rewrite(
         raw = m.group(1) or m.group(2) or m.group(3) or ""
         if not raw or raw.startswith("data:"):
             return m.group(0)
+        # Already a project-relative path (e.g. emitted by SVG inlining).
+        if raw.startswith(("Assets/", "Assets\\")):
+            return m.group(0)
         if raw.startswith(("http://", "https://")):
             if not download_remote:
                 report.failed.append((raw, "remote (use --download-assets)"))

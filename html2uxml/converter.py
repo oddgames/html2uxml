@@ -18,6 +18,7 @@ class ConvertResult:
     uss: str
     warnings: list[str] = field(default_factory=list)
     stats: "ConvertStats | None" = None
+    svg_files: list[tuple[str, str]] = field(default_factory=list)  # (filename, raw svg)
 
 
 @dataclass
@@ -78,6 +79,7 @@ def convert(
     resolved = resolve(parsed.root, parsed_rules)
 
     state = _EmitState()
+    state.svg_blocks = list(parsed.svg_blocks)
     if selection_warning:
         state.warnings.append(selection_warning)
 
@@ -93,7 +95,10 @@ def convert(
     uxml = _wrap_uxml(body_xml, uss_filename, with_bridge=state.used_bridge)
     uss = _emit_uss(state)
     state.stats.uss_rules = len(state.uss_order)
-    return ConvertResult(uxml=uxml, uss=uss, warnings=state.warnings, stats=state.stats)
+    return ConvertResult(
+        uxml=uxml, uss=uss, warnings=state.warnings, stats=state.stats,
+        svg_files=state.svg_files,
+    )
 
 
 def _find_first_match(root: Node, selector_raw: str) -> Node | None:
@@ -139,6 +144,9 @@ class _EmitState:
     warnings: list[str] = field(default_factory=list)
     used_bridge: bool = False
     stats: ConvertStats = field(default_factory=ConvertStats)
+    svg_files: list[tuple[str, str]] = field(default_factory=list)
+    svg_blocks: list[str] = field(default_factory=list)
+    svg_assets_subdir: str = "Assets/UI/Images"
     _gen_counter: int = 0
 
     def add_rule(self, selector: str, decls: list[tuple[str, str]]) -> None:
@@ -263,6 +271,8 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
                state: _EmitState, rule_bridge_flags: list[bool],
                indent: int, *, parent: Node | None = None,
                li_index: int = 1) -> str:
+    if node.tag == "svg":
+        return _emit_svg(node, state, indent)
     uxml_tag, extra_attrs, text_mode = map_element(node.tag, node.attrs)
     pad = " " * indent
     classes = list(node.classes())
@@ -447,6 +457,86 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         return f"{pad}<{uxml_tag}{attr_str} />\n"
     body = "".join(rendered_children)
     return f"{pad}<{uxml_tag}{attr_str}>\n{body}{pad}</{uxml_tag}>\n"
+
+
+_SVG_DIM_RE = __import__("re").compile(
+    r'\bwidth\s*=\s*["\']([^"\']+)["\']|\bheight\s*=\s*["\']([^"\']+)["\']|'
+    r'\bviewBox\s*=\s*["\']([^"\']+)["\']'
+)
+
+
+def _svg_dimensions(raw: str) -> tuple[float, float] | None:
+    """Pull (width, height) from <svg ...> attrs or viewBox. Returns None if
+    no usable dimensions are present."""
+    width: float | None = None
+    height: float | None = None
+    view_w: float | None = None
+    view_h: float | None = None
+    head_end = raw.find(">")
+    head = raw[:head_end] if head_end > 0 else raw
+    for m in _SVG_DIM_RE.finditer(head):
+        if m.group(1) is not None:
+            width = _to_float(m.group(1))
+        elif m.group(2) is not None:
+            height = _to_float(m.group(2))
+        elif m.group(3) is not None:
+            parts = m.group(3).replace(",", " ").split()
+            if len(parts) == 4:
+                view_w = _to_float(parts[2])
+                view_h = _to_float(parts[3])
+    w = width if width is not None else view_w
+    h = height if height is not None else view_h
+    if w is None or h is None:
+        return None
+    return w, h
+
+
+def _to_float(s: str) -> float | None:
+    try:
+        return float(s.rstrip("px").strip())
+    except ValueError:
+        return None
+
+
+def _emit_svg(node: Node, state: _EmitState, indent: int) -> str:
+    """Always render an <svg> as a VisualElement with a background-image
+    pointing at a captured copy of the SVG markup, sized at 2x the SVG's own
+    width/height so it survives DPR scaling."""
+    pad = " " * indent
+    sid_raw = node.attrs.get("data-svg-id")
+    raw = ""
+    if sid_raw is not None:
+        try:
+            sid = int(sid_raw)
+            if 0 <= sid < len(state.svg_blocks):
+                raw = state.svg_blocks[sid]
+        except ValueError:
+            pass
+    state.stats.elements += 1
+    if not raw:
+        return f"{pad}<ui:VisualElement />\n"
+
+    n = len(state.svg_files) + 1
+    filename = f"svg-{n}.svg"
+    state.svg_files.append((filename, raw))
+
+    own_class = state.gen_class()
+    decls: list[tuple[str, str]] = [
+        ("background-image", f'url("{state.svg_assets_subdir}/{filename}")'),
+        ("-unity-background-scale-mode", "scale-to-fit"),
+    ]
+    dims = _svg_dimensions(raw)
+    if dims is not None:
+        w, h = dims
+        decls.append(("width", f"{w * 2:g}px"))
+        decls.append(("height", f"{h * 2:g}px"))
+    state.add_rule(f".{own_class}", decls)
+    state.stats.inline_overrides += 1
+
+    classes = list(node.classes())
+    classes.append(own_class)
+    cls_attr = " ".join(classes)
+    return f'{pad}<ui:VisualElement class="{_xml_escape(cls_attr)}" />\n'
 
 
 def _emit_synthetic_pseudo(content: str, decls, state: _EmitState, indent: int) -> str:

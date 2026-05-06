@@ -104,13 +104,18 @@ def main(argv: list[str] | None = None) -> int:
         select=args.selector,
     )
 
+    images_dir = out_dir / "Assets" / "UI" / "Images"
+    if result.svg_files:
+        images_dir.mkdir(parents=True, exist_ok=True)
+        for filename, raw in result.svg_files:
+            (images_dir / filename).write_text(raw, encoding="utf-8")
+
     asset_report: AssetReport | None = None
     if args.bundle_assets or args.download_assets:
-        assets_dir = out_dir / "Assets" / "UI" / "Images"
         result.uss, asset_report = collect_and_rewrite(
             result.uss,
             base_dir=local_base_dir,
-            assets_dir=assets_dir,
+            assets_dir=images_dir,
             download_remote=args.download_assets,
         )
 

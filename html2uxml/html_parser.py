@@ -5,9 +5,28 @@ implicitly when their parent closes, void elements never push onto the stack.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Optional
+
+
+_SVG_BLOCK_RE = re.compile(r"<svg\b[^>]*>.*?</svg\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_svg_blocks(source: str) -> tuple[str, list[str]]:
+    """Pull raw <svg>...</svg> markup out of `source` so the HTML parser does
+    not lowercase case-sensitive SVG attributes (viewBox, preserveAspectRatio).
+    Returns the rewritten source (with placeholders) and the captured blocks.
+    """
+    blocks: list[str] = []
+
+    def replace(match: re.Match) -> str:
+        idx = len(blocks)
+        blocks.append(match.group(0))
+        return f'<svg data-svg-id="{idx}"></svg>'
+
+    return _SVG_BLOCK_RE.sub(replace, source), blocks
 
 
 VOID_ELEMENTS = {
@@ -119,6 +138,7 @@ class ParsedHTML:
     root: Node
     inline_styles: list[str]
     linked_stylesheets: list[str]
+    svg_blocks: list[str] = field(default_factory=list)
 
 
 def parse_html(source: str) -> ParsedHTML:
@@ -127,6 +147,7 @@ def parse_html(source: str) -> ParsedHTML:
     # tokenization, and UI Toolkit text doesn't care about nbsp distinctions,
     # so normalize across the whole input.
     source = source.replace(" ", " ")
+    source, svg_blocks = _extract_svg_blocks(source)
     builder = _TreeBuilder()
     builder.feed(source)
     builder.close()
@@ -135,6 +156,7 @@ def parse_html(source: str) -> ParsedHTML:
         root=body,
         inline_styles=builder.style_blocks,
         linked_stylesheets=builder.linked_stylesheets,
+        svg_blocks=svg_blocks,
     )
 
 
