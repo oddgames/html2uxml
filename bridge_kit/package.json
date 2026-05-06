@@ -1,0 +1,9 @@
+{
+  "name": "com.html2uxml.bridge",
+  "version": "0.1.0",
+  "displayName": "html2uxml Bridge",
+  "description": "Runtime VisualElements that read --gg-* USS custom properties to paint CSS features USS lacks (box-shadow, linear-gradient).",
+  "unity": "2022.3",
+  "keywords": ["uxml", "uss", "html"],
+  "author": { "name": "html2uxml" }
+}
