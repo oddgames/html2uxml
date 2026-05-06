@@ -11,18 +11,9 @@ namespace HtmlToUxml.Bridge
     //   --gg-gradient (string: linear-gradient(...))
     //
     // If none are set the element behaves exactly like a plain VisualElement.
-#if UNITY_2023_2_OR_NEWER
     [UxmlElement]
     public partial class BridgeBox : VisualElement
-#else
-    public class BridgeBox : VisualElement
-#endif
     {
-#if !UNITY_2023_2_OR_NEWER
-        public new class UxmlFactory : UxmlFactory<BridgeBox, UxmlTraits> { }
-        public new class UxmlTraits : VisualElement.UxmlTraits { }
-#endif
-
         static readonly CustomStyleProperty<float> ShadowOffsetX = new CustomStyleProperty<float>("--gg-shadow-offset-x");
         static readonly CustomStyleProperty<float> ShadowOffsetY = new CustomStyleProperty<float>("--gg-shadow-offset-y");
         static readonly CustomStyleProperty<float> ShadowBlur    = new CustomStyleProperty<float>("--gg-shadow-blur");
