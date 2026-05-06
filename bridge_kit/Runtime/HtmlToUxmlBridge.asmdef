@@ -1,7 +1,9 @@
 {
     "name": "HtmlToUxmlBridge",
     "rootNamespace": "HtmlToUxml.Bridge",
-    "references": [],
+    "references": [
+        "Unity.VectorGraphics"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
@@ -9,6 +11,12 @@
     "precompiledReferences": [],
     "autoReferenced": true,
     "defineConstraints": [],
-    "versionDefines": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.vectorgraphics",
+            "expression": "0.0.0",
+            "define": "HTML2UXML_VECTORGRAPHICS"
+        }
+    ],
     "noEngineReferences": false
 }
