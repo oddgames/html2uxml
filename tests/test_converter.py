@@ -217,6 +217,47 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn('text="1."', r.uxml)
         self.assertIn('text="2."', r.uxml)
 
+    # ---- subtree selection + pruning -------------------------------------
+
+    def test_select_extracts_subtree(self):
+        html = (
+            '<div class="outer"><span>outside</span></div>'
+            '<div id="card"><span>inside</span></div>'
+            '<div class="other"><span>also outside</span></div>'
+        )
+        r = convert(html, select="#card")
+        self.assertIn("inside", r.uxml)
+        self.assertNotIn("outside", r.uxml)
+        self.assertNotIn("also outside", r.uxml)
+
+    def test_select_prunes_unused_css_rules(self):
+        html = (
+            "<style>"
+            ".kept { color: red; }"
+            ".unused { color: blue; }"
+            ".outer .kept { padding: 4px; }"
+            "</style>"
+            '<div class="outer"><span class="kept">x</span></div>'
+            '<div class="elsewhere"><span class="unused">y</span></div>'
+        )
+        r = convert(html, select=".outer")
+        self.assertIn(".kept", r.uss)
+        self.assertIn(".outer .kept", r.uss)
+        self.assertNotIn(".unused", r.uss)
+
+    def test_select_no_match_warns(self):
+        r = convert("<div></div>", select=".missing")
+        self.assertTrue(any("matched no element" in w for w in r.warnings))
+
+    def test_full_doc_prunes_dead_rules(self):
+        # No element matches .ghost, so the rule should not appear in USS.
+        r = convert(
+            "<style>.alive { color: red; } .ghost { color: blue; }</style>"
+            '<div class="alive"></div>'
+        )
+        self.assertIn(".alive", r.uss)
+        self.assertNotIn(".ghost", r.uss)
+
 
 if __name__ == "__main__":
     unittest.main()

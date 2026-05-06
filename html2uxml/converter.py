@@ -4,10 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .css_parser import _parse_declarations, parse_css
+from .css_parser import _parse_declarations, parse_css, parse_selector
 from .html_parser import Node, parse_html
 from .mappings import map_declarations, map_element
-from .resolver import _ParsedRule, parse_rules, resolve, ResolvedStyle
+from .resolver import (
+    _ParsedRule, parse_rules, resolve, ResolvedStyle, selector_matches,
+)
 
 
 @dataclass
@@ -39,7 +41,15 @@ def convert(
     *,
     uss_filename: str = "styles.uss",
     base_dir: Path | None = None,
+    select: str | None = None,
 ) -> ConvertResult:
+    """Convert HTML+CSS to UXML+USS.
+
+    `select` (a CSS selector) restricts emission to the first matching
+    subtree. The full document's CSS is still parsed so rules can match
+    descendants, but only rules with at least one matching node in the
+    subtree are emitted to USS.
+    """
     parsed = parse_html(html)
     css_chunks = list(parsed.inline_styles)
     if base_dir is not None:
@@ -52,24 +62,69 @@ def convert(
         css_chunks.append(extra_css)
     rules = parse_css("\n".join(css_chunks))
     parsed_rules = parse_rules(rules)
+
+    # Subtree selection: find the first matching node, wrap it in a synthetic
+    # root so the converter renders that element AND its descendants.
+    selection_warning: str | None = None
+    if select:
+        target = _find_first_match(parsed.root, select)
+        if target is None:
+            selection_warning = f"selector matched no element: {select!r}"
+        else:
+            new_root = Node(tag="__root__")
+            new_root.children = [target]
+            parsed.root = new_root
+
     resolved = resolve(parsed.root, parsed_rules)
 
     state = _EmitState()
+    if selection_warning:
+        state.warnings.append(selection_warning)
 
-    # Pre-flight: find which parsed rules contribute bridge custom props, so
-    # that any element matching them is promoted to gg:BridgeBox even if its
-    # own inline style has no --gg-* declaration.
     rule_bridge_flags = _compute_rule_bridge_flags(parsed_rules)
 
-    # Emit class/id/tag rules from the parsed CSS verbatim, mapped through
-    # USS translation, so the original class names survive into the output.
-    _emit_css_rules(parsed_rules, state)
+    # Prune USS to selectors that actually hit something in the (sub)tree.
+    used_selectors: set = set()
+    for rs in resolved.values():
+        used_selectors.update(rs.matched_selectors)
+    _emit_css_rules(parsed_rules, state, allowed_selectors=used_selectors)
 
     body_xml = _emit_node_children(parsed.root, resolved, state, rule_bridge_flags, indent=2)
     uxml = _wrap_uxml(body_xml, uss_filename, with_bridge=state.used_bridge)
     uss = _emit_uss(state)
     state.stats.uss_rules = len(state.uss_order)
     return ConvertResult(uxml=uxml, uss=uss, warnings=state.warnings, stats=state.stats)
+
+
+def _find_first_match(root: Node, selector_raw: str) -> Node | None:
+    sel = parse_selector(selector_raw)
+    if sel is None:
+        return None
+    found: list[Node] = []
+
+    def walk(node: Node, ancestors: list[Node]) -> None:
+        if found:
+            return
+        if not node.is_text and node.tag != "__root__":
+            if ancestors:
+                parent = ancestors[-1]
+                sibs = [c for c in parent.children if not c.is_text]
+                try:
+                    sib_idx = sibs.index(node)
+                except ValueError:
+                    sib_idx = -1
+            else:
+                sibs, sib_idx = [node], 0
+            if selector_matches(node, sel, ancestors, sib_idx, sibs):
+                found.append(node)
+                return
+        for child in node.children:
+            if child.is_text:
+                continue
+            walk(child, ancestors + [node])
+
+    walk(root, [])
+    return found[0] if found else None
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +160,14 @@ class _EmitState:
 # ---------------------------------------------------------------------------
 
 
-def _emit_css_rules(parsed_rules: list[_ParsedRule], state: _EmitState) -> None:
+def _emit_css_rules(parsed_rules: list[_ParsedRule], state: _EmitState,
+                    *, allowed_selectors: set | None = None) -> None:
     for rule in parsed_rules:
+        # Drop the rule entirely if none of its selectors hit the (sub)tree.
+        if allowed_selectors is not None and not any(
+            s.raw in allowed_selectors for s in rule.selectors
+        ):
+            continue
         mapped = map_declarations([(d.prop, d.value) for d in rule.declarations])
         _record_warnings(state, mapped.warnings)
         if not mapped.decls:
@@ -116,6 +177,8 @@ def _emit_css_rules(parsed_rules: list[_ParsedRule], state: _EmitState) -> None:
                 state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
                 state.used_bridge = True
         for sel in rule.selectors:
+            if allowed_selectors is not None and sel.raw not in allowed_selectors:
+                continue
             state.add_rule(sel.raw, mapped.decls)
             state.stats.css_class_rules += 1
 

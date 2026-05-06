@@ -138,12 +138,11 @@ class ResolvedStyle:
     base: list[tuple[str, str]] = field(default_factory=list)
     pseudo_rules: list[tuple[str, list[Declaration]]] = field(default_factory=list)
     matched_rule_indices: list[int] = field(default_factory=list)
-    # Declarations from selectors that USS won't parse (attribute selectors,
-    # ::pseudo-elements, :nth-child, etc). These are hoisted onto the
-    # element's per-instance USS rule so the styles still apply.
+    # Raw selector strings (one per matching selector, including pseudos and
+    # unsupported ones) that hit this element. Used to prune dead USS rules
+    # when the converter is scoped to a subtree.
+    matched_selectors: tuple = ()
     unsupported_decls: list[Declaration] = field(default_factory=list)
-    # When ::before / ::after rules with `content:` match this element,
-    # synthesize sibling Labels.
     before_content: str | None = None
     after_content: str | None = None
     before_decls: list[Declaration] = field(default_factory=list)
@@ -186,6 +185,7 @@ def _resolve_for(node: Node, ancestors: list[Node], rules: list[_ParsedRule],
     matches: list[tuple[tuple[int, int, int], int, list[Declaration]]] = []
     pseudo_rules: list[tuple[str, list[Declaration]]] = []
     matched_indices: list[int] = []
+    matched_selector_raws: list[str] = []
     unsupported_decls: list[Declaration] = []
     before_content: str | None = None
     after_content: str | None = None
@@ -195,6 +195,7 @@ def _resolve_for(node: Node, ancestors: list[Node], rules: list[_ParsedRule],
         for sel in rule.selectors:
             if not selector_matches(node, sel, ancestors, sib_idx, siblings):
                 continue
+            matched_selector_raws.append(sel.raw)
             # Pseudo-element ::before / ::after rules become synthetic siblings.
             pseudo_elem = _pseudo_element_kind(sel)
             if pseudo_elem in ("before", "after"):
@@ -246,6 +247,7 @@ def _resolve_for(node: Node, ancestors: list[Node], rules: list[_ParsedRule],
     return ResolvedStyle(
         base=base, pseudo_rules=pseudo_rules,
         matched_rule_indices=matched_indices,
+        matched_selectors=tuple(matched_selector_raws),
         unsupported_decls=unsupported_decls,
         before_content=before_content,
         after_content=after_content,
