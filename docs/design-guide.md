@@ -178,7 +178,119 @@ your-design/
   fetched (URL inputs) or read from disk (file inputs).
 - Image paths must resolve relative to the HTML file.
 
-## 12. Quick Self-Check
+## 12. Hard-No List (Avoid Entirely)
+
+Features in this list are **silently dropped** and have no bridge in
+flight. If the design depends on any of them, redesign the affected
+piece before handing it off — the converter will not warn loudly enough
+to save you.
+
+### Layout
+- `display: grid`, `display: table`, `display: inline-grid`, `display: inline-block`
+- `float`, `clear`
+- `column-count` / multi-column layout
+- `position: sticky`, `position: fixed` (the latter is silently re-aliased)
+- `aspect-ratio` (use explicit `width` + `height` instead)
+- `place-items`, `place-content`, `place-self` (grid-only shorthands)
+- Container queries (`@container`)
+- CSS subgrid
+
+### Visual effects
+- `backdrop-filter` (frosted glass)
+- `mask`, `mask-image`, `-webkit-mask`
+- `mix-blend-mode`, `background-blend-mode`
+- `filter` other than `drop-shadow(...)` (no blur, hue-rotate, saturate, etc.)
+- `clip-path` shapes other than `polygon(...)` (no `circle()`, `ellipse()`,
+  `inset()`, `path()`, `url(#mask)`)
+- Multi-shadow `box-shadow` lists
+- `inset` / inner shadows
+- Conic and radial gradients
+- CSS variables that resolve to gradient/shadow strings (only literal
+  declarations are bridged)
+- `transform-style: preserve-3d`, `perspective`, `backface-visibility`
+- 3D transforms (`rotateX`, `rotateY`, `rotateZ` other than `rotate`,
+  `translateZ`, `matrix3d`)
+
+### Typography
+- `line-height` (use `font-size` + parent `padding` instead)
+- `text-shadow` with multiple shadows
+- `writing-mode`, `direction: rtl`
+- `font-variant-*`, `font-feature-settings`
+- `text-stroke`, `-webkit-text-stroke`
+- `hyphens`, `word-break`, `overflow-wrap`
+- Variable-font axes beyond weight (`wdth`, `slnt`, `opsz`, custom axes)
+- `@font-face` with non-Google sources
+
+### Color & input
+- `color-mix()`, `oklch()`, `lab()`, `lch()`, `hwb()`, relative-color syntax
+- Wide-gamut color spaces (`@media (color-gamut: p3)`)
+- `::selection` styling
+- `caret-color`
+- System color keywords (`Canvas`, `LinkText`, etc.)
+
+### Animation
+- `cubic-bezier()` and `steps()` timing functions
+- `@keyframes` driving anything outside the whitelisted property set
+  (`opacity`, `translate`, `scale`, `rotate`, `background-position`)
+- CSS scroll-driven animations (`animation-timeline`, `view-timeline`)
+- `@scope`, `@layer`, `@property` registrations
+
+### Interactivity / scripting
+- Inline `onclick`, `onchange`, `oninput`, `onsubmit` handlers
+- React, Vue, Svelte, Alpine, htmx — anything that materialises DOM at
+  runtime. The converter sees only the static markup; runtime-rendered
+  components produce empty UXML. Render to static HTML first.
+- `<form>` submission semantics (no network in Unity).
+- `contenteditable`
+- `<dialog>` open/close behaviour (renders, but `showModal()` doesn't fire).
+- Web Components (`<my-element>` custom elements + shadow DOM).
+- IFrames, embeds, web-views.
+
+### Media
+- `<canvas>`, `<video>`, `<audio>`
+- Background `url()` referencing a CSS sprite (the entire sheet is loaded
+  but `background-position` cropping is approximate at best).
+- Lazy-loaded images (`loading="lazy"` is ignored — everything is loaded
+  on import).
+- Picture sources / `srcset` (only the `src` attribute is read).
+
+### HTML structure
+- `<table>`, `<thead>`, `<tbody>`, `<tr>`, `<td>` — flatten to flex
+  containers in the source.
+- `<map>` / `<area>` image hotspots
+- `<noscript>`, `<template>` (stripped)
+- `<slot>` and shadow-root placeholders
+
+### Selectors / at-rules
+- `@media` queries (everything collapses to the default resolution).
+- `@supports`, `@import`
+- `[attr~=value]`, `[attr^=value]`, `[attr$=value]`, `[attr*=value]`
+- `:has(...)` (relational pseudo-class)
+- `::part`, `::slotted`, `::backdrop`
+- `:where()`, `:is()` with non-trivial argument lists (parsed but
+  precedence may shift)
+
+### Units
+- `calc()` mixing length with percentage / viewport units
+- `min()`, `max()`, `clamp()`
+- Container query units (`cqw`, `cqh`, `cqi`, `cqb`)
+- `lvh`, `lvw`, `dvh`, `dvw` — dynamic viewport units
+- `q`, `cm`, `mm`, `in`, `pc`, `pt` (use `px`)
+
+### Workflow gotchas
+- HTML pages that require a build step (`<script type="module">` with
+  imports). Pre-bundle to a single static file.
+- HTML pages that depend on browser DevTools-only features (`@scroll-timeline`,
+  `:state()`).
+- Designs sized to a specific viewport using `vh/vw` only — supply
+  fixed `px` widths/heights so the UXML survives at any Unity panel
+  resolution.
+
+If a design needs something on this list, treat it as a **redesign
+trigger**, not a converter bug. The closer the source sticks to the
+contract, the less hand-cleanup the Unity output needs.
+
+## 13. Quick Self-Check
 
 Before handing a design to the converter, run through:
 
