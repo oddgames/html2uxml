@@ -28,6 +28,8 @@ approximated.
 - `position: absolute` is honoured; `position: fixed` is approximated as
   absolute (use the document root as the offset parent yourself).
 - `box-sizing` is always **border-box** in USS — write to that assumption.
+- `aspect-ratio: <ratio>` is supported natively in Unity 6 USS — use it
+  for any element whose width should track its height.
 
 ### Z-ordering
 
@@ -51,8 +53,14 @@ dropped at conversion. Plan stacking by source order.
   `font-size`, `font-weight`, `font-style: italic`, `letter-spacing`,
   `text-align`, `color`, `text-transform`, `text-decoration: underline`,
   `white-space`.
-- Avoid `line-height` (no USS equivalent), `text-indent`, `word-break`,
-  `hyphens`, `vertical-align`.
+- `line-height: <px>` is auto-mapped to `-unity-paragraph-spacing`
+  (Unity's nearest equivalent). Unitless multipliers (`line-height: 1.5`)
+  drop with a warning — author with explicit pixel values for fidelity.
+- `-webkit-text-stroke: <width> <color>` (and the long-hand
+  `-webkit-text-stroke-width` / `-webkit-text-stroke-color`) auto-map to
+  `-unity-text-outline-width` / `-unity-text-outline-color`. Use this for
+  outlined text instead of stacked text-shadows.
+- Avoid `text-indent`, `word-break`, `hyphens`, `vertical-align`.
 
 ## 3. Color, Background, Borders
 
@@ -92,6 +100,12 @@ dropped at conversion. Plan stacking by source order.
   - Don't reference external assets from inside the SVG (no `<image href>`,
     no `<use href>`).
   - Animations / scripts inside the SVG are stripped at import time.
+  - **Unity Vector Graphics package limits**: no `<text>` (rasterise to
+    paths), no `<filter>`, no per-pixel masks, no embedded raster images,
+    no SVG `<animate>` tags. Stick to paths, basic shapes, and gradient
+    fills.
+  - Multiply-tint a single SVG via `-unity-background-image-tint-color`
+    if you need it in different palettes.
 - `background-image: url(...)` works for raster images (PNG/JPG/WebP).
 - No `<canvas>`, `<video>`, `<audio>`, `<iframe>`, `<embed>`. They become
   empty placeholder elements.
@@ -104,7 +118,11 @@ keyframes follow this shape:
 - **Properties allowed in keyframes**:
   `opacity`, `transform: translateX/Y(...)`, `transform: scale(...)`,
   `transform: rotate(...)`, `background-position`.
-- **Timing**: `linear`, `ease`, `ease-in`, `ease-out`, `ease-in-out`.
+- **Timing**: any of USS's named easing keywords are honoured —
+  `linear`, `ease`, `ease-in`, `ease-out`, `ease-in-out`,
+  `ease-in-sine` / `ease-out-sine` / `ease-in-out-sine`,
+  and the `-cubic`, `-circ`, `-elastic`, `-back`, `-bounce` family
+  (`ease-in-elastic`, `ease-out-bounce`, etc.).
   No `cubic-bezier()`, no `steps()`.
 - **Iteration**: `infinite` or an integer count. Direction `normal`,
   `reverse`, `alternate`. Fill modes are ignored.
@@ -122,6 +140,31 @@ Example the converter is happy with:
 ```
 
 Anything outside this subset becomes a static element on import.
+
+## 5b. Unity-Specific Properties Worth Authoring Against
+
+USS exposes `-unity-*` properties that have no CSS analogue. They don't
+appear in plain CSS authoring but the converter **passes them through**
+verbatim if the source CSS uses them, so designers can opt in:
+
+- `-unity-text-outline-width` + `-unity-text-outline-color` — true text
+  stroke. Use instead of stacked text-shadows.
+- `-unity-paragraph-spacing: <px>` — replacement for `line-height`.
+  Spacing between paragraphs (or text wraps) in pixels.
+- `-unity-background-image-tint-color: <color>` — multiply the element's
+  background image (or SVG) by a color. Lets one icon asset render in
+  many palettes.
+- `-unity-slice-left/-top/-right/-bottom` + `-unity-slice-scale` —
+  9-slice scaling for stretchy frames. Use for resizable button
+  backgrounds and cards. Source PNG must be set up for 9-slice.
+- `-unity-font-definition: url("Assets/UI/Fonts/Foo.ttf")` — direct font
+  reference. The converter writes this automatically when
+  `--download-fonts` is used; you can hand-author for non-Google fonts.
+- `-unity-overflow-clip-box: padding-box | content-box` — choose where
+  `overflow: hidden` clips. Defaults to padding-box.
+
+These are the right answer when a CSS feature looks tantalisingly close
+but isn't quite supported (line-height, icon coloring, multi-shadow text).
 
 ## 6. Transitions
 
@@ -235,7 +278,6 @@ to save you.
 - `float`, `clear`
 - `column-count` / multi-column layout
 - `position: sticky`, `position: fixed` (the latter is silently re-aliased)
-- `aspect-ratio` (use explicit `width` + `height` instead)
 - `place-items`, `place-content`, `place-self` (grid-only shorthands)
 - Container queries (`@container`)
 - CSS subgrid
@@ -257,11 +299,9 @@ to save you.
   `translateZ`, `matrix3d`)
 
 ### Typography
-- `line-height` (use `font-size` + parent `padding` instead)
 - `text-shadow` with multiple shadows
 - `writing-mode`, `direction: rtl`
 - `font-variant-*`, `font-feature-settings`
-- `text-stroke`, `-webkit-text-stroke`
 - `hyphens`, `word-break`, `overflow-wrap`
 - Variable-font axes beyond weight (`wdth`, `slnt`, `opsz`, custom axes)
 - `@font-face` with non-Google sources

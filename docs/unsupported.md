@@ -121,10 +121,12 @@ These are silently rewritten to nothing. Warning text:
 
 ### `line-height`
 - **Used for**: vertical text rhythm.
-- **Today**: dropped.
-- **To support**: USS has no line-height. Workaround: increase `font-size`
-  and add `padding-top/bottom` on Label parents. Could approximate by
-  emitting `padding` derived from `(line-height − 1) * font-size / 2`.
+- **Today**: `line-height: <px>` auto-mapped to `-unity-paragraph-spacing`.
+  Unitless multipliers (`1.5`) drop with a warning since the converter
+  can't resolve the parent font-size at mapping time.
+- **To support better**: when authoring with `line-height: 1.5`-style
+  multipliers, the converter would need to walk the resolver and emit a
+  font-size-relative paragraph-spacing per element. Not implemented.
 
 ---
 

@@ -162,7 +162,7 @@ DROP_PROPS = {
     "text-decoration",  # consumed by Label rich-text in the converter
     "text-transform",   # consumed by Label text pre-processing
     "text-indent", "vertical-align",
-    "word-break", "overflow-wrap", "hyphens", "line-height",
+    "word-break", "overflow-wrap", "hyphens",
 }
 
 # Common HTML cursor keywords -> USS cursor keywords. USS supports a fixed
@@ -433,8 +433,20 @@ def _strip_unit(n: str) -> str:
     return n
 
 
+_VENDOR_KEEP = {
+    "-webkit-text-stroke",
+    "-webkit-text-stroke-width",
+    "-webkit-text-stroke-color",
+}
+
+
 def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
-    if prop.startswith("-webkit-") or prop.startswith("-moz-") or prop.startswith("-ms-"):
+    if prop not in _VENDOR_KEEP and (
+        prop.startswith("-webkit-") or prop.startswith("-moz-") or prop.startswith("-ms-")
+    ):
+        return None
+    if prop in ("text-decoration", "text-transform"):
+        # These are consumed while emitting text nodes, not written as USS.
         return None
     if prop in DROP_PROPS:
         warnings.append(f"unsupported in USS, dropped: {prop}: {value}")
@@ -662,6 +674,35 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
             return [("text-overflow", v)]
         return None
 
+    # line-height -> -unity-paragraph-spacing (approximate). USS has no real
+    # line-height; paragraph-spacing controls extra space between wrapped
+    # lines. We pass the px value through as a best-effort substitute.
+    if prop == "line-height":
+        v = value.strip().lower()
+        if v in ("normal", "inherit", "initial"):
+            return None
+        if v.endswith("px"):
+            return [("-unity-paragraph-spacing", v)]
+        # Unitless multiplier or em/% — can't resolve without font-size context.
+        warnings.append(f"line-height: {value} approximated as 0 paragraph spacing")
+        return [("-unity-paragraph-spacing", "0")]
+
+    # -webkit-text-stroke -> -unity-text-outline-{width,color}
+    if prop in ("-webkit-text-stroke", "text-stroke"):
+        parts = value.split(None, 1)
+        if not parts:
+            return None
+        width = parts[0]
+        color = parts[1] if len(parts) > 1 else None
+        out: list[tuple[str, str]] = [("-unity-text-outline-width", width)]
+        if color:
+            out.append(("-unity-text-outline-color", color))
+        return out
+    if prop == "-webkit-text-stroke-width":
+        return [("-unity-text-outline-width", value)]
+    if prop == "-webkit-text-stroke-color":
+        return [("-unity-text-outline-color", value)]
+
     # text-shadow: USS (newer) accepts the same syntax.
     if prop == "text-shadow":
         return [("text-shadow", value)]
@@ -684,6 +725,8 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         "justify-content", "justify-self",
         "visibility",
         "letter-spacing", "font-size", "word-spacing",
+        "aspect-ratio",
+        "text-shadow",
         "transition", "transition-property",
         "transition-duration", "transition-delay", "transition-timing-function",
         "translate", "rotate", "scale",
