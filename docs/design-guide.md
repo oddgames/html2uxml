@@ -205,13 +205,205 @@ hooks from the generated UXML:
   `DropdownField`, `TextField`, `Slider`, `Foldout`, `ProgressBar`.
 
 Avoid: arbitrary `onclick="..."` strings, React state, jQuery toggles,
-`data-toggle-*` assumptions, and runtime-rendered DOM. Render to static
-HTML first, then bind behavior in Unity C#.
+generic `data-toggle-*` assumptions, and runtime-rendered DOM. Render to
+static HTML first, then bind behavior in Unity C#.
 
 **Pointer-blocking**: `pointer-events: none` (inline, class rule, or
 `<style>`) is auto-emitted as `picking-mode="Ignore"` on the UXML
 element. Use it for decorative overlays you don't want to swallow
 clicks.
+
+## 7b. Controller Export Contract
+
+A controller exporter should generate one C# controller per converted UI:
+
+```
+MyScreen.uxml
+MyScreen.uss
+MyScreenController.cs
+MyScreenController.Custom.cs   # optional, hand-authored partial
+```
+
+The generated file is disposable and may be overwritten. Any hand-written
+logic goes in a separate partial class file that the exporter never touches.
+This matches Unity UI Toolkit's normal runtime shape: bind against a
+`UIDocument.rootVisualElement`, query elements with UQuery (`Q<T>`), and
+register callbacks in C#.
+
+The `au.com.oddgames.html2uxml` Unity package provides
+`ODDGames.Html2Uxml.UXMLController`; generated controllers should derive
+from it. That base class already owns UIDocument resolution, delayed wire
+retries, callback tracking, reverse-order unwire, transient asset cleanup,
+and editor warnings for missing query targets. Generated controllers should
+not define `Start()` or `OnDestroy()` in that setup.
+
+The exporter must read the original HTML and scripts before conversion,
+because `<script>` tags are stripped and `data-*` attributes are not
+currently emitted into UXML. The generated controller should bind to the
+UXML by `id`, which becomes the Unity `name` attribute.
+
+### Authoring rules for controller-friendly HTML
+
+- Put a stable `id` on every interactive element and every target:
+  `id="menuButton"`, `id="menu"`, `id="settingsPanel"`.
+- Put the root controller name on the main wrapper:
+  `data-h2u-controller="GarageMenu"`.
+- Prefer `data-h2u-*` actions over inline JavaScript. They are easier and
+  safer to lower into C# than arbitrary code.
+- Keep state visual, not structural. Toggle classes like `.open`,
+  `.selected`, `.disabled`, and let USS handle transitions.
+- Keep targets explicit. Use `#id` selectors in `data-h2u-target`; avoid
+  relative selectors such as `.parent .child:nth-child(2)`.
+- If the action cannot be represented declaratively, mark it as custom and
+  let the generated controller create a partial method stub.
+
+Example:
+
+```html
+<div id="garageRoot" data-h2u-controller="GarageMenu">
+  <button id="menuButton"
+          data-h2u-on="click"
+          data-h2u-action="toggle-class"
+          data-h2u-target="#menu"
+          data-h2u-class="open">
+    Menu
+  </button>
+
+  <button id="buyButton"
+          data-h2u-on="click"
+          data-h2u-action="custom"
+          data-h2u-method="BuyUpgrade">
+    Buy
+  </button>
+
+  <div id="menu" class="menu"></div>
+</div>
+```
+
+### Supported declarative actions
+
+| Action | Required attributes | Generated C# behavior |
+|--------|---------------------|-----------------------|
+| `toggle-class` | `data-h2u-target`, `data-h2u-class` | `target.ToggleInClassList(className)` |
+| `add-class` | `data-h2u-target`, `data-h2u-class` | `target.AddToClassList(className)` |
+| `remove-class` | `data-h2u-target`, `data-h2u-class` | `target.RemoveFromClassList(className)` |
+| `show` | `data-h2u-target` | `target.style.display = DisplayStyle.Flex` |
+| `hide` | `data-h2u-target` | `target.style.display = DisplayStyle.None` |
+| `show-panel` | `data-h2u-target`, `data-h2u-group` | Hide peers in the same group, then show the target |
+| `set-text` | `data-h2u-target`, `data-h2u-value` | Set `Label.text` or `Button.text` |
+| `set-value` | `data-h2u-target`, `data-h2u-value` | Set a supported field value with `SetValueWithoutNotify` |
+| `custom` | `data-h2u-method` | Call a generated partial method stub |
+
+For `show-panel`, every panel in the group should declare
+`data-h2u-group="<group>"`. The exporter can build the group from those
+source attributes, even though they do not survive into UXML.
+
+### Event mapping
+
+| HTML event | Unity binding |
+|------------|---------------|
+| `click` on `<button>` | `WireClick(button, Handler)` |
+| `click` on other elements | `WireClickable(element, Handler)` |
+| `change` on fields/toggles/sliders/dropdowns | `WireValueChanged(field, Handler)` |
+| `input` on text fields | `WireValueChanged(textField, Handler)` |
+| `submit` | Generate a custom partial method; Unity has no HTML form submission |
+
+Generated controllers should cache element references in `WireUI`, register
+callbacks only through the base `Wire*` helpers, and return `false` until
+required elements are present. Do not call `root.Q(...)` inside every click
+handler.
+
+Recommended generated shape:
+
+```csharp
+using UnityEngine;
+using UnityEngine.UIElements;
+using ODDGames.Html2Uxml;
+
+public partial class GarageMenuController : UXMLController
+{
+    [SerializeField] VisualTreeAsset visualTree;
+
+    Button menuButton;
+    VisualElement menu;
+    Button buyButton;
+
+    protected override void ConfigureDocument(UIDocument doc)
+    {
+        if (visualTree != null)
+            doc.visualTreeAsset = visualTree;
+    }
+
+    protected override bool WireUI(VisualElement root)
+    {
+        menuButton = root.Q<Button>("menuButton");
+        menu = root.Q<VisualElement>("menu");
+        buyButton = root.Q<Button>("buyButton");
+
+        if (menuButton == null || menu == null || buyButton == null)
+            return false;
+
+        WireClick(menuButton, OnMenuButtonClicked);
+        WireClick(buyButton, OnBuyButtonClicked);
+        return true;
+    }
+
+    protected override void OnWired()
+    {
+        OnBound();
+    }
+
+    private void OnMenuButtonClicked()
+    {
+        menu.ToggleInClassList("open");
+    }
+
+    private void OnBuyButtonClicked()
+    {
+        BuyUpgrade();
+    }
+
+    partial void OnBound();
+    partial void BuyUpgrade();
+}
+```
+
+If a target project intentionally does not install
+`au.com.oddgames.html2uxml`, use the same shape with
+`MonoBehaviour.OnEnable` / `OnDisable`, cache UQuery results once, register
+callbacks at enable time, and unregister every callback manually. The
+package base-controller path is preferred because it avoids duplicate
+lifecycle and cleanup code in every generated file.
+
+Hand-authored extension file:
+
+```csharp
+public partial class GarageMenuController
+{
+    partial void BuyUpgrade()
+    {
+        // Game-specific behavior lives here.
+    }
+}
+```
+
+### JavaScript recovery rules
+
+When importing an existing UI, JavaScript recovery should be best-effort and
+AST-based. Do not use regular expressions and do not execute the script.
+Only lower simple, local DOM actions:
+
+- `document.getElementById("id")` and `document.querySelector("#id")`.
+- `element.addEventListener("click", handler)`.
+- `classList.add(...)`, `classList.remove(...)`, `classList.toggle(...)`.
+- `style.display = "none"` and `style.display = "flex"`.
+- Assigning simple `.textContent`, `.innerText`, `.value`, and `.checked`.
+
+Everything else becomes a generated partial method with a TODO:
+network calls, timers, storage, canvas, dynamic DOM creation, framework
+state, complex conditionals, loops over live DOM collections, and animation
+code. The exporter should preserve the UI and isolate missing behavior
+behind partial hooks rather than producing fragile C#.
 
 ## 8. Components Worth Using
 
@@ -272,9 +464,75 @@ Selectors have two paths:
 Prefer the verbatim set for maintainability. Hoisted selectors are useful
 when importing existing HTML, but they become static snapshots: if C# later
 moves elements around, the generated `.h2u-N` classes do not recompute.
+Do not combine hoisted selectors with runtime pseudo-classes such as
+`:hover` or `:focus`; the converter drops those mixed selectors rather
+than baking a stateful rule into an always-on class.
 
 Skip: `::part`, `::slotted`, container queries, `@layer`, `@scope`,
 `@media` (the converter strips them).
+
+## 11b. Screen Labeling for `--selector`
+
+The CLI's `--selector` flag extracts a single screen subtree from a
+multi-screen design canvas. To make a screen reliably extractable, label
+its root element with **both** an `id` and the convention class
+`screen`. The id is what the converter targets; the class is for human
+readability inside the design canvas.
+
+```html
+<section id="login" class="screen" aria-label="Login screen">
+  <!-- screen contents -->
+</section>
+
+<section id="lobby" class="screen" aria-label="Lobby screen">
+  <!-- screen contents -->
+</section>
+
+<section id="match-summary" class="screen" aria-label="Match summary">
+  <!-- screen contents -->
+</section>
+```
+
+Conversion rules:
+
+- **id naming**: lowercase-kebab, no spaces, stable. Becomes `name="..."`
+  on the UXML root, so it must round-trip cleanly to a Unity-side
+  `Q<VisualElement>("login")` lookup.
+- **One id per screen**, project-wide unique. Reusing an id across
+  screens makes `--selector "#dup"` ambiguous (the converter takes the
+  first match).
+- **Wrap with a single root element**. `--selector` extracts one subtree;
+  if your screen is a fragment of siblings, wrap them in a containing
+  `<section id="...">` first.
+- **Avoid relying on positional selectors** (`body > div:nth-child(2)`).
+  They break the moment the design canvas reorders.
+
+Then the per-screen export commands look like:
+
+```bash
+html2uxml design-canvas.html --selector "#login"        --name Login        -o out/
+html2uxml design-canvas.html --selector "#lobby"        --name Lobby        -o out/
+html2uxml design-canvas.html --selector "#match-summary" --name MatchSummary -o out/
+```
+
+Each command produces its own `.uxml` / `.uss` so the Unity side can
+load them independently.
+
+If a designer ever needs a sub-region of a screen exported separately
+(say, a chat overlay), give it its own labeled wrapper too. Use a
+hyphenated id rather than a dot so the value is a clean CSS id selector:
+
+```html
+<section id="login" class="screen">
+  <div id="login-chat-overlay" class="overlay">...</div>
+</section>
+```
+
+`--selector "#login-chat-overlay"` then targets the overlay alone. The
+prefix (`login-`) keeps the namespace readable when scanning the canvas.
+Don't put a literal `.` in an id — the CSS selector parser reads it as a
+class join (`#login.chat-overlay` means id `login` AND class
+`chat-overlay`).
 
 ## 12. File Layout the Converter Expects
 
@@ -466,13 +724,14 @@ my-unity-project/
       Fonts/    # downloaded TTFs from Google Fonts
 ```
 
-Drop the contents into your Unity project's `Assets/` folder and pair
-with the bridge package (`bridge_kit/`).
+Drop the generated UI assets into your Unity project's `Assets/` folder and
+install the runtime package (`au.com.oddgames.html2uxml`) through Unity's
+Package Manager.
 
 ## 16. Minimal Compliant Sample
 
 Copy-paste skeleton showing a flex layout, gap, gradient background,
-animation, and a declarative toggle:
+Unity 6.4 filter transition, SVG asset capture, and stable C# hooks:
 
 ```html
 <!DOCTYPE html>
@@ -507,32 +766,34 @@ animation, and a declarative toggle:
     background: #2563eb;
     font-size: 12px;
     font-weight: 700;
+    transition-property: translate, filter;
+    transition-duration: 160ms;
+    transition-timing-function: ease-out-cubic;
+    translate: 0px 0px;
   }
 
-  .pulse {
-    animation: pulse 1.6s ease-in-out infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50%      { opacity: 0.4; }
+  .pill:hover {
+    translate: 0px -2px;
+    filter: tint(#7dd3fc);
   }
 
-  /* Declarative toggle: clicking .menu-btn flips .open on .menu */
-  .menu { display: none; }
+  .menu { display: flex; flex-direction: column; gap: 6px; }
   .menu.open { display: flex; }
 </style>
 </head>
 <body>
   <div class="panel">
     <div class="row">
-      <span class="pill pulse">LIVE</span>
-      <span title="Toggle the menu"
-            class="menu-btn"
-            data-toggle-target=".menu"
-            data-toggle-class="open">☰</span>
+      <span class="pill">LIVE</span>
+      <button id="menuButton"
+              title="Toggle the menu"
+              data-h2u-on="click"
+              data-h2u-action="toggle-class"
+              data-h2u-target="#menu"
+              data-h2u-class="open">Menu</button>
     </div>
 
-    <div class="menu" data-show-group="main">
+    <div id="menu" class="menu">
       <button>Profile</button>
       <button>Settings</button>
     </div>
