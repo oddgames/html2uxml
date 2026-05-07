@@ -5,10 +5,15 @@ converter produces clean Unity UXML+USS. Every convention here is something
 the converter actively recognises. Code that follows the contract round-trips
 losslessly; code that drifts gets dropped or approximated.
 
-**Target runtime**: Unity 6.0 or newer. The bridge kit uses the
+**Target runtime**: Unity 6.4 (6000.4) or newer. The bridge kit uses the
 `[UxmlElement]` source generator (Unity 2023.2+) and depends on
 `com.unity.vectorgraphics` for SVG asset import. Older Unity versions
-will see a deprecation warning and unusable SVG backgrounds.
+are outside this contract.
+
+This guide tracks the Unity 6.4 UI Toolkit manual for USS properties, USS
+data types, selectors, transitions, and filters. If a generated file targets
+Unity 6.4, prefer native USS first and use the bridge only for gaps Unity
+still does not cover.
 
 ---
 
@@ -68,7 +73,8 @@ dropped at conversion. Plan stacking by source order.
 
 - Hex: `#fff`, `#ffffff`, `#ffffff80` (8-digit alpha is honoured).
 - `rgb(r, g, b)` and `rgba(r, g, b, a)`.
-- `hsl(h, s%, l%)` and `hsla(h, s%, l%, a)`.
+- `hsl(h, s%, l%)` and `hsla(h, s%, l%, a)` are accepted by the
+  converter and normalized to Unity-supported `rgb(...)` / `rgba(...)`.
 - Named CSS keywords (`red`, `transparent`, `cornflowerblue`, etc.).
 - `currentColor` is **not** supported — restate the color literally.
 - Modern color spaces (`oklch`, `lab`, `lch`, `hwb`, `color-mix()`,
@@ -76,19 +82,28 @@ dropped at conversion. Plan stacking by source order.
 
 ### Other rules
 
-- Solid backgrounds, `linear-gradient(...)` (single direction), and
-  `repeating-linear-gradient(...)` are all supported. Other gradient
-  functions are dropped.
+- Solid backgrounds, `background-image: url(...)`,
+  `background-position`, `background-position-x/y`, `background-repeat`,
+  and `background-size` pass through to native Unity 6.4 USS.
+- `linear-gradient(...)` and `repeating-linear-gradient(...)` are bridged.
+  Other gradient functions are dropped.
 - `box-shadow`: single shadow only. Multi-shadow lists and `inset` shadows
   drop.
-- `filter: drop-shadow(...)` is bridged to box-shadow. No other filter
-  functions.
+- Unity 6.4 native filters pass through:
+  `blur`, `grayscale`, `invert`, `opacity`, `sepia`, `tint`,
+  `hue-rotate`, `contrast`, and custom `filter("...")` assets.
+- `filter: drop-shadow(...)` is still bridged to box-shadow because
+  Unity 6.4 USS explicitly does not support the CSS drop-shadow filter.
 - `border: <width> solid <color>` is fully supported; dashed/dotted/double
   styles are flattened to solid.
 - `border-radius` (all four corners) is supported.
 - `clip-path: polygon(...)` is bridged. Other shapes (circle, inset, path,
   url) drop.
 - `outline` becomes a real `border` (so it occupies layout space).
+- `border-image: url(...) <slice>` (and the longhands `border-image-source`,
+  `border-image-slice`) auto-map to `background-image` plus
+  `-unity-slice-top/-right/-bottom/-left`. Use this for stretchy 9-slice
+  frames; the source asset must be set up for 9-slice in Unity.
 
 ## 4. Images & Media
 
@@ -112,34 +127,31 @@ dropped at conversion. Plan stacking by source order.
 
 ## 5. Animation Contract
 
-USS has no `@keyframes`; the bridge kit can run a tween scheduler if the
-keyframes follow this shape:
+The converter does **not** preserve CSS `@keyframes` or `animation-*`.
+Those at-rules are stripped and the `animation` declaration is dropped.
+For Unity 6.4, author motion as USS transitions or as C# behavior.
 
-- **Properties allowed in keyframes**:
-  `opacity`, `transform: translateX/Y(...)`, `transform: scale(...)`,
-  `transform: rotate(...)`, `background-position`.
-- **Timing**: any of USS's named easing keywords are honoured —
-  `linear`, `ease`, `ease-in`, `ease-out`, `ease-in-out`,
-  `ease-in-sine` / `ease-out-sine` / `ease-in-out-sine`,
-  and the `-cubic`, `-circ`, `-elastic`, `-back`, `-bounce` family
-  (`ease-in-elastic`, `ease-out-bounce`, etc.).
-  No `cubic-bezier()`, no `steps()`.
-- **Iteration**: `infinite` or an integer count. Direction `normal`,
-  `reverse`, `alternate`. Fill modes are ignored.
-- **Keyframe shape**: percentage stops (`0%`, `50%`, `100%`) only. Don't
-  use `from` / `to` shorthand (still parses but be explicit).
-
-Example the converter is happy with:
+Use USS transitions when the motion is tied to a style change:
 
 ```css
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.3; }
+.tile {
+  transition-property: translate, opacity, filter;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out-cubic;
+  translate: 0px 0px;
+  opacity: 1;
 }
-.dot { animation: pulse 1.6s ease-in-out infinite; }
+.tile:hover {
+  translate: 0px -4px;
+  opacity: 0.85;
+  filter: blur(1px);
+}
 ```
 
-Anything outside this subset becomes a static element on import.
+Keep start and end units identical. For example, transition from
+`translate: 0px 0px` to `translate: 12px 0px`, not from `0` to `12%`.
+Unity 6.4 transitions can be triggered by pseudo-classes, C# class
+toggles, or direct style changes.
 
 ## 5b. Unity-Specific Properties Worth Authoring Against
 
@@ -168,32 +180,38 @@ but isn't quite supported (line-height, icon coloring, multi-shadow text).
 
 ## 6. Transitions
 
-USS supports `transition` (`property duration timing delay`) on the same
-property set animation supports. Use them for hover/focus/active states.
-The triggering pseudo-classes (`:hover`, `:focus`, `:active`,
-`:disabled`, `:checked`) are honoured.
+USS supports `transition` (`property duration timing delay`) and the
+converter passes transition longhands/shorthand through. Use transitions
+for hover/focus/active states and for C# class toggles.
+
+Unity 6.4 supports named timing functions such as `linear`, `ease`,
+`ease-in`, `ease-out`, `ease-in-out`, and the sine/cubic/circ/elastic/
+back/bounce families (`ease-out-cubic`, `ease-in-out-sine`, etc.).
+It does not support CSS `cubic-bezier()` or `steps()` syntax.
 
 ## 7. Interactivity Contract
 
-The converter sees static DOM only — no JS execution. To make buttons
-behave at runtime, encode behaviour with these declarative attributes
-that the bridge kit recognises:
+The converter sees static DOM only. It does not execute JavaScript and it
+does not currently forward arbitrary `data-*` attributes into UXML.
 
-| Attribute                     | Purpose |
-|-------------------------------|---------|
-| `data-toggle-class="<class>"` | On click, toggles `<class>` on `this`. |
-| `data-toggle-target="<sel>"`  | Combined with `data-toggle-class`, targets a sibling/descendant by CSS selector instead of `this`. |
-| `data-show-target="<sel>"`    | On click, sets target's `display: flex` (and hides others sharing the same `data-show-group`). |
-| `data-show-group="<id>"`      | Mutually-exclusive show group (radio-button-style tabs). |
-| `data-checked`                | Initial state for elements that participate in toggling. |
-| `aria-expanded="true|false"`  | Honoured for `<details>` and disclosure widgets. |
+Author runtime behavior as C# that queries stable `name` and `class`
+hooks from the generated UXML:
 
-For anything more bespoke (forms, fetches, derived state) leave a
-placeholder `data-action="<name>"` attribute and write the C# handler
-yourself; the bridge kit dispatches a UnityEvent named `<name>` on click.
+- Use `id="..."` for elements you need to query with `root.Q<T>("id")`.
+- Use classes for visual states (`.open`, `.selected`, `.danger`) and have
+  C# add/remove those classes with `AddToClassList`, `RemoveFromClassList`,
+  or `ToggleInClassList`.
+- Use native controls where possible: `Button`, `Toggle`, `RadioButton`,
+  `DropdownField`, `TextField`, `Slider`, `Foldout`, `ProgressBar`.
 
-Avoid: arbitrary `onclick="..."` strings, React state, jQuery toggles.
-The converter will not parse them.
+Avoid: arbitrary `onclick="..."` strings, React state, jQuery toggles,
+`data-toggle-*` assumptions, and runtime-rendered DOM. Render to static
+HTML first, then bind behavior in Unity C#.
+
+**Pointer-blocking**: `pointer-events: none` (inline, class rule, or
+`<style>`) is auto-emitted as `picking-mode="Ignore"` on the UXML
+element. Use it for decorative overlays you don't want to swallow
+clicks.
 
 ## 8. Components Worth Using
 
@@ -203,7 +221,7 @@ Each maps to a real Unity control:
 |-----------------------------------|--------------------|
 | `<button>`                        | `ui:Button`        |
 | `<input type="text|email|...">`   | `ui:TextField`     |
-| `<input type="number">`           | `ui:IntegerField`  |
+| `<input type="number">`           | `ui:FloatField`    |
 | `<input type="checkbox">`         | `ui:Toggle`        |
 | `<input type="range">`            | `ui:Slider`        |
 | `<input type="color">`            | `ui:ColorField`    |
@@ -224,11 +242,11 @@ The converter forwards a small set of HTML attributes onto Unity controls:
 | `title="..."`      | `tooltip="..."` on any element. |
 | `alt="..."` (on `<img>`) | Falls back to `tooltip` if `title` is absent. |
 | `id="..."`         | `name="..."` on the UXML element so it's queryable via `Q<T>("id")`. |
-| `disabled`         | Honoured on `<button>`/`<input>` — emits `:disabled` style hooks. |
-| `placeholder=`     | Forwarded to TextField placeholder. |
 
-**Ignored** (no Unity equivalent): `aria-label`, `aria-describedby`,
-`role`, `tabindex`, `lang`. Use `title` for the same hover-text effect.
+**Not forwarded today**: `disabled`, `placeholder`, `aria-label`,
+`aria-describedby`, `role`, `tabindex`, `lang`, and arbitrary `data-*`
+attributes. Use `title` for hover text and C# setup for enabled state,
+placeholder behavior, focus order, and accessibility metadata.
 
 ## 10. Pseudo-elements
 
@@ -238,17 +256,25 @@ The converter forwards a small set of HTML attributes onto Unity controls:
 
 ## 11. Selectors
 
-Stick to:
+Selectors have two paths:
 
-- Type, class, id selectors.
-- Descendant, child (` > `), and adjacent-sibling (` + `) combinators.
-- `:hover`, `:focus`, `:active`, `:disabled`, `:checked`,
-  `:first-child`, `:last-child`, `:nth-child(2n)` — supported.
-- `:not(.x)` — supported.
+- **Emitted verbatim to USS**: type, class, id, universal selectors,
+  descendant combinators, child (` > `) combinators, selector lists, and
+  Unity state pseudo-classes (`:hover`, `:focus`, `:active`,
+  `:inactive`, `:disabled`, `:enabled`, `:checked`, `:root`).
+- **Statically hoisted by the converter**: attribute selectors,
+  adjacent/general sibling combinators (`+`, `~`), `:first-child`,
+  `:last-child`, `:nth-child(...)`, `:nth-last-child(...)`, and
+  `:not(...)`. The declarations are copied onto matching elements as
+  generated `.h2u-N` classes because Unity 6.4 USS does not parse those
+  selectors.
 
-Skip: attribute selectors (`[type="text"]`), `::part`, `::slotted`,
-container queries, `@layer`, `@scope`, `@media` (the converter strips
-them).
+Prefer the verbatim set for maintainability. Hoisted selectors are useful
+when importing existing HTML, but they become static snapshots: if C# later
+moves elements around, the generated `.h2u-N` classes do not recompute.
+
+Skip: `::part`, `::slotted`, container queries, `@layer`, `@scope`,
+`@media` (the converter strips them).
 
 ## 12. File Layout the Converter Expects
 
@@ -286,7 +312,9 @@ to save you.
 - `backdrop-filter` (frosted glass)
 - `mask`, `mask-image`, `-webkit-mask`
 - `mix-blend-mode`, `background-blend-mode`
-- `filter` other than `drop-shadow(...)` (no blur, hue-rotate, saturate, etc.)
+- `filter` functions outside Unity 6.4's native list and the converter's
+  `drop-shadow(...)` bridge. `brightness()` and `saturate()` are examples
+  that still drop.
 - `clip-path` shapes other than `polygon(...)` (no `circle()`, `ellipse()`,
   `inset()`, `path()`, `url(#mask)`)
 - Multi-shadow `box-shadow` lists
@@ -315,13 +343,14 @@ to save you.
 
 ### Animation
 - `cubic-bezier()` and `steps()` timing functions
-- `@keyframes` driving anything outside the whitelisted property set
-  (`opacity`, `translate`, `scale`, `rotate`, `background-position`)
+- `@keyframes`, `animation`, and `animation-*`
 - CSS scroll-driven animations (`animation-timeline`, `view-timeline`)
 - `@scope`, `@layer`, `@property` registrations
 
 ### Interactivity / scripting
 - Inline `onclick`, `onchange`, `oninput`, `onsubmit` handlers
+- Declarative `data-toggle-*`, `data-show-*`, and `data-action` attributes
+  (not forwarded today; bind behavior in C# by `name`/class).
 - React, Vue, Svelte, Alpine, htmx — anything that materialises DOM at
   runtime. The converter sees only the static markup; runtime-rendered
   components produce empty UXML. Render to static HTML first.
@@ -349,7 +378,6 @@ to save you.
 ### Selectors / at-rules
 - `@media` queries (everything collapses to the default resolution).
 - `@supports`, `@import`
-- `[attr~=value]`, `[attr^=value]`, `[attr$=value]`, `[attr*=value]`
 - `:has(...)` (relational pseudo-class)
 - `::part`, `::slotted`, `::backdrop`
 - `:where()`, `:is()` with non-trivial argument lists (parsed but
@@ -382,8 +410,9 @@ Before handing a design to the converter, run through:
 - [ ] No `display: grid` anywhere.
 - [ ] Every flex container declares `flex-direction` explicitly.
 - [ ] All fonts come from Google Fonts.
-- [ ] All animations use only opacity/transform/background-position.
-- [ ] Interactive buttons use `data-toggle-*` / `data-show-*` not JS.
+- [ ] No `@keyframes` / `animation-*`; use USS transitions or C#.
+- [ ] Interactive buttons have stable `id`/class hooks for C#; no JS or
+      `data-toggle-*` assumptions.
 - [ ] SVGs have `width`+`height` or `viewBox`.
 - [ ] No `<canvas>`, `<iframe>`, `<video>`, `<audio>`.
 - [ ] No `calc()` mixing units.

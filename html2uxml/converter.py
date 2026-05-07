@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .css_parser import _parse_declarations, parse_css, parse_selector
 from .html_parser import Node, parse_html
-from .mappings import map_declarations, map_element
+from .mappings import SKIP_TAGS, map_declarations, map_element
 from .resolver import (
     _ParsedRule, parse_rules, resolve, ResolvedStyle, selector_matches,
 )
@@ -147,6 +147,7 @@ class _EmitState:
     svg_files: list[tuple[str, str]] = field(default_factory=list)
     svg_blocks: list[str] = field(default_factory=list)
     svg_assets_subdir: str = "Assets/UI/Images"
+    synthetic_by_selector: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     _gen_counter: int = 0
 
     def add_rule(self, selector: str, decls: list[tuple[str, str]]) -> None:
@@ -171,33 +172,62 @@ class _EmitState:
 def _emit_css_rules(parsed_rules: list[_ParsedRule], state: _EmitState,
                     *, allowed_selectors: set | None = None) -> None:
     for rule in parsed_rules:
+        emit_selectors = [
+            s for s in rule.selectors
+            if (
+                (allowed_selectors is None or s.raw in allowed_selectors)
+                and not s.has_unsupported_features()
+            )
+        ]
         # Drop the rule entirely if none of its selectors hit the (sub)tree.
-        if allowed_selectors is not None and not any(
-            s.raw in allowed_selectors for s in rule.selectors
-        ):
+        if not emit_selectors:
             continue
         mapped = map_declarations([(d.prop, d.value) for d in rule.declarations])
         _record_warnings(state, mapped.warnings)
         if not mapped.decls:
             continue
-        for k, _ in mapped.decls:
-            if k.startswith("--gg-"):
+        real_decls: list[tuple[str, str]] = []
+        synth_decls: list[tuple[str, str]] = []
+        for k, v in mapped.decls:
+            if k.startswith("__") and k.endswith("__"):
+                synth_decls.append((k.strip("_"), v))
+            else:
+                real_decls.append((k, v))
+        for k, _ in real_decls:
+            if _requires_bridge_prop(k):
                 state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
                 state.used_bridge = True
-        for sel in rule.selectors:
-            if allowed_selectors is not None and sel.raw not in allowed_selectors:
-                continue
-            state.add_rule(sel.raw, mapped.decls)
-            state.stats.css_class_rules += 1
+        for sel in emit_selectors:
+            if real_decls:
+                state.add_rule(sel.raw, real_decls)
+                state.stats.css_class_rules += 1
+            if synth_decls:
+                state.synthetic_by_selector.setdefault(sel.raw, []).extend(synth_decls)
+
+
+_BRIDGE_REQUIRED_PROPS = {
+    "--gg-shadow-offset-x",
+    "--gg-shadow-offset-y",
+    "--gg-shadow-blur",
+    "--gg-shadow-color",
+    "--gg-gradient",
+    "--gg-clip-polygon",
+    "--gg-row-gap",
+    "--gg-column-gap",
+}
+
+
+def _requires_bridge_prop(prop: str) -> bool:
+    return prop in _BRIDGE_REQUIRED_PROPS
 
 
 def _compute_rule_bridge_flags(parsed_rules: list[_ParsedRule]) -> list[bool]:
     """For each parsed rule (parallel to parsed_rules), True iff its mapped
-    declarations include any --gg-* custom property."""
+    declarations include a custom property that the runtime BridgeBox reads."""
     flags = []
     for rule in parsed_rules:
         mapped = map_declarations([(d.prop, d.value) for d in rule.declarations])
-        flags.append(any(k.startswith("--gg-") for k, _ in mapped.decls))
+        flags.append(any(_requires_bridge_prop(k) for k, _ in mapped.decls))
     return flags
 
 
@@ -295,17 +325,29 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     inline = node.attrs.get("style", "")
     if inline:
         inline_pairs.extend((d.prop, d.value) for d in _parse_declarations(inline))
+    synthetic_attrs: list[tuple[str, str]] = []
+    if style is not None:
+        for sel in style.matched_selectors:
+            for k, v in state.synthetic_by_selector.get(sel, ()):
+                synthetic_attrs.append((k, v))
     if inline_pairs:
         mapped = map_declarations(inline_pairs)
         _record_warnings(state, mapped.warnings)
         if mapped.decls:
-            own_class = state.gen_class()
-            state.add_rule(f".{own_class}", mapped.decls)
-            state.stats.inline_overrides += 1
-            for k, _ in mapped.decls:
-                if k.startswith("--gg-"):
-                    needs_bridge = True
-                    state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
+            real_decls: list[tuple[str, str]] = []
+            for k, v in mapped.decls:
+                if k.startswith("__") and k.endswith("__"):
+                    synthetic_attrs.append((k.strip("_"), v))
+                else:
+                    real_decls.append((k, v))
+            if real_decls:
+                own_class = state.gen_class()
+                state.add_rule(f".{own_class}", real_decls)
+                state.stats.inline_overrides += 1
+                for k, _ in real_decls:
+                    if _requires_bridge_prop(k):
+                        needs_bridge = True
+                        state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
 
     # ScrollView promotion: any element with effective overflow auto/scroll
     # gets emitted as a ScrollView so Unity scrolls instead of clipping.
@@ -355,7 +397,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
 
     # Text handling.
     text_attr = None
-    inner_children = list(node.children)
+    inner_children = [] if node.tag in SKIP_TAGS else list(node.children)
 
     # <details>: extract <summary> text into the Foldout's text= and skip it.
     foldout_text: str | None = None
@@ -394,6 +436,8 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             cls_list.extend(v.split())
         else:
             attrs_out.append((k, v))
+    for k, v in synthetic_attrs:
+        attrs_out.append((k, v))
     if own_class:
         cls_list.append(own_class)
     if cls_list:

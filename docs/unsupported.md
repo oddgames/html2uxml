@@ -56,10 +56,12 @@ These are silently rewritten to nothing. Warning text:
 
 ### `user-select`, `pointer-events`, `touch-action`
 - **Used for**: blocking text selection / clicks.
-- **Today**: dropped.
-- **To support**: bridge to `pickingMode = Ignore` for `pointer-events: none`
-  in the converter (set on the element directly). `user-select` has no
-  equivalent because USS labels are never selectable.
+- **Today**: `pointer-events: none` auto-emits `picking-mode="Ignore"` as
+  a UXML attribute on the element. `user-select` and `touch-action`
+  remain dropped.
+- **To support better**: `user-select` has no Unity equivalent — labels
+  are never selectable. `touch-action` is a browser scroll hint with no
+  USS analogue.
 
 ### `perspective`, `perspective-origin`, `transform-style`, `backface-visibility`
 - **Used for**: 3D card flips.

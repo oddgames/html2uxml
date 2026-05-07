@@ -15,6 +15,7 @@ USS is CSS-like but:
 from __future__ import annotations
 
 import re
+import colorsys
 from dataclasses import dataclass
 
 
@@ -151,7 +152,7 @@ SKIP_VALUES = {"unset", "initial", "inherit", "revert", "revert-layer"}
 DROP_PROPS = {
     "backdrop-filter",
     "mask", "mask-image", "mask-type", "animation", "appearance",
-    "float", "clear", "box-sizing", "user-select", "pointer-events",
+    "float", "clear", "box-sizing", "user-select",
     "perspective", "perspective-origin", "transform-style",
     "backface-visibility", "mix-blend-mode", "background-blend-mode",
     "isolation", "contain", "will-change",
@@ -253,6 +254,7 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
             "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
             "width", "height", "min-width", "max-width", "min-height", "max-height",
             "left", "right", "top", "bottom",
+            "pointer-events",
         ):
             continue
 
@@ -348,6 +350,17 @@ _MODERN_RGB_RE = re.compile(
     r"\s*\)",
     re.IGNORECASE,
 )
+_HSL_RE = re.compile(
+    r"\bhsla?\(\s*"
+    r"([+-]?\d*\.?\d+)(?:deg)?"
+    r"(?:\s*,\s*|\s+)"
+    r"(\d*\.?\d+)%"
+    r"(?:\s*,\s*|\s+)"
+    r"(\d*\.?\d+)%"
+    r"(?:(?:\s*,\s*|\s*/\s*)(\d*\.?\d+%?))?"
+    r"\s*\)",
+    re.IGNORECASE,
+)
 
 
 def _coerce_units(value: str) -> str:
@@ -362,12 +375,29 @@ def _coerce_units(value: str) -> str:
 
 
 def _coerce_modern_color(value: str) -> str:
-    def repl(m: re.Match) -> str:
+    def repl_rgb(m: re.Match) -> str:
         r, g, b, a = m.group(1), m.group(2), m.group(3), m.group(4)
         if a is None:
             return f"rgb({r}, {g}, {b})"
         return f"rgba({r}, {g}, {b}, {a})"
-    return _MODERN_RGB_RE.sub(repl, value)
+
+    def repl_hsl(m: re.Match) -> str:
+        h = float(m.group(1)) % 360
+        s = max(0.0, min(100.0, float(m.group(2)))) / 100.0
+        light = max(0.0, min(100.0, float(m.group(3)))) / 100.0
+        r, g, b = colorsys.hls_to_rgb(h / 360.0, light, s)
+        rgb = tuple(round(c * 255) for c in (r, g, b))
+        alpha = m.group(4)
+        if alpha is None:
+            return f"rgb({rgb[0]}, {rgb[1]}, {rgb[2]})"
+        if alpha.endswith("%"):
+            a = float(alpha[:-1]) / 100.0
+        else:
+            a = float(alpha)
+        return f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, {a:g})"
+
+    value = _MODERN_RGB_RE.sub(repl_rgb, value)
+    return _HSL_RE.sub(repl_hsl, value)
 
 
 _BOX_SHADOW_PARTS_RE = re.compile(
@@ -627,13 +657,13 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         top, right, bottom, left = sides
         return [("top", top), ("right", right), ("bottom", bottom), ("left", left)]
 
-    # white-space: USS supports normal, nowrap, pre.
+    # white-space: Unity 6.4 USS supports normal, nowrap, pre, pre-wrap.
     if prop == "white-space":
         v = value.lower()
-        if v in ("normal", "nowrap", "pre"):
+        if v in ("normal", "nowrap", "pre", "pre-wrap"):
             return [("white-space", v)]
-        if v in ("pre-wrap", "pre-line", "break-spaces"):
-            return [("white-space", "pre")]
+        if v in ("pre-line", "break-spaces"):
+            return [("white-space", "pre-wrap")]
         warnings.append(f"white-space: {value} approximated as normal")
         return [("white-space", "normal")]
 
@@ -653,19 +683,7 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
 
     # filter: only drop-shadow() routes into the box-shadow bridge.
     if prop == "filter":
-        body = _extract_call_body(value, "drop-shadow")
-        if body is not None:
-            shadow = _parse_box_shadow(body)
-            if shadow:
-                ox, oy, blur, color = shadow
-                return [
-                    ("--gg-shadow-offset-x", ox),
-                    ("--gg-shadow-offset-y", oy),
-                    ("--gg-shadow-blur", blur),
-                    ("--gg-shadow-color", color),
-                ]
-        warnings.append(f"filter: {value} -- only drop-shadow() is bridged")
-        return None
+        return _map_filter(value, warnings)
 
     # text-overflow: USS supports clip and ellipsis.
     if prop == "text-overflow":
@@ -673,6 +691,66 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         if v in ("clip", "ellipsis"):
             return [("text-overflow", v)]
         return None
+
+    # pointer-events: forwarded as a synthetic UXML attribute, not USS, since
+    # picking-mode is per-element. The converter strips this from USS and
+    # picks it up via _resolved_value() when emitting the element.
+    if prop == "pointer-events":
+        v = value.strip().lower()
+        if v == "none":
+            return [("__picking-mode__", "Ignore")]
+        return None
+
+    # border-image -> background-image + -unity-slice-* (9-slice).
+    # Accepts: `<source> <slice> / <width>` shorthand or just <source> <slice>.
+    if prop == "border-image":
+        url_m = re.search(r"url\([^)]+\)", value)
+        if not url_m:
+            warnings.append(f"border-image: {value} dropped (no url() source)")
+            return None
+        url = url_m.group(0)
+        rest = value[:url_m.start()] + value[url_m.end():]
+        # Parse slice numbers (before any '/'), accepting 1, 2, or 4 values.
+        slice_part = rest.split("/", 1)[0]
+        nums = re.findall(r"-?\d*\.?\d+", slice_part)
+        if not nums:
+            return [("background-image", url)]
+        if len(nums) == 1:
+            t = r = b = l_ = nums[0]
+        elif len(nums) == 2:
+            t, r = nums; b, l_ = t, r
+        elif len(nums) == 3:
+            t, r, b = nums; l_ = r
+        else:
+            t, r, b, l_ = nums[:4]
+        out: list[tuple[str, str]] = [
+            ("background-image", url),
+            ("-unity-slice-top", str(int(float(t)))),
+            ("-unity-slice-right", str(int(float(r)))),
+            ("-unity-slice-bottom", str(int(float(b)))),
+            ("-unity-slice-left", str(int(float(l_)))),
+        ]
+        return out
+    if prop == "border-image-source":
+        return [("background-image", value)]
+    if prop == "border-image-slice":
+        nums = re.findall(r"-?\d*\.?\d+", value)
+        if not nums:
+            return None
+        if len(nums) == 1:
+            t = r = b = l_ = nums[0]
+        elif len(nums) == 2:
+            t, r = nums; b, l_ = t, r
+        elif len(nums) == 3:
+            t, r, b = nums; l_ = r
+        else:
+            t, r, b, l_ = nums[:4]
+        return [
+            ("-unity-slice-top", str(int(float(t)))),
+            ("-unity-slice-right", str(int(float(r)))),
+            ("-unity-slice-bottom", str(int(float(b)))),
+            ("-unity-slice-left", str(int(float(l_)))),
+        ]
 
     # line-height -> -unity-paragraph-spacing (approximate). USS has no real
     # line-height; paragraph-spacing controls extra space between wrapped
@@ -707,9 +785,17 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop == "text-shadow":
         return [("text-shadow", value)]
 
+    # Unity 6.4 has a growing set of -unity-* properties. Pass them through
+    # unless a handler above deliberately translated a web equivalent.
+    if prop.startswith("-unity-"):
+        return [(prop, value)]
+
     # opacity, color, and most numeric properties pass through.
     pass_through = {
+        "all",
         "color", "opacity", "background-color",
+        "background-position", "background-position-x", "background-position-y",
+        "background-repeat", "background-size",
         "width", "height", "min-width", "min-height", "max-width", "max-height",
         "left", "right", "top", "bottom",
         "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
@@ -832,6 +918,94 @@ def _split_transform(value: str, warnings: list[str]) -> list[tuple[str, str]] |
     if out_scale is not None:
         pairs.append(("scale", out_scale))
     return pairs or None
+
+
+_NATIVE_FILTER_FUNCS = {
+    "blur",
+    "grayscale",
+    "invert",
+    "opacity",
+    "sepia",
+    "tint",
+    "hue-rotate",
+    "contrast",
+    "filter",
+}
+
+
+def _map_filter(value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
+    """Map CSS filter functions to Unity 6.4 native filters where possible.
+
+    Unity 6.4 supports most common filter functions natively but still omits
+    CSS `drop-shadow()`, so that one remains routed through BridgeBox.
+    """
+    funcs = _parse_function_list(value)
+    if funcs is None:
+        warnings.append(f"filter: {value} -- unsupported filter syntax")
+        return None
+    out: list[tuple[str, str]] = []
+    native_parts: list[str] = []
+    unsupported: list[str] = []
+    for name, text, body in funcs:
+        low = name.lower()
+        if low == "drop-shadow":
+            shadow = _parse_box_shadow(body)
+            if shadow:
+                ox, oy, blur, color = shadow
+                out.extend([
+                    ("--gg-shadow-offset-x", ox),
+                    ("--gg-shadow-offset-y", oy),
+                    ("--gg-shadow-blur", blur),
+                    ("--gg-shadow-color", color),
+                ])
+            else:
+                warnings.append(f"filter: drop-shadow({body}) -- complex shadow not bridged")
+        elif low in _NATIVE_FILTER_FUNCS:
+            native_parts.append(text)
+        else:
+            unsupported.append(name)
+    if native_parts:
+        out.append(("filter", " ".join(native_parts)))
+    if unsupported:
+        warnings.append(
+            "filter functions not supported by Unity 6.4 USS, dropped: "
+            + ", ".join(unsupported)
+        )
+    return out or None
+
+
+def _parse_function_list(value: str) -> list[tuple[str, str, str]] | None:
+    funcs: list[tuple[str, str, str]] = []
+    i = 0
+    n = len(value)
+    while i < n:
+        while i < n and value[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        name_start = i
+        while i < n and (value[i].isalpha() or value[i] == "-"):
+            i += 1
+        name = value[name_start:i]
+        while i < n and value[i].isspace():
+            i += 1
+        if not name or i >= n or value[i] != "(":
+            return None
+        open_idx = i
+        i += 1
+        body_start = i
+        depth = 1
+        while i < n and depth > 0:
+            if value[i] == "(":
+                depth += 1
+            elif value[i] == ")":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            return None
+        body = value[body_start:i - 1]
+        funcs.append((name, value[name_start:i], body))
+    return funcs
 
 
 def _expand_box(value: str) -> tuple[str, str, str, str] | None:
