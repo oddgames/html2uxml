@@ -479,18 +479,46 @@ its root element with **both** an `id` and the convention class
 `screen`. The id is what the converter targets; the class is for human
 readability inside the design canvas.
 
+Pair every screen with a visible canvas label that reproduces the id, so
+designers can see at a glance which selector hits which screen. The
+label sits **outside** the screen root so it doesn't ship with the
+extracted UXML — `--selector "#login"` only grabs `<section id="login">`,
+leaving the badge behind on the design canvas.
+
 ```html
-<section id="login" class="screen" aria-label="Login screen">
-  <!-- screen contents -->
-</section>
+<figure class="screen-frame">
+  <figcaption class="screen-label">#login — Login screen</figcaption>
+  <section id="login" class="screen" aria-label="Login screen">
+    <!-- screen contents -->
+  </section>
+</figure>
 
-<section id="lobby" class="screen" aria-label="Lobby screen">
-  <!-- screen contents -->
-</section>
+<figure class="screen-frame">
+  <figcaption class="screen-label">#lobby — Lobby</figcaption>
+  <section id="lobby" class="screen" aria-label="Lobby screen">
+    <!-- screen contents -->
+  </section>
+</figure>
 
-<section id="match-summary" class="screen" aria-label="Match summary">
-  <!-- screen contents -->
-</section>
+<figure class="screen-frame">
+  <figcaption class="screen-label">#match-summary — Match summary</figcaption>
+  <section id="match-summary" class="screen" aria-label="Match summary">
+    <!-- screen contents -->
+  </section>
+</figure>
+```
+
+Style the label however you like in the canvas CSS; it never reaches
+Unity. Convention: prefix the visible label with `#<id>` so the exact
+selector argument is readable on the canvas.
+
+```css
+.screen-label {
+  font: 600 12px 'Inter', sans-serif;
+  color: #94a3b8;
+  margin-bottom: 6px;
+  letter-spacing: 0.04em;
+}
 ```
 
 Conversion rules:
