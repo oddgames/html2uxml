@@ -55,7 +55,7 @@ def parse_css(source: str) -> list[Rule]:
             break
         body = source[brace + 1:end]
         decls = _parse_declarations(body)
-        sels = [s.strip() for s in selectors_text.split(",") if s.strip()]
+        sels = _split_selector_list(selectors_text)
         if sels and decls:
             rules.append(Rule(selectors=sels, declarations=decls, order=order))
             order += 1
@@ -111,10 +111,24 @@ def _parse_declarations(body: str) -> list[Declaration]:
 
 
 def _split_declarations(body: str) -> list[str]:
-    """Split on `;` but respect parens (e.g. rgb(0,0,0))."""
+    """Split on `;` but respect parens and quoted strings."""
     parts, buf, depth = [], [], 0
+    quote: str | None = None
+    escaped = False
     for c in body:
-        if c == "(":
+        if quote:
+            buf.append(c)
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in ("'", '"'):
+            quote = c
+            buf.append(c)
+        elif c == "(":
             depth += 1
             buf.append(c)
         elif c == ")":
@@ -129,6 +143,57 @@ def _split_declarations(body: str) -> list[str]:
     if tail:
         parts.append(tail)
     return parts
+
+
+def _split_selector_list(selectors_text: str) -> list[str]:
+    """Split selector lists on top-level commas only.
+
+    Functional pseudos such as `:not(.a, .b)` can legally contain commas; a
+    plain `str.split(",")` turns those into invalid selectors and loses the
+    whole rule.
+    """
+    selectors: list[str] = []
+    buf: list[str] = []
+    paren_depth = 0
+    bracket_depth = 0
+    quote: str | None = None
+    escaped = False
+    for c in selectors_text:
+        if quote:
+            buf.append(c)
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in ("'", '"'):
+            quote = c
+            buf.append(c)
+        elif c == "(":
+            paren_depth += 1
+            buf.append(c)
+        elif c == ")":
+            paren_depth = max(0, paren_depth - 1)
+            buf.append(c)
+        elif c == "[":
+            bracket_depth += 1
+            buf.append(c)
+        elif c == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            buf.append(c)
+        elif c == "," and paren_depth == 0 and bracket_depth == 0:
+            sel = "".join(buf).strip()
+            if sel:
+                selectors.append(sel)
+            buf = []
+        else:
+            buf.append(c)
+    tail = "".join(buf).strip()
+    if tail:
+        selectors.append(tail)
+    return selectors
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +225,9 @@ class Selector:
     def has_unsupported_features(self) -> bool:
         """Return True if any compound has features USS won't parse (attribute
         selectors, ::pseudo-elements, :nth-* / :not(...) etc.)."""
-        for _, c in self.chain:
+        for combinator, c in self.chain:
+            if combinator in ("+", "~"):
+                return True
             if c.attrs:
                 return True
             for ps in c.pseudo:
@@ -168,6 +235,14 @@ class Selector:
                     return True
                 kw = ps.lstrip(":").split("(", 1)[0]
                 if kw not in _USS_PSEUDO_KEYWORDS:
+                    return True
+        return False
+
+    def has_runtime_pseudo(self) -> bool:
+        for _, c in self.chain:
+            for ps in c.pseudo:
+                kw = ps.lstrip(":").split("(", 1)[0]
+                if kw in _USS_PSEUDO_KEYWORDS:
                     return True
         return False
 

@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using UnityEngine;
 
-namespace HtmlToUxml.Bridge
+namespace ODDGames.Html2Uxml
 {
     public readonly struct GradientStop
     {
@@ -20,6 +20,19 @@ namespace HtmlToUxml.Bridge
     public sealed class LinearGradient
     {
         public float AngleDegrees;          // CSS-style: 0deg => to top, 90deg => to right
+        public List<GradientStop> Stops = new List<GradientStop>();
+
+        public bool IsValid => Stops != null && Stops.Count >= 2;
+    }
+
+    public sealed class RadialGradient
+    {
+        public Vector2 Center = new Vector2(0.5f, 0.5f);
+        public bool IsCircle;
+        public bool HasExplicitRadius;
+        public Vector2 Radius = Vector2.one;
+        public bool RadiusXIsPercent = true;
+        public bool RadiusYIsPercent = true;
         public List<GradientStop> Stops = new List<GradientStop>();
 
         public bool IsValid => Stops != null && Stops.Count >= 2;
@@ -73,6 +86,181 @@ namespace HtmlToUxml.Bridge
                 grad.Stops.Add(stop);
             }
             return grad.IsValid ? grad : null;
+        }
+
+        // Parses common CSS radial-gradient(...) forms used by generated UI:
+        //   radial-gradient(circle at 35% 35%, <color> <pos>, ...)
+        //   radial-gradient(ellipse at 50% 50%, <color>, ...)
+        //   radial-gradient(<color>, <color>)
+        public static RadialGradient ParseRadial(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            var open = s.IndexOf('(');
+            var close = s.LastIndexOf(')');
+            if (open < 0 || close <= open) return null;
+
+            var fn = s.Substring(0, open).Trim().ToLowerInvariant();
+            if (!fn.EndsWith("radial-gradient")) return null;
+
+            var body = s.Substring(open + 1, close - open - 1);
+            var args = SplitTopLevel(body);
+            if (args.Count < 2) return null;
+
+            var grad = new RadialGradient();
+            int firstStopIdx = 0;
+            var head = args[0].Trim().ToLowerInvariant();
+            if (head.StartsWith("at "))
+            {
+                grad.Center = ParsePositionPair(head.Substring(3).Trim());
+                firstStopIdx = 1;
+            }
+            else if (head.StartsWith("circle") || head.StartsWith("ellipse") || head.Contains(" at "))
+            {
+                var at = head.IndexOf(" at ", StringComparison.Ordinal);
+                var shapePart = head;
+                if (at >= 0)
+                {
+                    shapePart = head.Substring(0, at).Trim();
+                    grad.Center = ParsePositionPair(head.Substring(at + 4).Trim());
+                }
+                ParseRadialShape(shapePart, grad);
+                firstStopIdx = 1;
+            }
+
+            int n = args.Count - firstStopIdx;
+            for (int i = 0; i < n; i++)
+            {
+                if (!ParseStop(args[firstStopIdx + i], i / Mathf.Max(1f, n - 1f), out var stop))
+                    return null;
+                grad.Stops.Add(stop);
+            }
+            return grad.IsValid ? grad : null;
+        }
+
+        static void ParseRadialShape(string s, RadialGradient grad)
+        {
+            if (string.IsNullOrWhiteSpace(s))
+                return;
+
+            var parts = s.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0)
+                return;
+
+            int i = 0;
+            if (parts[0] == "circle")
+            {
+                grad.IsCircle = true;
+                i = 1;
+            }
+            else if (parts[0] == "ellipse")
+            {
+                grad.IsCircle = false;
+                i = 1;
+            }
+
+            if (i >= parts.Length)
+                return;
+
+            if (IsRadialSizeKeyword(parts[i]))
+                return;
+
+            if (!TryParseRadiusComponent(parts[i], out var rx, out var rxPct))
+                return;
+
+            if (grad.IsCircle)
+            {
+                grad.HasExplicitRadius = true;
+                grad.Radius = new Vector2(rx, rx);
+                grad.RadiusXIsPercent = rxPct;
+                grad.RadiusYIsPercent = rxPct;
+                return;
+            }
+
+            float ry = rx;
+            bool ryPct = rxPct;
+            if (i + 1 < parts.Length)
+            {
+                if (TryParseRadiusComponent(parts[i + 1], out var parsedRy, out var parsedRyPct))
+                {
+                    ry = parsedRy;
+                    ryPct = parsedRyPct;
+                }
+            }
+
+            grad.HasExplicitRadius = true;
+            grad.Radius = new Vector2(rx, ry);
+            grad.RadiusXIsPercent = rxPct;
+            grad.RadiusYIsPercent = ryPct;
+        }
+
+        static bool IsRadialSizeKeyword(string s)
+        {
+            switch (s)
+            {
+                case "closest-side":
+                case "closest-corner":
+                case "farthest-side":
+                case "farthest-corner":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        static bool TryParseRadiusComponent(string s, out float value, out bool isPercent)
+        {
+            value = 0f;
+            isPercent = true;
+            if (string.IsNullOrWhiteSpace(s))
+                return false;
+            s = s.Trim().ToLowerInvariant();
+            if (s.EndsWith("%"))
+            {
+                if (!float.TryParse(s.Substring(0, s.Length - 1), NumberStyles.Float,
+                                   CultureInfo.InvariantCulture, out var pct))
+                    return false;
+                value = Mathf.Max(0f, pct / 100f);
+                isPercent = true;
+                return true;
+            }
+            if (s.EndsWith("px"))
+                s = s.Substring(0, s.Length - 2);
+            if (!float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var raw))
+                return false;
+            value = Mathf.Max(0f, raw);
+            isPercent = false;
+            return true;
+        }
+
+        static Vector2 ParsePositionPair(string s)
+        {
+            var parts = s.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return new Vector2(0.5f, 0.5f);
+            if (parts.Length == 1)
+                return new Vector2(ParsePositionComponent(parts[0], true), 0.5f);
+            return new Vector2(
+                ParsePositionComponent(parts[0], true),
+                ParsePositionComponent(parts[1], false));
+        }
+
+        static float ParsePositionComponent(string s, bool horizontal)
+        {
+            s = s.Trim().ToLowerInvariant();
+            switch (s)
+            {
+                case "left":   return 0f;
+                case "top":    return 0f;
+                case "center": return 0.5f;
+                case "right":  return 1f;
+                case "bottom": return 1f;
+            }
+            if (s.EndsWith("%") &&
+                float.TryParse(s.Substring(0, s.Length - 1), NumberStyles.Float,
+                               CultureInfo.InvariantCulture, out var pct))
+                return Mathf.Clamp01(pct / 100f);
+            if (float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var raw))
+                return Mathf.Clamp01(raw);
+            return 0.5f;
         }
 
         static float AngleFromKeyword(string s)
@@ -156,6 +344,11 @@ namespace HtmlToUxml.Bridge
             c = Color.white;
             if (string.IsNullOrWhiteSpace(s)) return false;
             s = s.Trim();
+            if (string.Equals(s, "transparent", StringComparison.OrdinalIgnoreCase))
+            {
+                c = new Color(0f, 0f, 0f, 0f);
+                return true;
+            }
             if (s.StartsWith("#")) return ColorUtility.TryParseHtmlString(s, out c);
             if (s.StartsWith("rgb"))
             {

@@ -1,12 +1,14 @@
 """Match CSS rules against the parsed HTML tree and produce per-element styles."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .css_parser import (
     Declaration,
     Rule,
     Selector,
+    _split_selector_list,
     parse_selector,
 )
 from .html_parser import Node
@@ -37,7 +39,19 @@ def parse_rules(rules: list[Rule]) -> list[_ParsedRule]:
 # ---------------------------------------------------------------------------
 
 
-def _matches_compound(node: Node, comp) -> bool:
+_DYNAMIC_PSEUDOS = {
+    "hover", "active", "focus", "disabled", "enabled", "checked", "root",
+    "selected", "inactive",
+}
+
+
+def _matches_compound(
+    node: Node,
+    comp,
+    ancestors: list[Node],
+    sibling_index: int,
+    siblings: list[Node],
+) -> bool:
     if comp.tag != "*" and node.tag != comp.tag:
         return False
     if comp.id is not None and node.attrs.get("id") != comp.id:
@@ -70,6 +84,9 @@ def _matches_compound(node: Node, comp) -> bool:
         elif op == "*=":
             if actual is None or value not in actual:
                 return False
+    for pseudo in comp.pseudo:
+        if not _matches_pseudo(node, pseudo, ancestors, sibling_index, siblings):
+            return False
     return True
 
 
@@ -78,7 +95,7 @@ def _matches_chain(node: Node, chain: list, parent_chain: list[Node],
     if not chain:
         return False
     combinator, compound = chain[-1]
-    if not _matches_compound(node, compound):
+    if not _matches_compound(node, compound, parent_chain, sibling_index, siblings):
         return False
     if len(chain) == 1:
         return True
@@ -119,6 +136,81 @@ def _matches_chain(node: Node, chain: list, parent_chain: list[Node],
         if _matches_chain(anc, rest, parent_chain[:i], idx, sibs):
             return True
     return False
+
+
+def _matches_pseudo(
+    node: Node,
+    pseudo: str,
+    ancestors: list[Node],
+    sibling_index: int,
+    siblings: list[Node],
+) -> bool:
+    low = pseudo.lower()
+    if low in ("::before", "::after"):
+        return True
+    name, arg = _pseudo_name_and_arg(low)
+    if name in _DYNAMIC_PSEUDOS:
+        # Runtime-state pseudos are emitted verbatim for USS; they should not
+        # prevent the base element from being considered a selector match.
+        return True
+    index = sibling_index + 1  # CSS nth-child indexes are one-based.
+    if name == "first-child":
+        return sibling_index == 0
+    if name == "last-child":
+        return bool(siblings) and sibling_index == len(siblings) - 1
+    if name == "only-child":
+        return len(siblings) == 1
+    if name == "nth-child" and arg is not None:
+        return _matches_nth_child(index, arg)
+    if name == "nth-last-child" and arg is not None:
+        return _matches_nth_child(len(siblings) - sibling_index, arg)
+    if name == "not" and arg is not None:
+        for raw in _split_selector_list(arg):
+            sel = parse_selector(raw)
+            if sel is not None and selector_matches(
+                node, sel, ancestors, sibling_index, siblings
+            ):
+                return False
+        return True
+    return False
+
+
+def _pseudo_name_and_arg(pseudo: str) -> tuple[str, str | None]:
+    stripped = pseudo.lstrip(":")
+    if "(" not in stripped:
+        return stripped, None
+    name, rest = stripped.split("(", 1)
+    return name, rest[:-1].strip() if rest.endswith(")") else rest.strip()
+
+
+_NTH_RE = re.compile(r"^([+-]?\d*)n([+-]\d+)?$")
+
+
+def _matches_nth_child(index: int, formula: str) -> bool:
+    f = formula.replace(" ", "").lower()
+    if f == "odd":
+        return index % 2 == 1
+    if f == "even":
+        return index % 2 == 0
+    try:
+        return index == int(f)
+    except ValueError:
+        pass
+    m = _NTH_RE.match(f)
+    if not m:
+        return False
+    a_raw, b_raw = m.group(1), m.group(2)
+    if a_raw in ("", "+"):
+        a = 1
+    elif a_raw == "-":
+        a = -1
+    else:
+        a = int(a_raw)
+    b = int(b_raw or "0")
+    if a == 0:
+        return index == b
+    delta = index - b
+    return delta % a == 0 and delta // a >= 0
 
 
 def selector_matches(node: Node, selector: Selector,
@@ -215,15 +307,16 @@ def _resolve_for(node: Node, ancestors: list[Node], rules: list[_ParsedRule],
                         after_content = content_value
                     after_decls.extend(rest)
                 continue
+            if idx not in matched_indices:
+                matched_indices.append(idx)
             if sel.has_unsupported_features():
-                unsupported_decls.extend(rule.declarations)
+                if not sel.has_runtime_pseudo():
+                    unsupported_decls.extend(rule.declarations)
                 continue
             if _has_pseudo(sel):
                 pseudo_rules.append((sel.raw, rule.declarations))
             else:
                 matches.append((sel.specificity(), rule.order, rule.declarations))
-                if idx not in matched_indices:
-                    matched_indices.append(idx)
     matches.sort(key=lambda t: (t[0], t[1]))
 
     # Apply: lowest specificity first, later wins. !important wins over normal.

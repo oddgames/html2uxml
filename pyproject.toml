@@ -7,6 +7,9 @@ name = "html2uxml"
 version = "0.1.0"
 description = "Convert HTML+CSS to Unity UXML+USS, bridging unsupported CSS where possible."
 requires-python = ">=3.9"
+dependencies = [
+    "CairoSVG>=2.7.1",
+]
 
 [project.scripts]
 html2uxml = "html2uxml.cli:main"

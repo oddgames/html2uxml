@@ -1,0 +1,29 @@
+{
+  "name": "au.com.oddgames.html2uxml",
+  "version": "0.1.0",
+  "displayName": "ODD Games html2uxml",
+  "description": "ODD Games runtime support for html2uxml conversions: UI Toolkit bridge elements, generated-controller helpers, custom filters, and packaged rendering resources.",
+  "unity": "6000.4",
+  "keywords": [
+    "oddgames",
+    "odd-games",
+    "ui-toolkit",
+    "uxml",
+    "uss",
+    "html",
+    "converter"
+  ],
+  "author": {
+    "name": "ODD Games",
+    "url": "https://oddgames.com.au"
+  },
+  "documentationUrl": "https://github.com/oddgames/html2uxml",
+  "changelogUrl": "https://github.com/oddgames/html2uxml",
+  "licensesUrl": "https://github.com/oddgames/html2uxml",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oddgames/html2uxml.git",
+    "directory": "Package"
+  },
+  "dependencies": {}
+}

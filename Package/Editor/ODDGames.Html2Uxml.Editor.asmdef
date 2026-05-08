@@ -1,0 +1,18 @@
+{
+    "name": "ODDGames.Html2Uxml.Editor",
+    "rootNamespace": "ODDGames.Html2Uxml.Editor",
+    "references": [
+        "ODDGames.Html2Uxml"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -24,17 +24,22 @@ These are silently rewritten to nothing. Warning text:
   Cheaper alternative: detect the animated property + duration and emit a
   `transition` instead so static toggles work.
 
-### `backdrop-filter`
-- **Used for**: frosted-glass panels behind modals.
-- **Today**: dropped (no GPU shader available in USS).
-- **To support**: ship a `BlurBox` element using `RenderTexture` + a Gaussian
-  shader. Bridge `--gg-backdrop-blur: <px>` and read it in C#.
-
-### `mask`, `mask-image`, `mask-type`
+### `mask`, `mask-type`
 - **Used for**: alpha cutouts, gradient fades to transparent.
 - **Today**: dropped.
-- **To support**: requires a stencil/clip pass. Stretch goal: bridge
-  `mask-image: linear-gradient(...)` to a custom shader on the element.
+- **To support fully**: requires a stencil/clip pass or shader-based alpha
+  mask on the element.
+
+### `mask-image`, `-webkit-mask-image`
+- **Used for**: common edge fades on tickers, scroll regions, and HUD panels.
+- **Today**: `linear-gradient(...)` and `repeating-linear-gradient(...)`
+  are bridged to `--odd-mask-image` and rendered by `Html2UxmlPanel` as a cover
+  fade. This is an approximation, not a true per-pixel mask.
+- **Still unsupported**: URL/image masks, radial/conic masks,
+  mask-repeat/size/position, compositing semantics, and shader-quality alpha
+  clipping.
+- **To support fully**: add a shader-backed mask element/filter and map only
+  authored package masks automatically.
 
 ### `appearance`
 - **Used for**: native form-control reset (`appearance: none`).
@@ -72,7 +77,7 @@ These are silently rewritten to nothing. Warning text:
 - **Used for**: multiply/screen blending (badges, neon).
 - **Today**: dropped.
 - **To support**: requires custom shader on the element. Bridge as
-  `--gg-blend-mode: <mode>` and pick a Material per mode.
+  `--odd-blend-mode: <mode>` and pick a Material per mode.
 
 ### `contain`, `will-change`
 - **Used for**: browser performance hints.
@@ -118,17 +123,20 @@ These are silently rewritten to nothing. Warning text:
 
 ### `word-break`, `overflow-wrap`, `hyphens`
 - **Used for**: hyphenation, breaking long tokens.
-- **Today**: dropped. USS only has `white-space: normal | nowrap | pre`.
+- **Today**: dropped. Unity 6.4 USS only has
+  `white-space: normal | nowrap | pre | pre-wrap`.
 - **To support**: nothing in current USS.
 
 ### `line-height`
 - **Used for**: vertical text rhythm.
 - **Today**: `line-height: <px>` auto-mapped to `-unity-paragraph-spacing`.
-  Unitless multipliers (`1.5`) drop with a warning since the converter
-  can't resolve the parent font-size at mapping time.
-- **To support better**: when authoring with `line-height: 1.5`-style
-  multipliers, the converter would need to walk the resolver and emit a
-  font-size-relative paragraph-spacing per element. Not implemented.
+  Unitless multipliers (`1`, `1.5`) still report as approximations because USS
+  has no true line-height property. The converter does use resolved unitless
+  values to add tight, centered generated line boxes for safe single-line HUD
+  labels.
+- **Still unsupported**: multi-line browser line-height rhythm. Author explicit
+  pixel line boxes or split dense HUD labels into fixed-height rows when exact
+  vertical rhythm matters.
 
 ---
 
@@ -144,6 +152,49 @@ These are silently rewritten to nothing. Warning text:
 - USS only knows `relative` / `absolute`. `fixed` becomes `absolute` + author
   must position against the root manually.
 
+### `z-index`
+- Consumed by the converter as a static sibling paint-order sort. Higher
+  numeric z-index siblings are emitted later in UXML, which makes Unity paint
+  them on top. Nothing is emitted to USS.
+- Limits: only compares siblings under the same parent. Browser stacking
+  contexts from transform/opacity/filter/isolation are not reproduced.
+
+### `opacity`
+- Direct element opacity maps to USS `opacity`.
+- CSS parent opacity is browser group compositing. UI Toolkit does not give the
+  converter an equivalent USS-only offscreen subtree compositing primitive.
+- Current approximation: when a low-opacity parent contains absolutely
+  positioned painted overlay children, the converter removes parent opacity,
+  applies that opacity to normal children, and leaves the overlay opaque so it
+  still occludes lower siblings. This is designed for badges, chips, and HUD
+  overlays where bleed-through is more visibly wrong than a slightly stronger
+  overlay color.
+- Warning:
+  `CSS opacity group approximated for positioned overlay children; parent opacity was pushed to non-overlay children`.
+
+### `backdrop-filter` / `-webkit-backdrop-filter`
+- `blur`, `grayscale`, `invert`, `opacity`, `sepia`, `tint`, `hue-rotate`,
+  `contrast`, and custom `filter("...")` are approximated by emitting a normal
+  Unity `filter` declaration.
+- `brightness()` and `saturate()` map to the package-provided
+  `ODDGamesColorAdjust` custom filter asset.
+- Difference from CSS: Unity filters process the element subtree. They do
+  **not** sample pixels behind the element, so exact browser frosted glass is
+  not reproduced.
+- To support exact backdrop blur: use the package `BackdropBlurPanel` with a
+  camera/UI `RenderTexture` source and the bundled Gaussian blur shader. For
+  multiple live blur panels, use one `BackdropCaptureSource` and set
+  `source-id` on each panel so the capture/blur work is shared.
+
+### `transform`
+- `translate`, `translateX`, `translateY`, `translate3d(x, y, z)`,
+  `rotate`, `rotateZ`, `scale`, `scaleX`, and `scaleY` map to Unity's
+  individual `translate`, `rotate`, and `scale` properties.
+- `translate3d` is flattened to 2D; the z component is ignored.
+- `matrix`, `matrix3d`, `skew`, `skewX`, `skewY`, `translateZ`, `rotateX`,
+  `rotateY`, and `perspective` are dropped or ignored because UI Toolkit
+  transforms are 2D.
+
 ### `overflow`
 - `auto` / `scroll` -> the converter promotes the element to `ScrollView`.
   When that promotion is inhibited (e.g. inside Label-only elements), the prop
@@ -151,33 +202,54 @@ These are silently rewritten to nothing. Warning text:
 
 ### `cursor`
 - Mapped via `CURSOR_MAP` to Unity's fixed cursor set. Unmapped values dropped.
-- To extend: ship custom `Cursor` assets + a `--gg-cursor: <name>` bridge.
+- To extend: ship custom `Cursor` assets + a `--odd-cursor: <name>` bridge.
 
 ### `outline`
 - Approximated to `border` on all four sides. Difference: `outline` doesn't
-  occupy layout space; `border` does. Warned.
+  occupy layout space; `border` does. CSS pixel widths use the same
+  converter hairline scaling as normal borders. Warned.
 
 ### `white-space`
-- `pre-wrap`, `pre-line`, `break-spaces` collapsed to `pre` with a warning.
+- `normal`, `nowrap`, `pre`, and `pre-wrap` pass through. `pre-line` and
+  `break-spaces` approximate to `pre-wrap`.
 
 ### `text-align: justify`
 - Falls back to `middle-left`. USS has no justified text.
 
 ---
 
-## Bridged via `BridgeBox` (custom props)
+## Bridged via `Html2UxmlPanel` (custom props)
 
-These promote the element to `<gg:BridgeBox>` and stash a `--gg-*` custom
-property the runtime kit reads.
+These promote the element to `<odd:Html2UxmlPanel>` and stash a `--odd-*` custom
+property the runtime package reads.
 
 | CSS                          | Custom prop(s)                                     | Notes |
 |------------------------------|----------------------------------------------------|-------|
-| `box-shadow` (single)        | `--gg-shadow-offset-x/-y/-blur/-color`             | Multi-shadow / inset dropped. |
-| `filter: drop-shadow(...)`   | same as box-shadow                                  | Other filter functions dropped. |
-| `background: linear-gradient`| `--gg-gradient` (string)                           | Painted as 32-stripe approximation. Non-axis-aligned angles fall back to a flat tint. |
-| `clip-path: polygon(...)`    | `--gg-clip-polygon` (string)                       | Inverse-fill mask; needs a solid background to look right. |
-| `font-family`                | `--gg-font-family` (string)                        | `--download-fonts` resolves to `-unity-font-definition` at convert time. |
-| `gap` / `row-gap` / `column-gap` | `--gg-row-gap`, `--gg-column-gap`              | BridgeBox applies margin to direct children based on `flex-direction`. Reverse-direction ordering not yet handled. |
+| `box-shadow` (outer/inset)   | `--odd-box-shadows` plus legacy `--odd-shadow-*` / `--odd-inner-shadow-*` fallback props | Up to eight supported layers. Used for shadows, glow stacks, bevel, and emboss. |
+| `filter: drop-shadow(...)`   | same as box-shadow                                  | Unity 6.4 still lacks CSS drop-shadow. Native Unity filters pass through. |
+| `background: linear-gradient`| `--odd-gradient` (string)                           | Automatic mesh renderer. Non-axis-aligned angles are supported. |
+| `background: radial-gradient`| `--odd-radial-gradient`, `--odd-radial-gradient-2` (strings) | Up to two radial layers plus one linear layer. Explicit `circle/ellipse <size> at x y` forms are parsed. |
+| `background: repeating-linear-gradient(...)` | `--odd-repeating-linear-gradient` | Axis-aligned stripe and scanline patterns are painted as repeated pattern content. |
+| tiled `radial-gradient(...)` dot grids | `--odd-tiled-radial-gradient`, `--odd-background-pattern-size` | Detected when a small radial dot gradient is paired with explicit `background-size`. |
+| `mask-image: linear-gradient(...)` / `-webkit-mask-image: linear-gradient(...)` | `--odd-mask-image` | Html2UxmlPanel approximation for edge fades only; not a full CSS mask implementation. |
+| `clip-path: polygon(...)`    | `--odd-clip-polygon` (string)                       | Polygon-shaped background/gradient rendering with inverse-fill fallback for uncovered edges. |
+| `gap` / `row-gap` / `column-gap` | generated child margins; `--odd-row-gap`, `--odd-column-gap` when runtime help is still needed | Static flex containers bake gaps into direct-child margins. Converted buttons use `Html2UxmlButton`; elements already promoted to `Html2UxmlPanel` can still apply runtime gap based on `flex-direction`, including reverse directions. |
+
+`font-family` emits `--odd-font-family` as a converter-side marker, but it
+does **not** promote the element to `Html2UxmlPanel`. The CLI resolves that
+marker to `-unity-font-definition` by default when Google Fonts, supplied
+files, or installed local/system fonts provide a matching TTF/OTF. Use
+`--no-download-fonts` to leave the marker unresolved.
+
+### CSS variable resolution for bridged values
+
+- **Today**: static `var(...)` values are resolved before bridge parsing for
+  gradients, shadows, filters, polygon clips, and linear mask fades when the
+  custom property is available in the conversion cascade.
+- **Limits**: this is converter-time substitution only. Runtime USS custom
+  property changes, unresolved fallbacks, cyclic variables, and variables that
+  expand to unsupported syntax still drop or approximate according to the
+  underlying feature.
 
 ---
 
@@ -209,6 +281,6 @@ When you add or change a mapping in `mappings.py`:
 
 1. Update the relevant section in this doc (or add a new one).
 2. If the property is fully bridged with a custom prop, add it to the
-   "Bridged via BridgeBox" table.
+   "Bridged via Html2UxmlPanel" table.
 3. If you reclaim a property (drop -> approximate, or approximate -> bridged),
    move the entry rather than duplicating.

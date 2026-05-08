@@ -1,839 +1,741 @@
-# Design Contract for html2uxml
+# Claude Design CSS Guide
 
-Hand this document to whoever (human or AI) authors the HTML+CSS so the
-converter produces clean Unity UXML+USS. Every convention here is something
-the converter actively recognises. Code that follows the contract round-trips
-losslessly; code that drifts gets dropped or approximated.
+This guide is for Claude Design when creating HTML and CSS for game UI. It is
+an authoring guide only: use these CSS patterns, avoid the risky ones, and keep
+the source predictable for Unity UI Toolkit.
 
-**Target runtime**: Unity 6.4 (6000.4) or newer. The bridge kit uses the
-`[UxmlElement]` source generator (Unity 2023.2+) and depends on
-`com.unity.vectorgraphics` for SVG asset import. Older Unity versions
-are outside this contract.
+## Core Rules
 
-This guide tracks the Unity 6.4 UI Toolkit manual for USS properties, USS
-data types, selectors, transitions, and filters. If a generated file targets
-Unity 6.4, prefer native USS first and use the bridge only for gaps Unity
-still does not cover.
+- Put visual styling in CSS classes. Do not use inline `style` attributes.
+- Reuse classes for repeated visual treatments.
+- Use one stable root ID per screen.
+- Add stable IDs or clear classes to interactive elements.
+- Build layouts with flexbox.
+- Use fixed `px` artboard dimensions for game HUD screens.
+- Prefer simple CSS that describes the final visual directly.
+- Keep the number of fonts, colors, shadows, and one-off classes low.
 
----
-
-## 1. Layout
-
-**Use flex only.** No `display: grid`, no `float`, no `display: table`,
-no `position: static` reliance. USS is flex-only; everything else is
-approximated.
-
-- Always declare `display: flex` *and* `flex-direction: row | column`
-  explicitly. (CSS defaults to row, USS defaults to column — implicit row
-  is auto-backfilled but brittle.)
-- Use `gap` / `row-gap` / `column-gap` (bridged via runtime kit, applied as
-  child margin).
-- For sizing, prefer `px`, `%`, `vw`, `vh`, `rem`. Avoid `calc()` mixing
-  units, avoid `min()` / `max()` / `clamp()`.
-- `position: absolute` is honoured; `position: fixed` is approximated as
-  absolute (use the document root as the offset parent yourself).
-- `box-sizing` is always **border-box** in USS — write to that assumption.
-- `aspect-ratio: <ratio>` is supported natively in Unity 6 USS — use it
-  for any element whose width should track its height.
-
-### Z-ordering
-
-USS does **not** support `z-index`. Stacking is determined entirely by
-tree order: later siblings paint on top of earlier ones. To put one
-element in front of another:
-
-1. Make sure the visually-on-top element appears **after** its peer in
-   the DOM, or
-2. Lift it into a higher-up container that paints later.
-
-Don't author with `z-index: 999` and expect it to survive — the value is
-dropped at conversion. Plan stacking by source order.
-
-## 2. Typography
-
-- Fonts must be available on Google Fonts; the converter downloads TTF/OTF
-  files via the Google Fonts CSS API. System fonts (`Courier New`,
-  `Helvetica`, etc.) won't bundle.
-- Stick to:
-  `font-size`, `font-weight`, `font-style: italic`, `letter-spacing`,
-  `text-align`, `color`, `text-transform`, `text-decoration: underline`,
-  `white-space`.
-- `line-height: <px>` is auto-mapped to `-unity-paragraph-spacing`
-  (Unity's nearest equivalent). Unitless multipliers (`line-height: 1.5`)
-  drop with a warning — author with explicit pixel values for fidelity.
-- `-webkit-text-stroke: <width> <color>` (and the long-hand
-  `-webkit-text-stroke-width` / `-webkit-text-stroke-color`) auto-map to
-  `-unity-text-outline-width` / `-unity-text-outline-color`. Use this for
-  outlined text instead of stacked text-shadows.
-- Avoid `text-indent`, `word-break`, `hyphens`, `vertical-align`.
-
-## 3. Color, Background, Borders
-
-### Supported color formats
-
-- Hex: `#fff`, `#ffffff`, `#ffffff80` (8-digit alpha is honoured).
-- `rgb(r, g, b)` and `rgba(r, g, b, a)`.
-- `hsl(h, s%, l%)` and `hsla(h, s%, l%, a)` are accepted by the
-  converter and normalized to Unity-supported `rgb(...)` / `rgba(...)`.
-- Named CSS keywords (`red`, `transparent`, `cornflowerblue`, etc.).
-- `currentColor` is **not** supported — restate the color literally.
-- Modern color spaces (`oklch`, `lab`, `lch`, `hwb`, `color-mix()`,
-  relative-color syntax) are not parsed; see the Hard-No list.
-
-### Other rules
-
-- Solid backgrounds, `background-image: url(...)`,
-  `background-position`, `background-position-x/y`, `background-repeat`,
-  and `background-size` pass through to native Unity 6.4 USS.
-- `linear-gradient(...)` and `repeating-linear-gradient(...)` are bridged.
-  Other gradient functions are dropped.
-- `box-shadow`: single shadow only. Multi-shadow lists and `inset` shadows
-  drop.
-- Unity 6.4 native filters pass through:
-  `blur`, `grayscale`, `invert`, `opacity`, `sepia`, `tint`,
-  `hue-rotate`, `contrast`, and custom `filter("...")` assets.
-- `filter: drop-shadow(...)` is still bridged to box-shadow because
-  Unity 6.4 USS explicitly does not support the CSS drop-shadow filter.
-- `border: <width> solid <color>` is fully supported; dashed/dotted/double
-  styles are flattened to solid.
-- `border-radius` (all four corners) is supported.
-- `clip-path: polygon(...)` is bridged. Other shapes (circle, inset, path,
-  url) drop.
-- `outline` becomes a real `border` (so it occupies layout space).
-- `border-image: url(...) <slice>` (and the longhands `border-image-source`,
-  `border-image-slice`) auto-map to `background-image` plus
-  `-unity-slice-top/-right/-bottom/-left`. Use this for stretchy 9-slice
-  frames; the source asset must be set up for 9-slice in Unity.
-
-## 4. Images & Media
-
-- `<img src="...">`: relative paths or full http(s) URLs. Path resolution
-  is relative to the input HTML file (or the page URL).
-- Inline `<svg>...</svg>` is preserved verbatim and written to
-  `Assets/UI/Images/svg-N.svg`. Authoring rules:
-  - Always set `width` and `height` (or a `viewBox`) on the root `<svg>`.
-  - Don't reference external assets from inside the SVG (no `<image href>`,
-    no `<use href>`).
-  - Animations / scripts inside the SVG are stripped at import time.
-  - **Unity Vector Graphics package limits**: no `<text>` (rasterise to
-    paths), no `<filter>`, no per-pixel masks, no embedded raster images,
-    no SVG `<animate>` tags. Stick to paths, basic shapes, and gradient
-    fills.
-  - Multiply-tint a single SVG via `-unity-background-image-tint-color`
-    if you need it in different palettes.
-- `background-image: url(...)` works for raster images (PNG/JPG/WebP).
-- No `<canvas>`, `<video>`, `<audio>`, `<iframe>`, `<embed>`. They become
-  empty placeholder elements.
-
-## 5. Animation Contract
-
-The converter does **not** preserve CSS `@keyframes` or `animation-*`.
-Those at-rules are stripped and the `animation` declaration is dropped.
-For Unity 6.4, author motion as USS transitions or as C# behavior.
-
-Use USS transitions when the motion is tied to a style change:
-
-```css
-.tile {
-  transition-property: translate, opacity, filter;
-  transition-duration: 160ms;
-  transition-timing-function: ease-out-cubic;
-  translate: 0px 0px;
-  opacity: 1;
-}
-.tile:hover {
-  translate: 0px -4px;
-  opacity: 0.85;
-  filter: blur(1px);
-}
-```
-
-Keep start and end units identical. For example, transition from
-`translate: 0px 0px` to `translate: 12px 0px`, not from `0` to `12%`.
-Unity 6.4 transitions can be triggered by pseudo-classes, C# class
-toggles, or direct style changes.
-
-## 5b. Unity-Specific Properties Worth Authoring Against
-
-USS exposes `-unity-*` properties that have no CSS analogue. They don't
-appear in plain CSS authoring but the converter **passes them through**
-verbatim if the source CSS uses them, so designers can opt in:
-
-- `-unity-text-outline-width` + `-unity-text-outline-color` — true text
-  stroke. Use instead of stacked text-shadows.
-- `-unity-paragraph-spacing: <px>` — replacement for `line-height`.
-  Spacing between paragraphs (or text wraps) in pixels.
-- `-unity-background-image-tint-color: <color>` — multiply the element's
-  background image (or SVG) by a color. Lets one icon asset render in
-  many palettes.
-- `-unity-slice-left/-top/-right/-bottom` + `-unity-slice-scale` —
-  9-slice scaling for stretchy frames. Use for resizable button
-  backgrounds and cards. Source PNG must be set up for 9-slice.
-- `-unity-font-definition: url("Assets/UI/Fonts/Foo.ttf")` — direct font
-  reference. The converter writes this automatically when
-  `--download-fonts` is used; you can hand-author for non-Google fonts.
-- `-unity-overflow-clip-box: padding-box | content-box` — choose where
-  `overflow: hidden` clips. Defaults to padding-box.
-
-These are the right answer when a CSS feature looks tantalisingly close
-but isn't quite supported (line-height, icon coloring, multi-shadow text).
-
-## 6. Transitions
-
-USS supports `transition` (`property duration timing delay`) and the
-converter passes transition longhands/shorthand through. Use transitions
-for hover/focus/active states and for C# class toggles.
-
-Unity 6.4 supports named timing functions such as `linear`, `ease`,
-`ease-in`, `ease-out`, `ease-in-out`, and the sine/cubic/circ/elastic/
-back/bounce families (`ease-out-cubic`, `ease-in-out-sine`, etc.).
-It does not support CSS `cubic-bezier()` or `steps()` syntax.
-
-## 7. Interactivity Contract
-
-The converter sees static DOM only. It does not execute JavaScript and it
-does not currently forward arbitrary `data-*` attributes into UXML.
-
-Author runtime behavior as C# that queries stable `name` and `class`
-hooks from the generated UXML:
-
-- Use `id="..."` for elements you need to query with `root.Q<T>("id")`.
-- Use classes for visual states (`.open`, `.selected`, `.danger`) and have
-  C# add/remove those classes with `AddToClassList`, `RemoveFromClassList`,
-  or `ToggleInClassList`.
-- Use native controls where possible: `Button`, `Toggle`, `RadioButton`,
-  `DropdownField`, `TextField`, `Slider`, `Foldout`, `ProgressBar`.
-
-Avoid: arbitrary `onclick="..."` strings, React state, jQuery toggles,
-generic `data-toggle-*` assumptions, and runtime-rendered DOM. Render to
-static HTML first, then bind behavior in Unity C#.
-
-**Pointer-blocking**: `pointer-events: none` (inline, class rule, or
-`<style>`) is auto-emitted as `picking-mode="Ignore"` on the UXML
-element. Use it for decorative overlays you don't want to swallow
-clicks.
-
-## 7b. Controller Export Contract
-
-A controller exporter should generate one C# controller per converted UI:
-
-```
-MyScreen.uxml
-MyScreen.uss
-MyScreenController.cs
-MyScreenController.Custom.cs   # optional, hand-authored partial
-```
-
-The generated file is disposable and may be overwritten. Any hand-written
-logic goes in a separate partial class file that the exporter never touches.
-This matches Unity UI Toolkit's normal runtime shape: bind against a
-`UIDocument.rootVisualElement`, query elements with UQuery (`Q<T>`), and
-register callbacks in C#.
-
-The `au.com.oddgames.html2uxml` Unity package provides
-`ODDGames.Html2Uxml.UXMLController`; generated controllers should derive
-from it. That base class already owns UIDocument resolution, delayed wire
-retries, callback tracking, reverse-order unwire, transient asset cleanup,
-and editor warnings for missing query targets. Generated controllers should
-not define `Start()` or `OnDestroy()` in that setup.
-
-The exporter must read the original HTML and scripts before conversion,
-because `<script>` tags are stripped and `data-*` attributes are not
-currently emitted into UXML. The generated controller should bind to the
-UXML by `id`, which becomes the Unity `name` attribute.
-
-### Authoring rules for controller-friendly HTML
-
-- Put a stable `id` on every interactive element and every target:
-  `id="menuButton"`, `id="menu"`, `id="settingsPanel"`.
-- Put the root controller name on the main wrapper:
-  `data-h2u-controller="GarageMenu"`.
-- Prefer `data-h2u-*` actions over inline JavaScript. They are easier and
-  safer to lower into C# than arbitrary code.
-- Keep state visual, not structural. Toggle classes like `.open`,
-  `.selected`, `.disabled`, and let USS handle transitions.
-- Keep targets explicit. Use `#id` selectors in `data-h2u-target`; avoid
-  relative selectors such as `.parent .child:nth-child(2)`.
-- If the action cannot be represented declaratively, mark it as custom and
-  let the generated controller create a partial method stub.
-
-Example:
+Good:
 
 ```html
-<div id="garageRoot" data-h2u-controller="GarageMenu">
-  <button id="menuButton"
-          data-h2u-on="click"
-          data-h2u-action="toggle-class"
-          data-h2u-target="#menu"
-          data-h2u-class="open">
-    Menu
+<section id="screen-garage" class="screen screen-garage">
+  <button id="readyButton" class="button button-primary button-large">
+    Ready
   </button>
-
-  <button id="buyButton"
-          data-h2u-on="click"
-          data-h2u-action="custom"
-          data-h2u-method="BuyUpgrade">
-    Buy
-  </button>
-
-  <div id="menu" class="menu"></div>
-</div>
-```
-
-### Supported declarative actions
-
-| Action | Required attributes | Generated C# behavior |
-|--------|---------------------|-----------------------|
-| `toggle-class` | `data-h2u-target`, `data-h2u-class` | `target.ToggleInClassList(className)` |
-| `add-class` | `data-h2u-target`, `data-h2u-class` | `target.AddToClassList(className)` |
-| `remove-class` | `data-h2u-target`, `data-h2u-class` | `target.RemoveFromClassList(className)` |
-| `show` | `data-h2u-target` | `target.style.display = DisplayStyle.Flex` |
-| `hide` | `data-h2u-target` | `target.style.display = DisplayStyle.None` |
-| `show-panel` | `data-h2u-target`, `data-h2u-group` | Hide peers in the same group, then show the target |
-| `set-text` | `data-h2u-target`, `data-h2u-value` | Set `Label.text` or `Button.text` |
-| `set-value` | `data-h2u-target`, `data-h2u-value` | Set a supported field value with `SetValueWithoutNotify` |
-| `custom` | `data-h2u-method` | Call a generated partial method stub |
-
-For `show-panel`, every panel in the group should declare
-`data-h2u-group="<group>"`. The exporter can build the group from those
-source attributes, even though they do not survive into UXML.
-
-### Event mapping
-
-| HTML event | Unity binding |
-|------------|---------------|
-| `click` on `<button>` | `WireClick(button, Handler)` |
-| `click` on other elements | `WireClickable(element, Handler)` |
-| `change` on fields/toggles/sliders/dropdowns | `WireValueChanged(field, Handler)` |
-| `input` on text fields | `WireValueChanged(textField, Handler)` |
-| `submit` | Generate a custom partial method; Unity has no HTML form submission |
-
-Generated controllers should cache element references in `WireUI`, register
-callbacks only through the base `Wire*` helpers, and return `false` until
-required elements are present. Do not call `root.Q(...)` inside every click
-handler.
-
-Recommended generated shape:
-
-```csharp
-using UnityEngine;
-using UnityEngine.UIElements;
-using ODDGames.Html2Uxml;
-
-public partial class GarageMenuController : UXMLController
-{
-    [SerializeField] VisualTreeAsset visualTree;
-
-    Button menuButton;
-    VisualElement menu;
-    Button buyButton;
-
-    protected override void ConfigureDocument(UIDocument doc)
-    {
-        if (visualTree != null)
-            doc.visualTreeAsset = visualTree;
-    }
-
-    protected override bool WireUI(VisualElement root)
-    {
-        menuButton = root.Q<Button>("menuButton");
-        menu = root.Q<VisualElement>("menu");
-        buyButton = root.Q<Button>("buyButton");
-
-        if (menuButton == null || menu == null || buyButton == null)
-            return false;
-
-        WireClick(menuButton, OnMenuButtonClicked);
-        WireClick(buyButton, OnBuyButtonClicked);
-        return true;
-    }
-
-    protected override void OnWired()
-    {
-        OnBound();
-    }
-
-    private void OnMenuButtonClicked()
-    {
-        menu.ToggleInClassList("open");
-    }
-
-    private void OnBuyButtonClicked()
-    {
-        BuyUpgrade();
-    }
-
-    partial void OnBound();
-    partial void BuyUpgrade();
-}
-```
-
-If a target project intentionally does not install
-`au.com.oddgames.html2uxml`, use the same shape with
-`MonoBehaviour.OnEnable` / `OnDisable`, cache UQuery results once, register
-callbacks at enable time, and unregister every callback manually. The
-package base-controller path is preferred because it avoids duplicate
-lifecycle and cleanup code in every generated file.
-
-Hand-authored extension file:
-
-```csharp
-public partial class GarageMenuController
-{
-    partial void BuyUpgrade()
-    {
-        // Game-specific behavior lives here.
-    }
-}
-```
-
-### JavaScript recovery rules
-
-When importing an existing UI, JavaScript recovery should be best-effort and
-AST-based. Do not use regular expressions and do not execute the script.
-Only lower simple, local DOM actions:
-
-- `document.getElementById("id")` and `document.querySelector("#id")`.
-- `element.addEventListener("click", handler)`.
-- `classList.add(...)`, `classList.remove(...)`, `classList.toggle(...)`.
-- `style.display = "none"` and `style.display = "flex"`.
-- Assigning simple `.textContent`, `.innerText`, `.value`, and `.checked`.
-
-Everything else becomes a generated partial method with a TODO:
-network calls, timers, storage, canvas, dynamic DOM creation, framework
-state, complex conditionals, loops over live DOM collections, and animation
-code. The exporter should preserve the UI and isolate missing behavior
-behind partial hooks rather than producing fragile C#.
-
-## 8. Components Worth Using
-
-Each maps to a real Unity control:
-
-| HTML                              | Unity control      |
-|-----------------------------------|--------------------|
-| `<button>`                        | `ui:Button`        |
-| `<input type="text|email|...">`   | `ui:TextField`     |
-| `<input type="number">`           | `ui:FloatField`    |
-| `<input type="checkbox">`         | `ui:Toggle`        |
-| `<input type="range">`            | `ui:Slider`        |
-| `<input type="color">`            | `ui:ColorField`    |
-| `<select><option>`                | `ui:DropdownField` |
-| `<textarea>`                      | `ui:TextField` (multiline) |
-| `<details><summary>`              | `ui:Foldout`       |
-| `<progress>` / `<meter>`          | `ui:ProgressBar`   |
-
-Use the right tag and you get a Unity control with the right styling
-hooks for free.
-
-## 9. Accessibility & Tooltip Hooks
-
-The converter forwards a small set of HTML attributes onto Unity controls:
-
-| HTML attribute     | Unity result |
-|--------------------|--------------|
-| `title="..."`      | `tooltip="..."` on any element. |
-| `alt="..."` (on `<img>`) | Falls back to `tooltip` if `title` is absent. |
-| `id="..."`         | `name="..."` on the UXML element so it's queryable via `Q<T>("id")`. |
-
-**Not forwarded today**: `disabled`, `placeholder`, `aria-label`,
-`aria-describedby`, `role`, `tabindex`, `lang`, and arbitrary `data-*`
-attributes. Use `title` for hover text and C# setup for enabled state,
-placeholder behavior, focus order, and accessibility metadata.
-
-## 10. Pseudo-elements
-
-- `::before` and `::after` are materialized as Label children with the
-  rule's `content` text + the rest of the rule's styling.
-- CSS counters, attr() in content, and `::marker` aren't supported.
-
-## 11. Selectors
-
-Selectors have two paths:
-
-- **Emitted verbatim to USS**: type, class, id, universal selectors,
-  descendant combinators, child (` > `) combinators, selector lists, and
-  Unity state pseudo-classes (`:hover`, `:focus`, `:active`,
-  `:inactive`, `:disabled`, `:enabled`, `:checked`, `:root`).
-- **Statically hoisted by the converter**: attribute selectors,
-  adjacent/general sibling combinators (`+`, `~`), `:first-child`,
-  `:last-child`, `:nth-child(...)`, `:nth-last-child(...)`, and
-  `:not(...)`. The declarations are copied onto matching elements as
-  generated `.h2u-N` classes because Unity 6.4 USS does not parse those
-  selectors.
-
-Prefer the verbatim set for maintainability. Hoisted selectors are useful
-when importing existing HTML, but they become static snapshots: if C# later
-moves elements around, the generated `.h2u-N` classes do not recompute.
-Do not combine hoisted selectors with runtime pseudo-classes such as
-`:hover` or `:focus`; the converter drops those mixed selectors rather
-than baking a stateful rule into an always-on class.
-
-Skip: `::part`, `::slotted`, container queries, `@layer`, `@scope`,
-`@media` (the converter strips them).
-
-## 11b. Screen Labeling for `--selector`
-
-The CLI's `--selector` flag extracts a single screen subtree from a
-multi-screen design canvas. To make a screen reliably extractable, label
-its root element with **both** an `id` and the convention class
-`screen`. The id is what the converter targets; the class is for human
-readability inside the design canvas.
-
-Pair every screen with a visible canvas label that reproduces the id, so
-designers can see at a glance which selector hits which screen. The
-label sits **outside** the screen root so it doesn't ship with the
-extracted UXML — `--selector "#login"` only grabs `<section id="login">`,
-leaving the badge behind on the design canvas.
-
-```html
-<figure class="screen-frame">
-  <figcaption class="screen-label">#login — Login screen</figcaption>
-  <section id="login" class="screen" aria-label="Login screen">
-    <!-- screen contents -->
-  </section>
-</figure>
-
-<figure class="screen-frame">
-  <figcaption class="screen-label">#lobby — Lobby</figcaption>
-  <section id="lobby" class="screen" aria-label="Lobby screen">
-    <!-- screen contents -->
-  </section>
-</figure>
-
-<figure class="screen-frame">
-  <figcaption class="screen-label">#match-summary — Match summary</figcaption>
-  <section id="match-summary" class="screen" aria-label="Match summary">
-    <!-- screen contents -->
-  </section>
-</figure>
-```
-
-Style the label however you like in the canvas CSS; it never reaches
-Unity. Convention: prefix the visible label with `#<id>` so the exact
-selector argument is readable on the canvas.
-
-```css
-.screen-label {
-  font: 600 12px 'Inter', sans-serif;
-  color: #94a3b8;
-  margin-bottom: 6px;
-  letter-spacing: 0.04em;
-}
-```
-
-Conversion rules:
-
-- **id naming**: lowercase-kebab, no spaces, stable. Becomes `name="..."`
-  on the UXML root, so it must round-trip cleanly to a Unity-side
-  `Q<VisualElement>("login")` lookup.
-- **One id per screen**, project-wide unique. Reusing an id across
-  screens makes `--selector "#dup"` ambiguous (the converter takes the
-  first match).
-- **Wrap with a single root element**. `--selector` extracts one subtree;
-  if your screen is a fragment of siblings, wrap them in a containing
-  `<section id="...">` first.
-- **Avoid relying on positional selectors** (`body > div:nth-child(2)`).
-  They break the moment the design canvas reorders.
-
-Then the per-screen export commands look like:
-
-```bash
-html2uxml design-canvas.html --selector "#login"        --name Login        -o out/
-html2uxml design-canvas.html --selector "#lobby"        --name Lobby        -o out/
-html2uxml design-canvas.html --selector "#match-summary" --name MatchSummary -o out/
-```
-
-Each command produces its own `.uxml` / `.uss` so the Unity side can
-load them independently.
-
-If a designer ever needs a sub-region of a screen exported separately
-(say, a chat overlay), give it its own labeled wrapper too. Use a
-hyphenated id rather than a dot so the value is a clean CSS id selector:
-
-```html
-<section id="login" class="screen">
-  <div id="login-chat-overlay" class="overlay">...</div>
 </section>
 ```
 
-`--selector "#login-chat-overlay"` then targets the overlay alone. The
-prefix (`login-`) keeps the namespace readable when scanning the canvas.
-Don't put a literal `.` in an id — the CSS selector parser reads it as a
-class join (`#login.chat-overlay` means id `login` AND class
-`chat-overlay`).
+```css
+.screen {
+  width: 760px;
+  height: 360px;
+  display: flex;
+  flex-direction: column;
+  background: #050608;
+}
 
-## 12. File Layout the Converter Expects
+.button {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 14px;
+  font-family: "Saira Condensed", "Barlow Condensed", sans-serif;
+  font-size: 18px;
+  font-weight: 800;
+}
 
-```
-your-design/
-  index.html          # entry
-  styles.css          # optional external sheet
-  images/
-    icon.png
-  fonts/              # optional, Google Fonts handled separately
-```
-
-- One root HTML file passed to `html2uxml`.
-- External CSS files referenced via `<link rel="stylesheet">` are
-  fetched (URL inputs) or read from disk (file inputs).
-- Image paths must resolve relative to the HTML file.
-
-## 13. Hard-No List (Avoid Entirely)
-
-Features in this list are **silently dropped** and have no bridge in
-flight. If the design depends on any of them, redesign the affected
-piece before handing it off — the converter will not warn loudly enough
-to save you.
-
-### Layout
-- `display: grid`, `display: table`, `display: inline-grid`, `display: inline-block`
-- `float`, `clear`
-- `column-count` / multi-column layout
-- `position: sticky`, `position: fixed` (the latter is silently re-aliased)
-- `place-items`, `place-content`, `place-self` (grid-only shorthands)
-- Container queries (`@container`)
-- CSS subgrid
-
-### Visual effects
-- `backdrop-filter` (frosted glass)
-- `mask`, `mask-image`, `-webkit-mask`
-- `mix-blend-mode`, `background-blend-mode`
-- `filter` functions outside Unity 6.4's native list and the converter's
-  `drop-shadow(...)` bridge. `brightness()` and `saturate()` are examples
-  that still drop.
-- `clip-path` shapes other than `polygon(...)` (no `circle()`, `ellipse()`,
-  `inset()`, `path()`, `url(#mask)`)
-- Multi-shadow `box-shadow` lists
-- `inset` / inner shadows
-- Conic and radial gradients
-- CSS variables that resolve to gradient/shadow strings (only literal
-  declarations are bridged)
-- `transform-style: preserve-3d`, `perspective`, `backface-visibility`
-- 3D transforms (`rotateX`, `rotateY`, `rotateZ` other than `rotate`,
-  `translateZ`, `matrix3d`)
-
-### Typography
-- `text-shadow` with multiple shadows
-- `writing-mode`, `direction: rtl`
-- `font-variant-*`, `font-feature-settings`
-- `hyphens`, `word-break`, `overflow-wrap`
-- Variable-font axes beyond weight (`wdth`, `slnt`, `opsz`, custom axes)
-- `@font-face` with non-Google sources
-
-### Color & input
-- `color-mix()`, `oklch()`, `lab()`, `lch()`, `hwb()`, relative-color syntax
-- Wide-gamut color spaces (`@media (color-gamut: p3)`)
-- `::selection` styling
-- `caret-color`
-- System color keywords (`Canvas`, `LinkText`, etc.)
-
-### Animation
-- `cubic-bezier()` and `steps()` timing functions
-- `@keyframes`, `animation`, and `animation-*`
-- CSS scroll-driven animations (`animation-timeline`, `view-timeline`)
-- `@scope`, `@layer`, `@property` registrations
-
-### Interactivity / scripting
-- Inline `onclick`, `onchange`, `oninput`, `onsubmit` handlers
-- Declarative `data-toggle-*`, `data-show-*`, and `data-action` attributes
-  (not forwarded today; bind behavior in C# by `name`/class).
-- React, Vue, Svelte, Alpine, htmx — anything that materialises DOM at
-  runtime. The converter sees only the static markup; runtime-rendered
-  components produce empty UXML. Render to static HTML first.
-- `<form>` submission semantics (no network in Unity).
-- `contenteditable`
-- `<dialog>` open/close behaviour (renders, but `showModal()` doesn't fire).
-- Web Components (`<my-element>` custom elements + shadow DOM).
-- IFrames, embeds, web-views.
-
-### Media
-- `<canvas>`, `<video>`, `<audio>`
-- Background `url()` referencing a CSS sprite (the entire sheet is loaded
-  but `background-position` cropping is approximate at best).
-- Lazy-loaded images (`loading="lazy"` is ignored — everything is loaded
-  on import).
-- Picture sources / `srcset` (only the `src` attribute is read).
-
-### HTML structure
-- `<table>`, `<thead>`, `<tbody>`, `<tr>`, `<td>` — flatten to flex
-  containers in the source.
-- `<map>` / `<area>` image hotspots
-- `<noscript>`, `<template>` (stripped)
-- `<slot>` and shadow-root placeholders
-
-### Selectors / at-rules
-- `@media` queries (everything collapses to the default resolution).
-- `@supports`, `@import`
-- `:has(...)` (relational pseudo-class)
-- `::part`, `::slotted`, `::backdrop`
-- `:where()`, `:is()` with non-trivial argument lists (parsed but
-  precedence may shift)
-
-### Units
-- `calc()` mixing length with percentage / viewport units
-- `min()`, `max()`, `clamp()`
-- Container query units (`cqw`, `cqh`, `cqi`, `cqb`)
-- `lvh`, `lvw`, `dvh`, `dvw` — dynamic viewport units
-- `q`, `cm`, `mm`, `in`, `pc`, `pt` (use `px`)
-
-### Workflow gotchas
-- HTML pages that require a build step (`<script type="module">` with
-  imports). Pre-bundle to a single static file.
-- HTML pages that depend on browser DevTools-only features (`@scroll-timeline`,
-  `:state()`).
-- Designs sized to a specific viewport using `vh/vw` only — supply
-  fixed `px` widths/heights so the UXML survives at any Unity panel
-  resolution.
-
-If a design needs something on this list, treat it as a **redesign
-trigger**, not a converter bug. The closer the source sticks to the
-contract, the less hand-cleanup the Unity output needs.
-
-## 14. Quick Self-Check
-
-Before handing a design to the converter, run through:
-
-- [ ] No `display: grid` anywhere.
-- [ ] Every flex container declares `flex-direction` explicitly.
-- [ ] All fonts come from Google Fonts.
-- [ ] No `@keyframes` / `animation-*`; use USS transitions or C#.
-- [ ] Interactive buttons have stable `id`/class hooks for C#; no JS or
-      `data-toggle-*` assumptions.
-- [ ] SVGs have `width`+`height` or `viewBox`.
-- [ ] No `<canvas>`, `<iframe>`, `<video>`, `<audio>`.
-- [ ] No `calc()` mixing units.
-- [ ] No `position: fixed` reliance (treated as absolute).
-
-If every box checks, conversion is high-fidelity. If a box fails, expect
-the matching feature to drop or approximate per `docs/unsupported.md`.
-
-## 15. CLI Reference
-
-```bash
-html2uxml <input> [-o OUT_DIR] [--name NAME] [--selector CSS]
-                  [--css FILE]+ [--bundle-assets] [--download-assets]
-                  [--download-fonts] [--timeout SECONDS] [-q]
+.button-primary {
+  background: #ffbf13;
+  color: #050608;
+}
 ```
 
-- `<input>` — local HTML file path or an `http(s)://` URL.
-- `-o OUT_DIR` — where the converted `.uxml` / `.uss` and `Assets/UI/`
-  folders land. Defaults to the input's parent directory.
-- `--name NAME` — base name for the output files (default: input stem).
-- `--selector CSS` — convert only the first matching subtree (e.g.
-  `--selector "#chat-overlay"`). Useful for a multi-screen design canvas.
-- `--css FILE` — additional CSS files to merge in (repeatable).
-- `--bundle-assets` — copy referenced images into
-  `<out>/Assets/UI/Images/` and rewrite `url()` in USS.
-- `--download-assets` — also fetch remote `http(s)` image URLs (implies
-  `--bundle-assets`).
-- `--download-fonts` — pull TTFs for Google Fonts referenced in CSS into
-  `<out>/Assets/UI/Fonts/` and inject `-unity-font-definition` rules.
-- `--timeout` — network timeout in seconds (default 10).
-- `-q` — suppress the conversion report.
-
-Typical full conversion:
-
-```bash
-html2uxml http://localhost:8000/test.html \
-  -o my-unity-project \
-  --name MyScreen \
-  --bundle-assets --download-assets --download-fonts
-```
-
-Output layout:
-
-```
-my-unity-project/
-  MyScreen.uxml
-  MyScreen.uss
-  Assets/
-    UI/
-      Images/   # copied PNG/JPG and inlined svg-N.svg files
-      Fonts/    # downloaded TTFs from Google Fonts
-```
-
-Drop the generated UI assets into your Unity project's `Assets/` folder and
-install the runtime package (`au.com.oddgames.html2uxml`) through Unity's
-Package Manager.
-
-## 16. Minimal Compliant Sample
-
-Copy-paste skeleton showing a flex layout, gap, gradient background,
-Unity 6.4 filter transition, SVG asset capture, and stable C# hooks:
+Avoid:
 
 ```html
-<!DOCTYPE html>
-<html>
-<head>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700&display=swap" rel="stylesheet">
-<style>
-  body { margin: 0; background: #0a0a0a; color: #fff;
-         font-family: 'Inter', sans-serif; }
-
-  .panel {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    padding: 16px;
-    width: 360px;
-    background: linear-gradient(180deg, #1f2937 0%, #0f172a 100%);
-    border-radius: 12px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-  }
-
-  .row {
-    display: flex;
-    flex-direction: row;
-    gap: 8px;
-    align-items: center;
-  }
-
-  .pill {
-    padding: 4px 10px;
-    border-radius: 999px;
-    background: #2563eb;
-    font-size: 12px;
-    font-weight: 700;
-    transition-property: translate, filter;
-    transition-duration: 160ms;
-    transition-timing-function: ease-out-cubic;
-    translate: 0px 0px;
-  }
-
-  .pill:hover {
-    translate: 0px -2px;
-    filter: tint(#7dd3fc);
-  }
-
-  .menu { display: flex; flex-direction: column; gap: 6px; }
-  .menu.open { display: flex; }
-</style>
-</head>
-<body>
-  <div class="panel">
-    <div class="row">
-      <span class="pill">LIVE</span>
-      <button id="menuButton"
-              title="Toggle the menu"
-              data-h2u-on="click"
-              data-h2u-action="toggle-class"
-              data-h2u-target="#menu"
-              data-h2u-class="open">Menu</button>
-    </div>
-
-    <div id="menu" class="menu">
-      <button>Profile</button>
-      <button>Settings</button>
-    </div>
-
-    <svg width="48" height="48" viewBox="0 0 48 48">
-      <circle cx="24" cy="24" r="20" fill="#22c55e" />
-    </svg>
-  </div>
-</body>
-</html>
+<button style="padding: 8px 14px; background: #ffbf13">Ready</button>
 ```
 
-Every feature in this snippet round-trips through the converter.
-Anything you'd add beyond this should be checked against the Hard-No
-list before committing time to it.
+## Class Naming
+
+Use composable class names:
+
+- Components: `.screen`, `.panel`, `.button`, `.toolbar`, `.card`, `.badge`,
+  `.ticker`, `.stat-row`, `.driver-row`, `.icon-button`.
+- Variants: `.button-primary`, `.panel-dark`, `.badge-live`,
+  `.row-selected`, `.tone-danger`, `.size-large`.
+- States: `.is-open`, `.is-selected`, `.is-disabled`, `.is-live`,
+  `.is-warning`.
+- Shared utilities only when useful: `.row`, `.column`, `.absolute-fill`,
+  `.text-uppercase`, `.fill`.
+
+Avoid generated or visual-only names:
+
+- `.style-1`
+- `.box-37`
+- `.yellow-text-13px`
+- `.left-top-title-copy`
+
+If two elements look the same, share a class. If only one token changes, use a
+variant class.
+
+## Layout
+
+Use flexbox for all layout.
+
+```css
+.row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+}
+
+.spaced-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+```
+
+Use:
+
+- `display: flex`
+- `flex-direction: row | column`
+- `align-items`
+- `justify-content`
+- `gap`, `row-gap`, `column-gap`
+- `flex-grow`, `flex-shrink`, `flex-basis`
+- `width`, `height`, `min-width`, `min-height`, `max-width`, `max-height`
+- `margin`, `padding`
+
+Avoid:
+
+- `display: grid`
+- `display: table`
+- `display: inline-grid`
+- `display: inline-block`
+- `float`, `clear`
+- multi-column layout
+- container queries
+- subgrid
+- `place-items`, `place-content`, `place-self`
+
+## Positioning
+
+Use normal flex layout first. Use absolute positioning for fixed HUD overlays,
+badges, corner controls, and decorative layers.
+
+```css
+.screen {
+  position: relative;
+}
+
+.absolute-fill {
+  position: absolute;
+  inset: 0;
+}
+
+.top-right-toolbar {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+}
+```
+
+Use:
+
+- `position: relative` on the local containing block.
+- `position: absolute` for overlays inside that block.
+- `top`, `right`, `bottom`, `left`, or `inset`.
+- DOM order for layering: later siblings appear above earlier siblings.
+- Small `z-index` values only among siblings under the same parent.
+- `overflow: hidden` for clipping.
+
+Avoid:
+
+- `position: fixed`
+- `position: sticky`
+- very large `z-index` values
+- relying on nested stacking context behavior from `opacity`, `transform`,
+  `filter`, `isolation`, or blend modes
+- placing overlays inside deeply clipped or transformed parents
+
+## Sizing and Units
+
+Use:
+
+- `px` for game HUD screens, rows, icons, text, spacing, and precise panels.
+- `%` for simple parent-relative sizing.
+- `rem` only when the root font size is controlled.
+- `aspect-ratio` for fixed-format media, portraits, tiles, and icon boxes.
+
+Avoid:
+
+- `calc()` with mixed units
+- `min()`, `max()`, `clamp()`
+- `dvh`, `dvw`, `lvh`, `lvw`
+- physical units like `pt`, `cm`, `mm`, `in`, `pc`
+- layouts that only work because everything is tied to viewport units
+
+## Typography
+
+Use a small, sourceable font set.
+
+- Prefer Google Fonts / open-source families.
+- Use supplied `.ttf` or `.otf` files for brand or game fonts.
+- Use common Windows system fonts only when the target machine is controlled.
+- Use one primary UI family and at most one accent family per screen.
+- Prefer real italic font files over synthetic italic when available.
+
+```css
+.hud-title {
+  font-family: "Saira Condensed", "Barlow Condensed", sans-serif;
+  font-size: 24px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 1.2px;
+  line-height: 28px;
+  text-transform: uppercase;
+  color: #ffffff;
+  text-shadow: 2px 2px 0 #000000;
+}
+```
+
+Use:
+
+- `font-family`
+- `font-size`
+- numeric `font-weight` values such as `400`, `700`, `800`, `900`
+- `font-style: normal | italic`
+- `letter-spacing`
+- `word-spacing`
+- `line-height` in `px`
+- `text-align`
+- `text-transform: uppercase`
+- `text-decoration: underline`
+- `white-space: nowrap | normal | pre | pre-wrap`
+- `text-overflow: ellipsis` on fixed-width labels
+- `text-shadow`
+- `-webkit-text-stroke` for strong display outlines
+- `-unity-text-outline-width` and `-unity-text-outline-color` for Unity text
+  outlines
+
+Avoid:
+
+- many font families in one screen
+- proprietary fonts unless the font files are supplied
+- variable font axes other than weight
+- browser-only font feature tuning
+- paragraph text tricks such as hyphenation and advanced wrapping
+- depending on fallback fonts to define the design
+
+## Text Patterns
+
+For compact HUD labels:
+
+```css
+.hud-label {
+  height: 18px;
+  line-height: 18px;
+  font-family: "Saira Condensed", sans-serif;
+  font-size: 12px;
+  font-weight: 800;
+  font-style: italic;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+```
+
+For outlined or shadowed display numbers:
+
+```css
+.result-time {
+  font-family: "Saira Condensed", sans-serif;
+  font-size: 28px;
+  font-weight: 900;
+  font-style: italic;
+  color: #ffffff;
+  text-shadow: 2px 2px 0 #000000;
+  -webkit-text-stroke: 1px #000000;
+}
+```
+
+For truncating player names:
+
+```css
+.driver-name {
+  width: 112px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+```
+
+## Color
+
+Use:
+
+- hex colors: `#ffbf13`, `#050608`
+- `rgb(...)`, `rgba(...)`
+- `hsl(...)`, `hsla(...)`
+- alpha only where transparency is intended
+
+Avoid:
+
+- `oklch()`, `lab()`, `lch()`
+- `color-mix()`
+- CSS variables for every color unless the palette is reused heavily
+- parent `opacity` when children overlap other UI
+
+Prefer alpha in the actual color:
+
+```css
+.muted-text {
+  color: rgba(255, 255, 255, 0.55);
+}
+```
+
+Avoid this for containers with child content:
+
+```css
+.muted-panel {
+  opacity: 0.55;
+}
+```
+
+## Backgrounds and Gradients
+
+Use CSS backgrounds for panels, lighting, overlays, and simple texture.
+
+```css
+.panel-dark {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.00)),
+    linear-gradient(90deg, #070b12 0%, #111820 55%, #050608 100%);
+}
+```
+
+Use:
+
+- `background-color`
+- `background-image: url(...)`
+- `background-size: cover | contain | 100% 100% | <px> <px>`
+- `background-position`
+- `background-repeat`
+- `linear-gradient(...)`
+- `radial-gradient(...)`
+- `repeating-linear-gradient(...)`
+
+For scanlines:
+
+```css
+.scanline-panel {
+  background:
+    repeating-linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.04) 0,
+      rgba(255, 255, 255, 0.04) 1px,
+      rgba(0, 0, 0, 0.00) 1px,
+      rgba(0, 0, 0, 0.00) 4px
+    ),
+    #080a0d;
+}
+```
+
+For subtle dot grain:
+
+```css
+.dot-grain {
+  background:
+    radial-gradient(circle, rgba(255, 255, 255, 0.06) 0 1px, transparent 1px)
+      0 0 / 8px 8px,
+    #07090d;
+}
+```
+
+Avoid:
+
+- `conic-gradient(...)`
+- `background-blend-mode`
+- `mix-blend-mode`
+- animated gradients
+- gradients that rely on many tiny fractional stops
+
+## Borders, Radius, Shadows, Emboss
+
+Use borders and shadows for bevels, embossing, button chrome, and inset panel
+depth.
+
+```css
+.embossed-panel {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: linear-gradient(180deg, #222832 0%, #11151b 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.55),
+    0 2px 4px rgba(0, 0, 0, 0.45);
+}
+```
+
+Use:
+
+- `border`
+- `border-color`
+- `border-width`
+- `border-radius`
+- `box-shadow`
+- `inset` shadows
+
+Avoid:
+
+- dozens of layered shadows on many repeated rows
+- very large blur shadows on scrolling lists
+- border styles other than `solid`
+- `outline-offset` as layout
+
+## Slanted Shapes
+
+Use `clip-path: polygon(...)` for slanted panels and motorsport-style chrome.
+
+```css
+.slanted-panel {
+  clip-path: polygon(6% 0, 100% 0, 94% 100%, 0 100%);
+}
+```
+
+For a slanted result row:
+
+```css
+.result-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  height: 28px;
+  background: linear-gradient(90deg, #110404 0%, #050608 60%, #030405 100%);
+  clip-path: polygon(3% 0, 100% 0, 97% 100%, 0 100%);
+}
+```
+
+Use:
+
+- `clip-path: polygon(...)`
+- simple 3 to 8 point polygons
+- a normal rectangular parent when text or hit area must stay predictable
+
+Avoid:
+
+- `clip-path: path(...)`
+- CSS masks for complex shapes
+- `shape-outside`
+- relying on clipped children to create layout
+
+## Images and SVG
+
+Use raster images for complex art.
+
+- Logos, portraits, game art, and textured badges should be PNG/WebP/JPG.
+- Use transparent PNG for irregular logos.
+- Use SVG only for simple static icons and flat vector marks.
+- Inline SVGs should include `viewBox`, `width`, and `height`.
+- Keep SVGs self-contained.
+
+Avoid in SVG:
+
+- external references
+- `<use>` references to external sprites
+- filters
+- masks
+- animation
+- embedded scripts
+- complex text inside SVG
+
+For icon buttons:
+
+```css
+.icon-button {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.icon {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+```
+
+## Filters and Blur
+
+Use simple filters sparingly.
+
+Use:
+
+- `filter: blur(<px>)` for isolated decorative layers
+- `filter: grayscale(...)`
+- `filter: invert(...)`
+- `filter: opacity(...)`
+- `filter: sepia(...)`
+- `filter: hue-rotate(...)`
+- `filter: contrast(...)`
+
+Avoid:
+
+- `backdrop-filter`
+- `-webkit-backdrop-filter`
+- `filter: drop-shadow(...)` on repeated elements
+- heavy blur on large moving regions
+- chaining many filters on the same element
+
+For frosted glass, fake the look with a translucent background and subtle
+highlight instead of live backdrop blur:
+
+```css
+.frosted-panel {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.04)),
+    rgba(20, 24, 30, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+```
+
+## Masks and Fades
+
+Prefer explicit gradient overlays for fades.
+
+```css
+.bottom-fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 48px;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.00), #000000);
+}
+```
+
+Avoid:
+
+- complex CSS masks
+- image masks
+- nested mask stacks
+- masks used as the primary way to draw shapes
+
+## Animation and State
+
+Use state classes for UI changes.
+
+```css
+.menu {
+  opacity: 0;
+}
+
+.menu.is-open {
+  opacity: 1;
+}
+
+.row.is-selected {
+  background: #ffbf13;
+  color: #050608;
+}
+```
+
+Use:
+
+- `.is-open`
+- `.is-selected`
+- `.is-disabled`
+- `.is-live`
+- `.is-warning`
+- simple `:hover`, `:focus`, `:active`, `:disabled`
+- `transition-property`
+- `transition-duration`
+- `transition-timing-function`
+
+Avoid:
+
+- `@keyframes`
+- `animation`
+- infinite CSS animation
+- visual state that only exists in JavaScript
+- transitions between different unit types
+
+## Pointer Events
+
+Use `pointer-events: none` only for decorative layers that should never
+receive input.
+
+```css
+.chrome-highlight {
+  pointer-events: none;
+}
+```
+
+Interactive controls should use real elements:
+
+- `button` for actions
+- `input` for text or toggles
+- `select` for option lists
+- `textarea` for multi-line text
+
+Avoid using plain decorative `div` elements as the only interactive target
+unless a stable ID and role are provided.
+
+## Selectors
+
+Keep selectors simple and class-based.
+
+Use:
+
+- `.component`
+- `.component .child`
+- `.component > .child`
+- `.component.variant`
+- `.component.is-selected`
+- selector lists such as `.button, .tab`
+- pseudo-classes for direct state: `:hover`, `:focus`, `:active`, `:disabled`
+
+Avoid:
+
+- `:has(...)`
+- `::part`
+- `::slotted`
+- deep `nth-child(...)` selectors as core styling
+- sibling selectors for dynamic UI behavior
+- framework-generated selectors
+- `@media`, `@container`, `@supports`, `@layer`, `@scope`
+- deep chains such as `body > div:nth-child(2) > div > div`
+
+## Common Patterns
+
+Ready prompt with a round dot:
+
+```css
+.ready-cta {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-family: "Saira Condensed", sans-serif;
+  font-size: 12px;
+  font-weight: 800;
+  font-style: italic;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: #dca40d;
+  text-shadow: 1px 1px 0 #000000;
+}
+
+.ready-cta-dot {
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: #dca40d;
+}
+```
+
+Broadcast ticker:
+
+```css
+.ticker {
+  height: 26px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  background: #050608;
+  border-top: 2px solid #ffbf13;
+}
+
+.ticker-label {
+  font-family: "Saira Condensed", sans-serif;
+  font-size: 16px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: #ffbf13;
+}
+```
+
+Toolbar icon rail:
+
+```css
+.toolbar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: rgba(25, 30, 38, 0.96);
+}
+
+.toolbar-icon {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+```
+
+## Hard-No List
+
+Avoid these in design source:
+
+- Inline styles.
+- Inline JavaScript event handlers.
+- Grid, table layout, floats, and multi-column layout.
+- `position: fixed` and `position: sticky`.
+- `@keyframes` and `animation`.
+- `backdrop-filter` and `-webkit-backdrop-filter`.
+- `mix-blend-mode` and `background-blend-mode`.
+- `conic-gradient`.
+- `clip-path` shapes other than `polygon(...)`.
+- General masks beyond simple edge fades.
+- `canvas`, `video`, `audio`, `iframe`, `embed`.
+- Web Components and shadow DOM.
+- `@media`, `@container`, `@supports`, `@layer`, `@scope`.
+- `:has(...)`, `::part`, `::slotted`.
+- `calc()` with mixed units, `min()`, `max()`, `clamp()`.
+- Modern color functions such as `oklch()`, `lab()`, `lch()`, `color-mix()`.
+- Variable font axes beyond weight.
+- Browser-only font features.
+- CSS that depends on framework runtime state to look correct.
+
+## Self-Check
+
+Before handing off a design, verify:
+
+- No inline styles.
+- Shared visuals use shared classes.
+- Every flex container declares `flex-direction`.
+- No grid, table, or float layout.
+- Fonts are open source, supplied, or known system fonts.
+- Each screen has one root ID.
+- Interactive elements have stable IDs or classes.
+- No keyframe animations.
+- SVGs have `viewBox`, `width`, and `height`.
+- Complex logos and portraits are raster images.
+- Slanted panels use `clip-path: polygon(...)`.
+- Emboss and bevel use `box-shadow` and inset shadows.
+- Frosted glass is represented as translucent chrome, not backdrop blur.
+- Selectors are simple and class-based.

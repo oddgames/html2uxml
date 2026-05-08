@@ -34,8 +34,11 @@ VOID_ELEMENTS = {
     "link", "meta", "param", "source", "track", "wbr",
 }
 
-# Tags that should be skipped entirely (we read their contents separately).
-HEAD_ONLY_TAGS = {"script", "noscript", "meta", "link", "title", "head"}
+# Tags that should be skipped entirely (we read some contents separately).
+# Void head-only tags are handled as one-shot skips; only container tags push
+# skip state.
+HEAD_ONLY_TAGS = {"script", "noscript", "template", "meta", "link", "title", "head"}
+HEAD_ONLY_CONTAINER_TAGS = {"script", "noscript", "template", "title", "head"}
 
 
 @dataclass
@@ -67,7 +70,7 @@ class _TreeBuilder(HTMLParser):
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         attr_dict = {k.lower(): (v if v is not None else "") for k, v in attrs}
-        if tag == "link" and attr_dict.get("rel", "").lower() == "stylesheet":
+        if tag == "link" and _is_stylesheet_link(attr_dict):
             href = attr_dict.get("href")
             if href:
                 self.linked_stylesheets.append(href)
@@ -76,6 +79,8 @@ class _TreeBuilder(HTMLParser):
             self._in_style = True
             return
         if tag in HEAD_ONLY_TAGS:
+            if tag not in HEAD_ONLY_CONTAINER_TAGS:
+                return
             self._in_skip += 1
             return
         node = Node(tag=tag, attrs=attr_dict)
@@ -88,7 +93,7 @@ class _TreeBuilder(HTMLParser):
         if tag == "style":
             self._in_style = False
             return
-        if tag in HEAD_ONLY_TAGS:
+        if tag in HEAD_ONLY_CONTAINER_TAGS:
             if self._in_skip > 0:
                 self._in_skip -= 1
             return
@@ -100,6 +105,13 @@ class _TreeBuilder(HTMLParser):
     def handle_startendtag(self, tag, attrs):
         tag = tag.lower()
         attr_dict = {k.lower(): (v if v is not None else "") for k, v in attrs}
+        if tag == "link" and _is_stylesheet_link(attr_dict):
+            href = attr_dict.get("href")
+            if href:
+                self.linked_stylesheets.append(href)
+            return
+        if tag in HEAD_ONLY_TAGS:
+            return
         node = Node(tag=tag, attrs=attr_dict)
         self.stack[-1].children.append(node)
 
@@ -131,6 +143,13 @@ def _collapse(s: str) -> str:
             out.append(ch)
             prev_space = False
     return "".join(out)
+
+
+def _is_stylesheet_link(attrs: dict) -> bool:
+    rel_tokens = {tok for tok in attrs.get("rel", "").lower().split() if tok}
+    if "stylesheet" in rel_tokens:
+        return True
+    return "preload" in rel_tokens and attrs.get("as", "").lower() == "style"
 
 
 @dataclass

@@ -6,8 +6,8 @@ USS is CSS-like but:
   - font weight/style is folded into `-unity-font-style` (normal|bold|italic|bold-and-italic).
   - `font-family` requires a Unity font asset, set via `-unity-font` / `-unity-font-definition`.
   - shorthand `border`, `background`, `font` aren't supported.
-  - `box-shadow`, `clip-path`, `filter`, `backdrop-filter`, `mask`, vendor prefixes,
-    keyframe animations, gradient backgrounds, and named cursors aren't supported.
+  - some CSS effects need bridges: shadows, clip paths, gradients, and
+    drop-shadow filters. Browser backdrop blur is only approximated.
   - `box-sizing` doesn't exist; padding/border are inside the box.
   - percentages on `transform: translate(...)` work; `translateX(50%)` becomes
     `translate: 50% 0;`.
@@ -80,7 +80,7 @@ ELEMENT_MAP: dict[str, tuple[str, dict, str | None]] = {
     "button":  ("ui:Button", {}, "text"),
     "a":       ("ui:Button", {}, "text"),
 
-    "img":     ("ui:Image", {}, None),
+    "img":     ("ui:VisualElement", {}, None),
     "br":      ("ui:VisualElement", {"class": "br"}, None),
     "hr":      ("ui:VisualElement", {"class": "hr"}, None),
 
@@ -150,8 +150,7 @@ SKIP_VALUES = {"unset", "initial", "inherit", "revert", "revert-layer"}
 
 # CSS properties that USS does not support and we drop with a warning.
 DROP_PROPS = {
-    "backdrop-filter",
-    "mask", "mask-image", "mask-type", "animation", "appearance",
+    "mask", "mask-type", "animation", "appearance",
     "float", "clear", "box-sizing", "user-select",
     "perspective", "perspective-origin", "transform-style",
     "backface-visibility", "mix-blend-mode", "background-blend-mode",
@@ -227,12 +226,20 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
     """Convert a list of (prop, value) CSS pairs to USS pairs."""
     out: list[tuple[str, str]] = []
     warnings: list[str] = []
+    normalized_decls = [
+        (prop, _coerce_modern_color(_coerce_units(value.strip())))
+        for prop, value in decls
+    ]
+    pattern_decls, pattern_skip, pattern_rewrites = _extract_background_pattern_decls(
+        normalized_decls,
+        warnings,
+    )
     # Collected font-style flags that combine into -unity-font-style.
     is_bold = False
     is_italic = False
     has_font_style_decl = False
 
-    input_props = {p.lower() for p, _ in decls}
+    input_props = {p.lower() for p, _ in normalized_decls}
     # CSS default for `display: flex` is `flex-direction: row`. USS default is
     # `column`. Backfill row when the author relied on the CSS default and didn't
     # declare flex-direction explicitly.
@@ -243,9 +250,10 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
                 for p, v in decls)
     )
 
-    for prop, value in decls:
-        v = _coerce_units(value.strip())
-        v = _coerce_modern_color(v)
+    for idx, (prop, value) in enumerate(normalized_decls):
+        if idx in pattern_skip:
+            continue
+        v = pattern_rewrites.get(idx, value)
         if not v or v.lower() in SKIP_VALUES:
             continue
         # auto/normal often mean "no override" in computed-style dumps
@@ -273,6 +281,8 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
             else:
                 out.append((k, val))
 
+    out.extend(pattern_decls)
+
     if has_font_style_decl:
         if is_bold and is_italic:
             out.append(("-unity-font-style", "bold-and-italic"))
@@ -290,6 +300,8 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
     seen: dict[str, str] = {}
     for k, val in out:
         seen[k] = val
+    if "--odd-clip-polygon" in seen and "background-color" in seen:
+        seen["--odd-background-color"] = seen.pop("background-color")
     final = list(seen.items())
     return MapResult(decls=final, warnings=warnings)
 
@@ -297,6 +309,7 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
 _LEN_RE = re.compile(r"^-?\d*\.?\d+(px|em|rem|%|vw|vh|)$")
 _GRAD_RE = re.compile(r"\b(linear|radial|conic|repeating-linear|repeating-radial)-gradient\s*\(",
                       re.IGNORECASE)
+_BORDER_HAIRLINE_SCALE = 0.5
 
 
 def _extract_call_body(value: str, fn_name: str) -> str | None:
@@ -339,6 +352,277 @@ def _find_gradient(value: str) -> tuple[int, int, str] | None:
     if depth != 0:
         return None
     return start, i, value[start:i]
+
+
+def _map_background_layers(value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
+    """Map CSS background layers to the subset Unity plus Html2UxmlPanel can draw.
+
+    CSS permits many comma-separated background layers. The runtime bridge has
+    one linear and one radial slot, so keep the first useful layer of each kind
+    and derive a solid fallback from the bottom-most layer.
+    """
+    out: list[tuple[str, str]] = []
+    linear: str | None = None
+    repeating_linear: str | None = None
+    radials: list[str] = []
+    other_bits: list[str] = []
+    fallback_gradient_layers: list[str] = []
+
+    for layer in _split_top_level_commas(value):
+        grad = _find_gradient(layer)
+        if not grad:
+            if layer.strip():
+                other_bits.append(layer.strip())
+            continue
+        start, end, text = grad
+        fn = text.split("(", 1)[0].strip().lower()
+        if fn == "linear-gradient":
+            if linear is None:
+                linear = text
+            fallback_gradient_layers.append(text)
+        elif fn == "repeating-linear-gradient":
+            if repeating_linear is None:
+                repeating_linear = text
+            else:
+                warnings.append("extra repeating-linear-gradient background layers ignored after 1")
+        elif fn in ("radial-gradient", "repeating-radial-gradient"):
+            if len(radials) < 2:
+                radials.append(text)
+            else:
+                warnings.append("extra radial-gradient background layers ignored after 2")
+            if fn == "radial-gradient":
+                fallback_gradient_layers.append(text)
+        else:
+            warnings.append(f"{fn or 'gradient'} not bridged; use linear/radial gradients")
+        rest = (layer[:start] + layer[end:]).strip(" ,")
+        if rest:
+            other_bits.append(rest)
+
+    if linear is not None:
+        out.append(("--odd-gradient", _quote_for_uss(linear)))
+    if repeating_linear is not None:
+        out.append(("--odd-repeating-linear-gradient", _quote_for_uss(repeating_linear)))
+    if radials:
+        out.append(("--odd-radial-gradient", _quote_for_uss(radials[0])))
+    if len(radials) > 1:
+        out.append(("--odd-radial-gradient-2", _quote_for_uss(radials[1])))
+
+    color = None
+    for bit in reversed(other_bits):
+        color = _extract_color(bit)
+        if color:
+            break
+    if color is None and fallback_gradient_layers:
+        color = _extract_color(fallback_gradient_layers[-1])
+    if color:
+        out.append(("background-color", color))
+
+    for bit in other_bits:
+        url_m = re.search(r"url\([^)]+\)|resource\([^)]+\)", bit)
+        if url_m:
+            out.append(("background-image", url_m.group(0)))
+            break
+
+    return out or None
+
+
+def _map_gradient(value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
+    fn = value.split("(", 1)[0].strip().lower()
+    if fn == "linear-gradient":
+        return [("--odd-gradient", _quote_for_uss(value))]
+    if fn == "repeating-linear-gradient":
+        return [("--odd-repeating-linear-gradient", _quote_for_uss(value))]
+    if fn in ("radial-gradient", "repeating-radial-gradient"):
+        return [("--odd-radial-gradient", _quote_for_uss(value))]
+    warnings.append(f"{fn or 'gradient'} not bridged; use linear/radial gradients")
+    return None
+
+
+def _extract_background_pattern_decls(
+    decls: list[tuple[str, str]],
+    warnings: list[str],
+) -> tuple[list[tuple[str, str]], set[int], dict[int, str]]:
+    """Pull CSS tiled radial dot patterns out of normal gradient mapping.
+
+    A browser commonly authors subtle grain with:
+
+        background-image: radial-gradient(rgba(...) 1px, transparent 1px);
+        background-size: 6px 6px;
+
+    That is a repeated background image, not one giant radial gradient. UI
+    Toolkit has no CSS gradient image tiling, so emit runtime pattern bridge
+    props and remove that radial layer from the normal gradient bridge.
+    """
+    size_value: str | None = None
+    position_value: str | None = None
+    repeat_value: str | None = None
+    for prop, value in decls:
+        low = prop.lower()
+        if low == "background-size":
+            size_value = value
+        elif low == "background-position":
+            position_value = value
+        elif low == "background-repeat":
+            repeat_value = value
+
+    if not size_value or not _is_tiled_background_size(size_value):
+        return [], set(), {}
+    if repeat_value and repeat_value.strip().lower() in ("no-repeat", "round", "space"):
+        return [], set(), {}
+
+    out: list[tuple[str, str]] = []
+    skip: set[int] = set()
+    rewrites: dict[int, str] = {}
+    emitted = False
+
+    for idx, (prop, value) in enumerate(decls):
+        if prop.lower() not in ("background-image", "background"):
+            continue
+        layers = _split_top_level_commas(value)
+        if not layers:
+            continue
+
+        kept_layers: list[str] = []
+        for layer in layers:
+            grad = _find_gradient(layer)
+            if not grad:
+                kept_layers.append(layer)
+                continue
+            start, end, text = grad
+            fn = text.split("(", 1)[0].strip().lower()
+            if fn == "radial-gradient" and _looks_like_radial_dot_pattern(text):
+                if not emitted:
+                    out.append(("--odd-tiled-radial-gradient", _quote_for_uss(text)))
+                    out.append(("--odd-background-pattern-size", _quote_for_uss(size_value)))
+                    if position_value:
+                        out.append(("--odd-background-pattern-position", _quote_for_uss(position_value)))
+                    warnings.append(
+                        "tiled radial-gradient background mapped to Html2UxmlPanel pattern renderer"
+                    )
+                    emitted = True
+                rest = (layer[:start] + layer[end:]).strip(" ,")
+                if rest:
+                    kept_layers.append(rest)
+            else:
+                kept_layers.append(layer)
+
+        if len(kept_layers) == len(layers):
+            continue
+        if kept_layers:
+            rewrites[idx] = ", ".join(kept_layers)
+        else:
+            skip.add(idx)
+
+    return out, skip, rewrites
+
+
+def _is_tiled_background_size(value: str) -> bool:
+    v = value.strip().lower()
+    if not v or v in ("auto", "cover", "contain", "initial", "inherit", "unset"):
+        return False
+    # Tiled CSS pattern art normally uses explicit lengths. Avoid treating
+    # cover/contain image scaling as a pattern signal.
+    return bool(re.search(r"\d", v) and any(unit in v for unit in ("px", "%", "em", "rem")))
+
+
+def _looks_like_radial_dot_pattern(value: str) -> bool:
+    body = _extract_gradient_body(value)
+    if body is None:
+        return False
+    parts = _split_top_level_commas(body)
+    if len(parts) < 2:
+        return False
+    first_color, first_positions = _split_color_stop_positions(parts[0])
+    second_color, second_positions = _split_color_stop_positions(parts[1])
+    if not first_color or not second_color:
+        return False
+    if not first_positions or not second_positions:
+        return False
+    if "transparent" not in second_color.lower() and not re.search(r"rgba?\([^)]*,\s*0(?:\.0+)?\s*\)", second_color, re.IGNORECASE):
+        return False
+    first_px = _small_px_stop(first_positions[-1])
+    second_px = _small_px_stop(second_positions[-1])
+    return first_px is not None and second_px is not None and abs(first_px - second_px) <= 1.0
+
+
+def _extract_gradient_body(value: str) -> str | None:
+    open_idx = value.find("(")
+    close_idx = value.rfind(")")
+    if open_idx < 0 or close_idx <= open_idx:
+        return None
+    return value[open_idx + 1:close_idx]
+
+
+def _split_color_stop_positions(stop: str) -> tuple[str, list[str]]:
+    tokens = _split_whitespace_top_level(stop.strip())
+    if not tokens:
+        return "", []
+    color_tokens: list[str] = []
+    positions: list[str] = []
+    for token in tokens:
+        if positions or _is_gradient_stop_position(token):
+            positions.append(token)
+        else:
+            color_tokens.append(token)
+    return " ".join(color_tokens).strip(), positions
+
+
+def _split_whitespace_top_level(value: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    quote: str | None = None
+    buf: list[str] = []
+    for c in value:
+        if quote:
+            buf.append(c)
+            if c == quote:
+                quote = None
+            continue
+        if c in ("'", '"'):
+            quote = c
+            buf.append(c)
+            continue
+        if c == "(":
+            depth += 1
+            buf.append(c)
+            continue
+        if c == ")":
+            depth = max(0, depth - 1)
+            buf.append(c)
+            continue
+        if c.isspace() and depth == 0:
+            if buf:
+                parts.append("".join(buf))
+                buf = []
+            continue
+        buf.append(c)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def _is_gradient_stop_position(token: str) -> bool:
+    return bool(re.fullmatch(r"-?\d*\.?\d+(?:px|%|em|rem)?", token.strip().lower()))
+
+
+def _small_px_stop(token: str) -> float | None:
+    t = token.strip().lower()
+    factor = 1.0
+    if t.endswith("px"):
+        t = t[:-2]
+    elif t.endswith("rem"):
+        factor = 16.0
+        t = t[:-3]
+    elif t.endswith("em"):
+        factor = 16.0
+        t = t[:-2]
+    elif t.endswith("%"):
+        return None
+    try:
+        px = float(t) * factor
+    except ValueError:
+        return None
+    return px if 0.0 <= px <= 16.0 else None
 
 # em/rem -> px (16px base). vw/vh -> %.
 _UNIT_LEN_RE = re.compile(r"(-?\d*\.?\d+)(rem|em|vw|vh)\b")
@@ -400,17 +684,6 @@ def _coerce_modern_color(value: str) -> str:
     return _HSL_RE.sub(repl_hsl, value)
 
 
-_BOX_SHADOW_PARTS_RE = re.compile(
-    r"""
-    \s*
-    (?P<color>(?:rgba?|hsla?)\([^)]*\)|\#[0-9a-fA-F]{3,8}|[a-zA-Z]+)?
-    \s*
-    (?P<rest>[^,]*)
-    """,
-    re.VERBOSE,
-)
-
-
 def _parse_box_shadow(value: str):
     """Parse a single `<color> <ox> <oy> <blur>` (any order) shadow.
 
@@ -418,28 +691,133 @@ def _parse_box_shadow(value: str):
     Only the first shadow is taken if multiple comma-separated shadows are
     present (USS bridge supports a single shadow per element).
     """
-    # Take the first comma-separated shadow at the *top* level (skip commas
-    # inside parens like rgba(...)).
+    for layer in _split_top_level_commas(value):
+        parsed = _parse_shadow_layer(layer)
+        if parsed is not None and not parsed[0]:
+            _, ox, oy, blur, _spread, color = parsed
+            return ox, oy, blur, color
+    return None
+
+
+def _shadow_record(kind: str, ox: str, oy: str, blur: str, spread: str, color: str) -> str:
+    return "|".join((kind, ox, oy, blur, spread, color))
+
+
+def _emit_shadow_props(records: list[str]) -> list[tuple[str, str]]:
+    if not records:
+        return []
+    out = [("--odd-box-shadows", _quote_for_uss(";".join(records)))]
+    for record in records:
+        parts = record.split("|", 5)
+        if len(parts) < 6:
+            continue
+        kind, ox, oy, blur, spread, color = parts
+        if kind == "outset":
+            out.extend([
+                ("--odd-shadow-offset-x", ox),
+                ("--odd-shadow-offset-y", oy),
+                ("--odd-shadow-blur", blur),
+                ("--odd-shadow-color", color),
+            ])
+            break
+    for record in records:
+        parts = record.split("|", 5)
+        if len(parts) < 6:
+            continue
+        kind, ox, oy, blur, spread, color = parts
+        if kind == "inset":
+            out.extend([
+                ("--odd-inner-shadow-offset-x", ox),
+                ("--odd-inner-shadow-offset-y", oy),
+                ("--odd-inner-shadow-blur", blur),
+                ("--odd-inner-shadow-spread", spread),
+                ("--odd-inner-shadow-color", color),
+            ])
+            break
+    return out
+
+
+def _map_box_shadow(value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
+    out: list[tuple[str, str]] = []
+    saw_supported = False
+    skipped_layers = 0
+    records: list[str] = []
+    for layer in _split_top_level_commas(value):
+        parsed = _parse_shadow_layer(layer)
+        if parsed is None:
+            skipped_layers += 1
+            continue
+        inset, ox, oy, blur, spread, color = parsed
+        if len(records) >= 8:
+            skipped_layers += 1
+            continue
+        records.append(_shadow_record("inset" if inset else "outset", ox, oy, blur, spread, color))
+        saw_supported = True
+    out = _emit_shadow_props(records) + out
+    if skipped_layers:
+        warnings.append(f"box-shadow: {value} -- additional/complex shadow layers ignored after 8 supported layers")
+    if not saw_supported:
+        warnings.append(f"box-shadow: {value} -- complex shadow not bridged")
+        return None
+    return out
+
+
+def _map_mask_image(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
+    grad = _find_gradient(value)
+    if not grad:
+        warnings.append(f"{prop}: {value} -- only linear-gradient mask fades are bridged")
+        return None
+    text = grad[2]
+    fn = text.split("(", 1)[0].strip().lower()
+    if fn not in ("linear-gradient", "repeating-linear-gradient"):
+        warnings.append(f"{prop}: {value} -- only linear-gradient mask fades are bridged")
+        return None
+    return [("--odd-mask-image", _quote_for_uss(text))]
+
+
+def _split_top_level_commas(value: str) -> list[str]:
+    parts: list[str] = []
     depth = 0
-    first_end = len(value)
+    start = 0
+    quote: str | None = None
+    escaped = False
     for i, c in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in ("'", '"'):
+            quote = c
         if c == "(":
             depth += 1
         elif c == ")":
-            depth -= 1
+            depth = max(0, depth - 1)
         elif c == "," and depth == 0:
-            first_end = i
-            break
-    first = value[:first_end]
-    if "inset" in first.lower():
-        return None  # inset shadows aren't supported by the bridge.
-    color = _extract_color(first)
+            part = value[start:i].strip()
+            if part:
+                parts.append(part)
+            start = i + 1
+    tail = value[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _parse_shadow_layer(layer: str):
+    low = layer.lower()
+    inset = bool(re.search(r"\binset\b", low))
+    color = _extract_color(layer)
     if color is None:
         return None
     # Strip the color and any other function calls before scanning lengths,
     # so we don't pick up channel digits from rgba()/hsla().
-    scrubbed = re.sub(r"(rgba?|hsla?)\s*\([^)]*\)", " ", first, flags=re.IGNORECASE)
+    scrubbed = re.sub(r"(rgba?|hsla?)\s*\([^)]*\)", " ", layer, flags=re.IGNORECASE)
     scrubbed = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", scrubbed)
+    scrubbed = re.sub(r"\binset\b", " ", scrubbed, flags=re.IGNORECASE)
     nums = re.findall(r"-?\d*\.?\d+(?:px|em|rem|%)?", scrubbed)
     nums = [n for n in nums if n.strip()]
     if len(nums) < 2:
@@ -447,7 +825,8 @@ def _parse_box_shadow(value: str):
     ox = _strip_unit(nums[0])
     oy = _strip_unit(nums[1])
     blur = _strip_unit(nums[2]) if len(nums) >= 3 else "0"
-    return ox, oy, blur, color
+    spread = _strip_unit(nums[3]) if len(nums) >= 4 else "0"
+    return inset, ox, oy, blur, spread, color
 
 
 def _ensure_unit(n: str) -> str:
@@ -464,6 +843,8 @@ def _strip_unit(n: str) -> str:
 
 
 _VENDOR_KEEP = {
+    "-webkit-backdrop-filter",
+    "-webkit-mask-image",
     "-webkit-text-stroke",
     "-webkit-text-stroke-width",
     "-webkit-text-stroke-color",
@@ -478,6 +859,19 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop in ("text-decoration", "text-transform"):
         # These are consumed while emitting text nodes, not written as USS.
         return None
+    if prop == "z-index":
+        # Consumed by the converter as a static sibling paint-order sort.
+        # Unity has no z-index property to emit.
+        return None
+    if prop == "pointer-events":
+        v = value.strip().lower()
+        if v == "none":
+            return [("__picking-mode__", "Ignore")]
+        return None
+    if prop in ("backdrop-filter", "-webkit-backdrop-filter"):
+        return _map_backdrop_filter(value, warnings)
+    if prop in ("mask-image", "-webkit-mask-image"):
+        return _map_mask_image(prop, value, warnings)
     if prop in DROP_PROPS:
         warnings.append(f"unsupported in USS, dropped: {prop}: {value}")
         return None
@@ -505,16 +899,27 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         v = value.lower()
         return [("-unity-text-align", TEXT_ALIGN_MAP.get(v, "middle-left"))]
 
-    # font weight / style fold into -unity-font-style
+    # font weight / style fold into -unity-font-style. Keep the numeric
+    # weight as a custom property so the CLI can inject the closest real font
+    # file instead of asking Unity to synthesize every bold weight.
     if prop == "font-weight":
         v = value.lower()
         try:
             n = int(v)
         except ValueError:
             n = None
+        out: list[tuple[str, str]] = []
+        if n is not None:
+            out.append(("--odd-font-weight", str(n)))
+        elif v in ("bold", "bolder"):
+            out.append(("--odd-font-weight", "700"))
+        elif v in ("normal", "lighter"):
+            out.append(("--odd-font-weight", "400"))
         if v in ("bold", "bolder") or (n is not None and n >= 600):
-            return [("__bold__", "1")]
-        return [("__font-normal__", "0")]
+            out.append(("__bold__", "1"))
+        else:
+            out.append(("__font-normal__", "0"))
+        return out
     if prop == "font-style":
         v = value.lower()
         if v in ("italic", "oblique"):
@@ -531,7 +936,7 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
             "ui-rounded", "math", "emoji", "fangsong",
         ):
             return None
-        return [("--gg-font-family", f'"{first}"')]
+        return [("--odd-font-family", f'"{first}"')]
 
     # font shorthand: too ambiguous; only pull font-size if obvious.
     if prop == "font":
@@ -546,25 +951,11 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
 
     # background shorthand: pull color, image, and bridge gradients via custom prop.
     if prop == "background":
-        out: list[tuple[str, str]] = []
-        grad = _find_gradient(value)
-        if grad:
-            start, end, text = grad
-            out.append(("--gg-gradient", _quote_for_uss(text)))
-            scrubbed = (value[:start] + value[end:]).strip(" ,")
-        else:
-            scrubbed = value
-        color = _extract_color(scrubbed) if scrubbed else None
-        if color:
-            out.append(("background-color", color))
-        url_m = re.search(r"url\([^)]+\)|resource\([^)]+\)", scrubbed or "")
-        if url_m:
-            out.append(("background-image", url_m.group(0)))
-        return out or None
+        return _map_background_layers(value, warnings)
     if prop == "background-image":
         grad = _find_gradient(value)
         if grad:
-            return [("--gg-gradient", _quote_for_uss(grad[2]))]
+            return _map_gradient(grad[2], warnings)
         return [("background-image", value)]
     if prop == "background-color":
         return [("background-color", value)]
@@ -575,6 +966,18 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop in ("border-top", "border-right", "border-bottom", "border-left"):
         side = prop.split("-", 1)[1]
         return _split_border(value, sides=(side,))
+    if prop in (
+        "border-width", "border-top-width", "border-right-width",
+        "border-bottom-width", "border-left-width",
+    ):
+        return _map_border_width_property(prop, value)
+    if prop == "border-radius":
+        return _map_border_radius(value, warnings)
+    if prop in (
+        "border-top-left-radius", "border-top-right-radius",
+        "border-bottom-right-radius", "border-bottom-left-radius",
+    ):
+        return [(prop, _first_radius_component(value, warnings))]
 
     # cursor: USS supports a fixed keyword set or url()/resource().
     if prop == "cursor":
@@ -618,36 +1021,26 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
             return [("-unity-background-scale-mode", mapped)]
         return None
 
-    # box-shadow: not in USS proper; emit custom props for the bridge kit.
+    # box-shadow: not in USS proper; emit custom props for the runtime package.
     if prop == "box-shadow":
-        parsed = _parse_box_shadow(value)
-        if not parsed:
-            warnings.append(f"box-shadow: {value} -- complex/multi shadows not bridged")
-            return None
-        ox, oy, blur, color = parsed
-        return [
-            ("--gg-shadow-offset-x", ox),
-            ("--gg-shadow-offset-y", oy),
-            ("--gg-shadow-blur", blur),
-            ("--gg-shadow-color", color),
-        ]
+        return _map_box_shadow(value, warnings)
 
     # transform: USS prefers individual translate/rotate/scale properties.
     if prop == "transform":
         return _split_transform(value, warnings)
 
     # gap / row-gap / column-gap: USS doesn't support these. Bridge them by
-    # emitting --gg-row-gap / --gg-column-gap so BridgeBox can apply margin
+    # emitting --odd-row-gap / --odd-column-gap so Html2UxmlPanel can apply margin
     # to direct children at runtime based on the parent's flex-direction.
     if prop == "gap":
         parts = value.split()
         rg = _strip_unit(parts[0])
         cg = _strip_unit(parts[1] if len(parts) > 1 else parts[0])
-        return [("--gg-row-gap", rg), ("--gg-column-gap", cg)]
+        return [("--odd-row-gap", rg), ("--odd-column-gap", cg)]
     if prop == "row-gap":
-        return [("--gg-row-gap", _strip_unit(value))]
+        return [("--odd-row-gap", _strip_unit(value))]
     if prop == "column-gap":
-        return [("--gg-column-gap", _strip_unit(value))]
+        return [("--odd-column-gap", _strip_unit(value))]
 
     # inset shorthand -> top/right/bottom/left.
     if prop == "inset":
@@ -673,15 +1066,16 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         warnings.append(f"outline approximated as border (occupies layout space)")
         return _split_border(value, sides=("top", "right", "bottom", "left"))
 
-    # clip-path: bridge polygon() via a custom prop the BridgeBox renders.
+    # clip-path: bridge polygon() via a custom prop the Html2UxmlPanel renders.
     if prop == "clip-path":
         v = value.strip()
         if v.lower().startswith("polygon"):
-            return [("--gg-clip-polygon", _quote_for_uss(v))]
+            return [("--odd-clip-polygon", _quote_for_uss(v))]
         warnings.append(f"clip-path: {value} -- only polygon() is bridged")
         return None
 
-    # filter: only drop-shadow() routes into the box-shadow bridge.
+    # filter: Unity 6.4 native functions pass through; drop-shadow() routes
+    # into the box-shadow bridge because USS still omits that CSS function.
     if prop == "filter":
         return _map_filter(value, warnings)
 
@@ -690,15 +1084,6 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         v = value.lower()
         if v in ("clip", "ellipsis"):
             return [("text-overflow", v)]
-        return None
-
-    # pointer-events: forwarded as a synthetic UXML attribute, not USS, since
-    # picking-mode is per-element. The converter strips this from USS and
-    # picks it up via _resolved_value() when emitting the element.
-    if prop == "pointer-events":
-        v = value.strip().lower()
-        if v == "none":
-            return [("__picking-mode__", "Ignore")]
         return None
 
     # border-image -> background-image + -unity-slice-* (9-slice).
@@ -804,7 +1189,7 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         "border-bottom-width", "border-left-width",
         "border-color", "border-top-color", "border-right-color",
         "border-bottom-color", "border-left-color",
-        "border-radius", "border-top-left-radius", "border-top-right-radius",
+        "border-top-left-radius", "border-top-right-radius",
         "border-bottom-left-radius", "border-bottom-right-radius",
         "flex", "flex-grow", "flex-shrink", "flex-basis", "flex-direction", "flex-wrap",
         "align-items", "align-self", "align-content",
@@ -836,7 +1221,7 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
 
 def _quote_for_uss(value: str) -> str:
     """Wrap a raw CSS value as a USS string literal so the parser accepts it.
-    Bridge kit reads --gg-* as strings; functions like `linear-gradient(...)`
+    runtime panel reads --odd-* as strings; functions like `linear-gradient(...)`
     aren't recognized by the USS lexer otherwise."""
     inner = value.replace('\\', '\\\\').replace('"', '\\"')
     return f'"{inner}"'
@@ -872,21 +1257,98 @@ def _split_border(value: str, sides: tuple[str, ...]) -> list[tuple[str, str]] |
     out: list[tuple[str, str]] = []
     for side in sides:
         if width is not None:
-            out.append((f"border-{side}-width", width))
+            out.append((f"border-{side}-width", _scale_border_width(width)))
         if color is not None:
             out.append((f"border-{side}-color", color))
     return out or None
+
+
+def _map_border_width_property(prop: str, value: str) -> list[tuple[str, str]] | None:
+    """Map border width longhands and CSS box shorthand into Unity-sized widths.
+
+    UI Toolkit renders CSS pixel borders heavier than browsers at the target
+    scales used by authored HTML mockups. Scale px hairlines at conversion time
+    so 1px browser strokes land closer to the same visual weight in USS.
+    """
+    if prop != "border-width":
+        return [(prop, _scale_border_width(value))]
+
+    sides = _expand_box(value)
+    if not sides:
+        return [("border-width", _scale_border_width(value))]
+    top, right, bottom, left = sides
+    return [
+        ("border-top-width", _scale_border_width(top)),
+        ("border-right-width", _scale_border_width(right)),
+        ("border-bottom-width", _scale_border_width(bottom)),
+        ("border-left-width", _scale_border_width(left)),
+    ]
+
+
+def _scale_border_width(value: str) -> str:
+    raw = value.strip()
+    if raw in ("0", "0px", "0.0px", "0.00px"):
+        return "0"
+    m = re.fullmatch(r"(-?\d*\.?\d+)(px)?", raw, re.IGNORECASE)
+    if not m:
+        return value
+    unit = m.group(2)
+    if unit is None and float(m.group(1)) != 0:
+        unit = "px"
+    if unit is None:
+        return "0"
+    width = max(0.0, float(m.group(1)) * _BORDER_HAIRLINE_SCALE)
+    if width == 0:
+        return "0"
+    return f"{width:g}px"
+
+
+def _map_border_radius(value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
+    horizontal = value.split("/", 1)[0].strip()
+    if "/" in value:
+        warnings.append(
+            f"border-radius elliptical values approximated with horizontal radii: {value}"
+        )
+    sides = _expand_box(horizontal)
+    if not sides:
+        return None
+    top_left, top_right, bottom_right, bottom_left = sides
+    return [
+        ("border-top-left-radius", _first_radius_component(top_left, warnings)),
+        ("border-top-right-radius", _first_radius_component(top_right, warnings)),
+        ("border-bottom-right-radius", _first_radius_component(bottom_right, warnings)),
+        ("border-bottom-left-radius", _first_radius_component(bottom_left, warnings)),
+    ]
+
+
+def _first_radius_component(value: str, warnings: list[str]) -> str:
+    parts = value.split()
+    if len(parts) > 1:
+        warnings.append(
+            f"border radius elliptical corner approximated with first radius: {value}"
+        )
+    return parts[0] if parts else value
+
+
+def _split_transform_args(args: str) -> list[str]:
+    comma_parts = _split_top_level_commas(args)
+    if len(comma_parts) > 1:
+        return comma_parts
+    return [p for p in re.split(r"\s+", args.strip()) if p]
 
 
 def _split_transform(value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
     """Map `transform: translateX(50%) rotate(10deg)` to USS individual props."""
     out_translate = ["0", "0"]
     out_rotate = None
-    out_scale = None
     has_translate = False
-    for fn, args in re.findall(r"([a-zA-Z]+)\s*\(([^)]*)\)", value):
+    scale_x = "1"
+    scale_y = "1"
+    has_scale = False
+    force_scale_pair = False
+    for fn, args in re.findall(r"([a-zA-Z][a-zA-Z0-9-]*)\s*\(([^)]*)\)", value):
         fn = fn.lower()
-        parts = [p.strip() for p in args.split(",")]
+        parts = _split_transform_args(args)
         if fn == "translatex" and parts:
             out_translate[0] = parts[0]
             has_translate = True
@@ -899,15 +1361,34 @@ def _split_transform(value: str, warnings: list[str]) -> list[tuple[str, str]] |
             if len(parts) > 1:
                 out_translate[1] = parts[1]
             has_translate = True
+        elif fn == "translate3d":
+            if len(parts) >= 2:
+                out_translate[0] = parts[0]
+                out_translate[1] = parts[1]
+                has_translate = True
+            warnings.append("transform function translate3d() flattened to 2D; z component ignored")
         elif fn in ("rotate", "rotatez"):
             if parts:
                 out_rotate = parts[0]
         elif fn == "scale":
             if len(parts) == 1:
-                out_scale = parts[0]
+                scale_x = parts[0]
+                scale_y = parts[0]
+                has_scale = True
             elif len(parts) >= 2:
-                out_scale = f"{parts[0]} {parts[1]}"
-        elif fn in ("scalex", "scaley", "rotatex", "rotatey", "translate3d", "matrix",
+                scale_x = parts[0]
+                scale_y = parts[1]
+                has_scale = True
+                force_scale_pair = True
+        elif fn == "scalex" and parts:
+            scale_x = parts[0]
+            has_scale = True
+            force_scale_pair = True
+        elif fn == "scaley" and parts:
+            scale_y = parts[0]
+            has_scale = True
+            force_scale_pair = True
+        elif fn in ("rotatex", "rotatey", "translatez", "matrix",
                     "skew", "skewx", "skewy", "perspective", "matrix3d"):
             warnings.append(f"transform function {fn}() not supported in USS, ignored")
     pairs: list[tuple[str, str]] = []
@@ -915,8 +1396,11 @@ def _split_transform(value: str, warnings: list[str]) -> list[tuple[str, str]] |
         pairs.append(("translate", f"{out_translate[0]} {out_translate[1]}"))
     if out_rotate is not None:
         pairs.append(("rotate", out_rotate))
-    if out_scale is not None:
-        pairs.append(("scale", out_scale))
+    if has_scale:
+        if scale_x == scale_y and not force_scale_pair:
+            pairs.append(("scale", scale_x))
+        else:
+            pairs.append(("scale", f"{scale_x} {scale_y}"))
     return pairs or None
 
 
@@ -932,12 +1416,21 @@ _NATIVE_FILTER_FUNCS = {
     "filter",
 }
 
+_ODDGAMES_PACKAGE_ID = "au.com.oddgames.html2uxml"
+_ODDGAMES_FILTER_ASSET_ROOT = f"Packages/{_ODDGAMES_PACKAGE_ID}/Runtime/Filters"
+
+
+def _oddgames_filter_asset(name: str) -> str:
+    return f'{_ODDGAMES_FILTER_ASSET_ROOT}/{name}.asset'
+
 
 def _map_filter(value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
     """Map CSS filter functions to Unity 6.4 native filters where possible.
 
     Unity 6.4 supports most common filter functions natively but still omits
-    CSS `drop-shadow()`, so that one remains routed through BridgeBox.
+    CSS `drop-shadow()`, so that one remains routed through Html2UxmlPanel.
+    Brightness/saturation route to package custom filter assets because Unity
+    6.4 doesn't ship those CSS functions as built-ins.
     """
     funcs = _parse_function_list(value)
     if funcs is None:
@@ -946,32 +1439,124 @@ def _map_filter(value: str, warnings: list[str]) -> list[tuple[str, str]] | None
     out: list[tuple[str, str]] = []
     native_parts: list[str] = []
     unsupported: list[str] = []
+    drop_shadow_records: list[str] = []
+    used_custom_assets = False
     for name, text, body in funcs:
         low = name.lower()
         if low == "drop-shadow":
             shadow = _parse_box_shadow(body)
             if shadow:
                 ox, oy, blur, color = shadow
-                out.extend([
-                    ("--gg-shadow-offset-x", ox),
-                    ("--gg-shadow-offset-y", oy),
-                    ("--gg-shadow-blur", blur),
-                    ("--gg-shadow-color", color),
-                ])
+                if len(drop_shadow_records) < 8:
+                    drop_shadow_records.append(_shadow_record("outset", ox, oy, blur, "0", color))
+                else:
+                    warnings.append("filter: extra drop-shadow() functions ignored after 8 layers")
             else:
                 warnings.append(f"filter: drop-shadow({body}) -- complex shadow not bridged")
         elif low in _NATIVE_FILTER_FUNCS:
             native_parts.append(text)
+        elif low == "brightness":
+            brightness = _parse_filter_amount(body)
+            if brightness is None:
+                unsupported.append(name)
+                continue
+            native_parts.append(
+                f'filter("{_oddgames_filter_asset("ODDGamesColorAdjust")}" {brightness:g} 1)'
+            )
+            used_custom_assets = True
+        elif low == "saturate":
+            saturation = _parse_filter_amount(body)
+            if saturation is None:
+                unsupported.append(name)
+                continue
+            native_parts.append(
+                f'filter("{_oddgames_filter_asset("ODDGamesColorAdjust")}" 1 {saturation:g})'
+            )
+            used_custom_assets = True
         else:
             unsupported.append(name)
+    out.extend(_emit_shadow_props(drop_shadow_records))
     if native_parts:
         out.append(("filter", " ".join(native_parts)))
+    if used_custom_assets:
+        warnings.append(
+            "filter uses ODDGames package custom filter assets; install "
+            "au.com.oddgames.html2uxml before loading the USS"
+        )
     if unsupported:
         warnings.append(
             "filter functions not supported by Unity 6.4 USS, dropped: "
             + ", ".join(unsupported)
         )
     return out or None
+
+
+def _map_backdrop_filter(value: str, warnings: list[str]) -> list[tuple[str, str]] | None:
+    """Approximate browser backdrop-filter with Unity 6.4 element filters.
+
+    UI Toolkit filters process the element subtree, not the pixels already
+    behind it. Keeping native blur/color filters is still useful for source
+    that authors a separate translucent glass layer.
+    """
+    funcs = _parse_function_list(value)
+    if funcs is None:
+        warnings.append(f"backdrop-filter: {value} -- unsupported filter syntax")
+        return None
+    native_parts: list[str] = []
+    unsupported: list[str] = []
+    used_custom_assets = False
+    for name, text, _body in funcs:
+        low = name.lower()
+        if low in _NATIVE_FILTER_FUNCS:
+            native_parts.append(text)
+        elif low == "brightness":
+            brightness = _parse_filter_amount(_body)
+            if brightness is None:
+                unsupported.append(name)
+                continue
+            native_parts.append(
+                f'filter("{_oddgames_filter_asset("ODDGamesColorAdjust")}" {brightness:g} 1)'
+            )
+            used_custom_assets = True
+        elif low == "saturate":
+            saturation = _parse_filter_amount(_body)
+            if saturation is None:
+                unsupported.append(name)
+                continue
+            native_parts.append(
+                f'filter("{_oddgames_filter_asset("ODDGamesColorAdjust")}" 1 {saturation:g})'
+            )
+            used_custom_assets = True
+        else:
+            unsupported.append(name)
+    if unsupported:
+        warnings.append(
+            "backdrop-filter functions not supported by Unity 6.4 USS, dropped: "
+            + ", ".join(unsupported)
+        )
+    if not native_parts:
+        return None
+    if used_custom_assets:
+        warnings.append(
+            "backdrop-filter uses ODDGames package custom filter assets; install "
+            "au.com.oddgames.html2uxml before loading the USS"
+        )
+    warnings.append(
+        "backdrop-filter approximated as filter; Unity blurs the element subtree, not the backdrop"
+    )
+    return [("filter", " ".join(native_parts))]
+
+
+def _parse_filter_amount(value: str) -> float | None:
+    v = value.strip().lower()
+    if not v:
+        return None
+    try:
+        if v.endswith("%"):
+            return float(v[:-1].strip()) / 100.0
+        return float(v)
+    except ValueError:
+        return None
 
 
 def _parse_function_list(value: str) -> list[tuple[str, str, str]] | None:

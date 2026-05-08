@@ -10,5 +10,28 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
 *.uxml.out
 *.uss.out
+
+# Local conversion output and browser-render snapshots
+out_*/
+rendered-from-cli.html
+.tmp/
+sample/
+sample2/
+
+# Local Unity scratch projects and generated Unity caches
+UnityProj_*/
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+*.csproj
+*.sln
+
+# Local agent/editor state
+.claude/
