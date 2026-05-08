@@ -15,6 +15,8 @@ namespace ODDGames.Html2Uxml.Editor
     /// imports or refreshes the generated UI folder.
     public class TextCoreFontAssetImporter : AssetPostprocessor
     {
+        const string RepairMenuPath = "Tools/Html2Uxml/Repair Font Assets";
+
         static void OnPostprocessAllAssets(
             string[] importedAssets,
             string[] deletedAssets,
@@ -43,6 +45,49 @@ namespace ODDGames.Html2Uxml.Editor
 
             if (createdAny)
                 AssetDatabase.SaveAssets();
+        }
+
+        [InitializeOnLoadMethod]
+        static void RepairOnLoad()
+        {
+            EditorApplication.delayCall += () => RepairAllManifests(silent: true);
+        }
+
+        [MenuItem(RepairMenuPath)]
+        static void RepairMenu()
+        {
+            int repaired = RepairAllManifests(silent: false);
+            Debug.Log($"[Html2Uxml] Font asset repair: processed {repaired} font(s).");
+        }
+
+        static int RepairAllManifests(bool silent)
+        {
+            var manifestGuids = AssetDatabase.FindAssets("html2uxml-fonts");
+            int processed = 0;
+            bool changed = false;
+            var seen = new HashSet<string>();
+
+            foreach (var guid in manifestGuids)
+            {
+                string manifestPath = AssetDatabase.GUIDToAssetPath(guid);
+                if (!IsFontManifestPath(manifestPath))
+                    continue;
+
+                foreach (var fontPath in FontPathsForManifest(manifestPath))
+                {
+                    if (!seen.Add(fontPath))
+                        continue;
+                    if (EnsureFontAsset(fontPath))
+                    {
+                        processed++;
+                        changed = true;
+                    }
+                }
+            }
+
+            if (changed)
+                AssetDatabase.SaveAssets();
+            return processed;
         }
 
         static bool IsGeneratedFontPath(string path)
@@ -94,17 +139,24 @@ namespace ODDGames.Html2Uxml.Editor
 
             if (existing != null)
             {
-                if (existing.sourceFontFile == null)
+                bool needsRecreate = existing.sourceFontFile == null || existing.material == null;
+                if (needsRecreate)
                 {
-                    var field = typeof(FontAsset).GetField(
-                        "m_SourceFontFile",
-                        BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (field != null)
-                        field.SetValue(existing, sourceFont);
+                    // Stale asset (typically copied from another project where the
+                    // source font reference was lost). SerializedObject can repoint
+                    // m_SourceFontFile but cannot resurrect a missing m_Material or
+                    // atlas texture. Delete and recreate from scratch.
+                    AssetDatabase.DeleteAsset(assetPath);
+                    existing = null;
                 }
-                ConfigureFontAsset(existing, atlasMode, characterSet, fontPath);
-                EditorUtility.SetDirty(existing);
-                return true;
+                else
+                {
+                    bool dirty = ApplyFontAssetSerializedFixes(existing, sourceFont, atlasMode);
+                    ConfigureFontAsset(existing, atlasMode, characterSet, fontPath);
+                    if (dirty)
+                        EditorUtility.SetDirty(existing);
+                    return dirty;
+                }
             }
 
             var asset = FontAsset.CreateFontAsset(sourceFont);
@@ -118,6 +170,30 @@ namespace ODDGames.Html2Uxml.Editor
             ConfigureFontAsset(asset, atlasMode, characterSet, fontPath);
             AssetDatabase.CreateAsset(asset, assetPath);
             return true;
+        }
+
+        static bool ApplyFontAssetSerializedFixes(FontAsset asset, Font sourceFont, AtlasPopulationMode atlasMode)
+        {
+            var so = new SerializedObject(asset);
+            bool changed = false;
+
+            var sourceProp = so.FindProperty("m_SourceFontFile");
+            if (sourceProp != null && sourceProp.objectReferenceValue == null && sourceFont != null)
+            {
+                sourceProp.objectReferenceValue = sourceFont;
+                changed = true;
+            }
+
+            var atlasProp = so.FindProperty("m_AtlasPopulationMode");
+            if (atlasProp != null && atlasProp.intValue != (int)atlasMode)
+            {
+                atlasProp.intValue = (int)atlasMode;
+                changed = true;
+            }
+
+            if (changed)
+                so.ApplyModifiedPropertiesWithoutUndo();
+            return changed;
         }
 
         static AtlasPopulationMode FontAtlasModeFor(FontManifestEntry entry)

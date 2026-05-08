@@ -38,6 +38,12 @@ namespace ODDGames.Html2Uxml
         void ApplyGap()
         {
             if (!_hasGap || childCount < 2) return;
+            schedule.Execute(ApplyGapImmediate);
+        }
+
+        void ApplyGapImmediate()
+        {
+            if (!_hasGap || childCount < 2) return;
             bool isColumn = resolvedStyle.flexDirection == FlexDirection.Column
                          || resolvedStyle.flexDirection == FlexDirection.ColumnReverse;
             bool isReverse = resolvedStyle.flexDirection == FlexDirection.RowReverse

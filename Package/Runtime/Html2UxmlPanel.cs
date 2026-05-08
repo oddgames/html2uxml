@@ -256,6 +256,16 @@ namespace ODDGames.Html2Uxml
         void ApplyGap()
         {
             if (!_hasGap || childCount < 2) return;
+            // Style writes are unsafe during render/layout callbacks (preview
+            // editor surfaces this with InvalidOperationException). Defer to
+            // the next scheduler tick so we run outside any active visual
+            // tree update.
+            schedule.Execute(ApplyGapImmediate);
+        }
+
+        void ApplyGapImmediate()
+        {
+            if (!_hasGap || childCount < 2) return;
             bool isColumn = resolvedStyle.flexDirection == FlexDirection.Column
                          || resolvedStyle.flexDirection == FlexDirection.ColumnReverse;
             bool isReverse = resolvedStyle.flexDirection == FlexDirection.RowReverse
