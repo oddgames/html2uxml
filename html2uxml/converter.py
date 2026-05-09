@@ -371,12 +371,15 @@ class _EmitState:
         self,
         decls: list[tuple[str, str]],
         name_hint: str | None = None,
+        *,
+        cache: bool = True,
     ) -> tuple[str, bool]:
         key = _decl_cache_key(decls)
-        if key in self.generated_class_cache:
+        if cache and key in self.generated_class_cache:
             return self.generated_class_cache[key], False
         cls = self.gen_class(name_hint)
-        self.generated_class_cache[key] = cls
+        if cache:
+            self.generated_class_cache[key] = cls
         self.add_rule(f".{cls}", decls)
         return cls, True
 
@@ -1975,7 +1978,14 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             "parent opacity was pushed to non-overlay children"
         )
     if extra_generated_decls:
-        own_class, created = state.class_for_generated_decls(extra_generated_decls, name_hint)
+        # These are per-node cascade overrides (baked flex gap, isolated
+        # opacity). Reusing an earlier identical class can put the rule before
+        # this node's own generated style and let that base style cancel it.
+        own_class, created = state.class_for_generated_decls(
+            extra_generated_decls,
+            name_hint,
+            cache=False,
+        )
         own_classes.append(own_class)
         if created:
             state.stats.inline_overrides += 1
@@ -3686,7 +3696,12 @@ def _emit_generated_text_label(
     state.record_font_text(value, effective_text_raw, dynamic=dynamic_font)
     if not _should_emit_spaced_text(value, effective_text_raw):
         if extra_container_decls:
-            extra_class, created = state.class_for_generated_decls(extra_container_decls)
+            # Gap/override classes must be emitted at this point in the cascade
+            # so a generated Label's own style cannot overwrite them.
+            extra_class, created = state.class_for_generated_decls(
+                extra_container_decls,
+                cache=False,
+            )
             if created:
                 state.stats.inline_overrides += 1
             class_name = f"{class_name} {extra_class}" if class_name else extra_class

@@ -241,6 +241,7 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
     is_bold = False
     is_italic = False
     has_font_style_decl = False
+    text_align_flex_justify: str | None = None
 
     input_props = {p.lower() for p, _ in normalized_decls}
     # CSS default for `display: flex` is `flex-direction: row`. USS default is
@@ -281,6 +282,8 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
                 has_font_style_decl = True
             elif k == "__font-normal__":
                 has_font_style_decl = True
+            elif k == "__text-align-flex-justify__":
+                text_align_flex_justify = val
             else:
                 out.append((k, val))
 
@@ -305,6 +308,18 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
         seen[k] = val
     if "--odd-clip-polygon" in seen and "background-color" in seen:
         seen["--odd-background-color"] = seen.pop("background-color")
+    # Browsers honour `text-align` for inline children of a flex container;
+    # Unity USS doesn't propagate it the same way. Use flex justification as
+    # a fallback only when the CSS did not already declare `justify-content`.
+    if "justify-content" not in seen and (seen.get("display") == "flex" or "flex-direction" in seen):
+        justify = {
+            "middle-center": "center",
+            "middle-right": "flex-end",
+            "middle-left": "flex-start",
+        }.get(seen.get("-unity-text-align"))
+        justify = text_align_flex_justify or justify
+        if justify:
+            seen["justify-content"] = justify
     _drop_inert_unity_slices(seen, normalized_decls)
     _apply_content_box_sizing(seen, normalized_decls)
     final = list(seen.items())
@@ -906,24 +921,10 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     # text alignment
     if prop == "text-align":
         v = value.lower()
-        out_decls = [("-unity-text-align", TEXT_ALIGN_MAP.get(v, "middle-left"))]
-        # Browsers honour `text-align` for inline children of a flex
-        # container (each line gets centered/right-aligned within the
-        # container). Unity USS doesn't propagate text-align that way,
-        # so mirror the alignment via `justify-content` on the parent.
-        # `justify-content` is inert on non-flex containers, so emitting
-        # it unconditionally is safe.
-        justify = {
-            "center": "center",
-            "right": "flex-end",
-            "end": "flex-end",
-            "left": "flex-start",
-            "start": "flex-start",
-            "justify": "space-between",
-        }.get(v)
-        if justify:
-            out_decls.append(("justify-content", justify))
-        return out_decls
+        out = [("-unity-text-align", TEXT_ALIGN_MAP.get(v, "middle-left"))]
+        if v == "justify":
+            out.append(("__text-align-flex-justify__", "space-between"))
+        return out
 
     # font weight / style fold into -unity-font-style. Keep the numeric
     # weight as a custom property so the CLI can inject the closest real font

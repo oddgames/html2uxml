@@ -282,6 +282,21 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertNotIn("odd:Html2UxmlPanel", r.uxml)
         self.assertIn("margin-left: 8px", r.uss)
 
+    def test_static_flex_gap_override_stays_after_child_inline_margin(self):
+        r = convert(
+            '<div style="display:flex; column-gap:6px">'
+            '<span></span><span data-h2u-name="first-gap"></span>'
+            '</div>'
+            '<div style="display:flex; column-gap:6px">'
+            '<span></span><span data-h2u-name="text" '
+            'style="margin-left:0px;width:10px;height:10px"></span>'
+            '</div>'
+        )
+        self.assertGreater(
+            r.uss.rfind("margin-left: 6px"),
+            r.uss.rfind("margin-left: 0px"),
+        )
+
     def test_inline_child_label_carries_inherited_letter_spacing(self):
         r = convert(
             '<div class="ready"><span>TAP</span></div>',
@@ -335,6 +350,18 @@ class ConvertBasicsTest(unittest.TestCase):
         r = convert('<p style="text-align: center;">x</p>')
         self.assertIn("-unity-text-align: middle-center", r.uss)
         self.assertNotIn("\ntext-align:", r.uss)
+
+    def test_text_align_flex_fallback_does_not_override_explicit_justify_content(self):
+        r = convert(
+            '<div style="display: flex; flex-direction: column; '
+            'justify-content: center; text-align: start;"><span>x</span></div>'
+        )
+        self.assertIn("justify-content: center", r.uss)
+        self.assertNotIn("justify-content: flex-start", r.uss)
+
+    def test_text_align_flex_fallback_still_maps_inline_text_alignment(self):
+        r = convert('<div style="display: flex; text-align: right;"><span>x</span></div>')
+        self.assertIn("justify-content: flex-end", r.uss)
 
     def test_font_weight_and_style_fold_into_unity_font_style(self):
         r = convert(
