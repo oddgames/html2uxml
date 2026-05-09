@@ -1613,6 +1613,45 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn('text="LIVE"', r.uxml)
         self.assertNotIn("ignored", r.uxml)
 
+    def test_document_body_is_emitted_for_body_css(self):
+        r = convert(
+            "<html><head><style>"
+            "body { padding: 2rem; background: #f5f5f5; color: #222; }"
+            "section { background: white; }"
+            "</style></head><body><section><h1>Title</h1></section></body></html>"
+        )
+        self.assertIn('class="h2u-tag-body"', r.uxml)
+        self.assertIn('<odd:Html2UxmlElement class="h2u-tag-body"', r.uxml)
+        self.assertIn("background-color: #f5f5f5", r.uss)
+        self.assertIn("padding: 32px", r.uss)
+
+    def test_normal_document_flow_children_do_not_shrink(self):
+        r = convert(
+            "<html><body><section><h1>Title</h1></section><section><p>Body</p></section></body></html>",
+            "body { padding: 32px; } section { padding: 24px; }",
+        )
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlElement class="h2u-tag-section h2u-[^"]*"')
+        self.assertIn("flex-shrink: 0", r.uss)
+
+    def test_authored_flex_children_keep_css_flex_shrink_default(self):
+        r = convert(
+            '<html><body class="row"><span>A</span><span>B</span></body></html>',
+            ".row { display: flex; } span { color: red; }",
+        )
+        self.assertNotIn("flex-shrink: 0", r.uss)
+
+    def test_inline_strikethrough_keeps_paragraph_inline(self):
+        r = convert(
+            "<p>Alpha <strong>bold</strong>, <em>italic</em>, <u>underlined</u>, "
+            "<s>struck</s>, and <a href='#'>link</a>.</p>"
+        )
+        self.assertIn(
+            'text="Alpha &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;, '
+            '&lt;u&gt;underlined&lt;/u&gt;, &lt;s&gt;struck&lt;/s&gt;, and link."',
+            r.uxml,
+        )
+        self.assertNotIn('name="struck" text="struck"', r.uxml)
+
     def test_cli_can_fail_on_inline_styles(self):
         with TemporaryDirectory() as td:
             base = Path(td)

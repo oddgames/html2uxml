@@ -433,10 +433,17 @@ namespace ODDGames.Html2Uxml
             var rect = BorderBoxRect();
             var backgroundRect = BackgroundPaintRect(rect);
             var painter = ctx.painter2D;
+            bool shaderGradient = _gradientLayer != null && _gradientLayer.parent == _target;
+            bool hasOutsetShadow = HasOutsetShadow();
             for (int i = _shadowLayers.Count - 1; i >= 0; i--)
                 if (!_shadowLayers[i].Inset && _shadowLayers[i].Color.a > 0f)
-                    PaintShadow(painter, rect, _shadowLayers[i]);
-            bool shaderGradient = _gradientLayer != null && _gradientLayer.parent == _target;
+                    PaintShadow(ctx, painter, rect, _shadowLayers[i]);
+            if (hasOutsetShadow && !_hasSolidBackground && !shaderGradient)
+            {
+                Color backgroundColor = _target.resolvedStyle.backgroundColor;
+                if (backgroundColor.a > 0.001f)
+                    PaintBackgroundColor(painter, backgroundRect, backgroundColor);
+            }
             if (_hasSolidBackground && !shaderGradient)
                 PaintSolidBackground(painter, backgroundRect);
             if (!shaderGradient)
@@ -458,6 +465,14 @@ namespace ODDGames.Html2Uxml
                     else
                         PaintInnerShadow(painter, backgroundRect, _shadowLayers[i]);
                 }
+        }
+
+        bool HasOutsetShadow()
+        {
+            for (int i = 0; i < _shadowLayers.Count; i++)
+                if (!_shadowLayers[i].Inset && _shadowLayers[i].Color.a > 0f)
+                    return true;
+            return false;
         }
 
         Rect BorderBoxRect()
@@ -486,6 +501,25 @@ namespace ODDGames.Html2Uxml
             float yMin = rect.yMin + top;
             float xMax = rect.xMax - right;
             float yMax = rect.yMax - bottom;
+            if (xMax < xMin)
+            {
+                float x = (xMin + xMax) * 0.5f;
+                xMin = xMax = x;
+            }
+            if (yMax < yMin)
+            {
+                float y = (yMin + yMax) * 0.5f;
+                yMin = yMax = y;
+            }
+            return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+        }
+
+        static Rect InflateRect(Rect rect, float amount)
+        {
+            float xMin = rect.xMin - amount;
+            float yMin = rect.yMin - amount;
+            float xMax = rect.xMax + amount;
+            float yMax = rect.yMax + amount;
             if (xMax < xMin)
             {
                 float x = (xMin + xMax) * 0.5f;
@@ -550,7 +584,12 @@ namespace ODDGames.Html2Uxml
 
         void PaintSolidBackground(Painter2D p, Rect rect)
         {
-            p.fillColor = _solidBackgroundColor;
+            PaintBackgroundColor(p, rect, _solidBackgroundColor);
+        }
+
+        void PaintBackgroundColor(Painter2D p, Rect rect, Color color)
+        {
+            p.fillColor = color;
             p.BeginPath();
             if (_clipPoints != null && _clipPoints.Length >= 3)
             {
@@ -569,17 +608,20 @@ namespace ODDGames.Html2Uxml
             p.Fill();
         }
 
-        void PaintShadow(Painter2D p, Rect rect, ShadowLayer layer)
+        void PaintShadow(MeshGenerationContext ctx, Painter2D p, Rect rect, ShadowLayer layer)
         {
-            // Approximate a Gaussian shadow with N concentric semi-transparent
-            // rounded rectangles. Cheap, no shader needed.
-            float radius = _target.resolvedStyle.borderTopLeftRadius;
+            float radius = RoundedRadius(rect);
             float spread = layer.Spread;
-            Rect baseRect = new Rect(
-                rect.x + layer.Offset.x - spread,
-                rect.y + layer.Offset.y - spread,
-                rect.width + spread * 2f,
-                rect.height + spread * 2f);
+            Rect baseRect = InflateRect(
+                new Rect(
+                    rect.x + layer.Offset.x,
+                    rect.y + layer.Offset.y,
+                    rect.width,
+                    rect.height),
+                spread);
+            if (baseRect.width <= 0.001f || baseRect.height <= 0.001f)
+                return;
+
             if (layer.Blur <= 0f)
             {
                 p.fillColor = layer.Color;
@@ -590,25 +632,82 @@ namespace ODDGames.Html2Uxml
                 return;
             }
 
-            int steps = Mathf.Clamp(Mathf.CeilToInt(layer.Blur * 0.5f), 1, 8);
-            for (int i = steps; i >= 1; i--)
+            PaintSoftShadowMesh(ctx, baseRect, radius + spread, layer.Blur, layer.Color);
+        }
+
+        void PaintSoftShadowMesh(
+            MeshGenerationContext ctx,
+            Rect sourceRect,
+            float sourceRadius,
+            float blur,
+            Color color)
+        {
+            // UI Toolkit does not provide CSS box-shadow directly. Generate a
+            // feathered rounded-rect mesh around the shadow caster. The fade
+            // starts inside the caster and continues outward so offset shadows
+            // don't expose a hard strip at the element edge.
+            float blurExtent = Mathf.Max(0.5f, blur);
+            float outerRadius = Mathf.Max(0f, sourceRadius) + blurExtent;
+            float innerExtent = Mathf.Min(
+                blurExtent,
+                Mathf.Max(0f, Mathf.Min(sourceRect.width, sourceRect.height) * 0.5f - 0.5f));
+            int contourCount = Mathf.Clamp(Mathf.CeilToInt(blurExtent * 1.25f) + 5, 7, 24);
+            int segmentsPerCorner = Mathf.Clamp(Mathf.CeilToInt(outerRadius * 0.75f), 8, 32);
+            int pointsPerContour = segmentsPerCorner * 4;
+            int vertexCount = 1 + contourCount * pointsPerContour;
+            int indexCount = pointsPerContour * 3 + (contourCount - 1) * pointsPerContour * 6;
+            if (vertexCount <= 0 || vertexCount > ushort.MaxValue || indexCount <= 0)
+                return;
+
+            var vertices = new Vertex[vertexCount];
+            var indices = new ushort[indexCount];
+            Color centerColor = color;
+            vertices[0] = MakeVertex(sourceRect.center, centerColor);
+            int vi = 1;
+            int ii = 0;
+            for (int contour = 0; contour < contourCount; contour++)
             {
-                float t = i / (float)steps;
-                float expand = layer.Blur * t * 0.5f;
-                Color c = layer.Color;
-                c.a = layer.Color.a * (1f - t) * 0.6f;
-                p.fillColor = c;
-                p.BeginPath();
-                RoundedRect(p,
-                    new Rect(
-                        baseRect.x - expand,
-                        baseRect.y - expand,
-                        baseRect.width + expand * 2f,
-                        baseRect.height + expand * 2f),
-                    radius + Mathf.Max(0f, spread) + expand);
-                RoundedRectReverse(p, rect, radius);
-                p.Fill(FillRule.NonZero);
+                float t = contour / (float)(contourCount - 1);
+                float expand = Mathf.Lerp(-innerExtent, blurExtent, t);
+                Rect contourRect = InflateRect(sourceRect, expand);
+                float contourRadius = Mathf.Max(0f, sourceRadius) + expand;
+                Color c = color;
+                float fade = Mathf.InverseLerp(-innerExtent, blurExtent, expand);
+                c.a = color.a * (1f - Mathf.SmoothStep(0f, 1f, fade));
+
+                var points = RoundedRectPoints(contourRect, contourRadius, segmentsPerCorner);
+                for (int i = 0; i < points.Length; i++)
+                    vertices[vi++] = MakeVertex(points[i], c);
             }
+
+            int firstContour = 1;
+            for (int i = 0; i < pointsPerContour; i++)
+            {
+                int next = (i + 1) % pointsPerContour;
+                indices[ii++] = 0;
+                indices[ii++] = (ushort)(firstContour + i);
+                indices[ii++] = (ushort)(firstContour + next);
+            }
+
+            for (int contour = 0; contour < contourCount - 1; contour++)
+            {
+                int inner = 1 + contour * pointsPerContour;
+                int outer = 1 + (contour + 1) * pointsPerContour;
+                for (int i = 0; i < pointsPerContour; i++)
+                {
+                    int next = (i + 1) % pointsPerContour;
+                    indices[ii++] = (ushort)(inner + i);
+                    indices[ii++] = (ushort)(outer + i);
+                    indices[ii++] = (ushort)(outer + next);
+                    indices[ii++] = (ushort)(inner + i);
+                    indices[ii++] = (ushort)(outer + next);
+                    indices[ii++] = (ushort)(inner + next);
+                }
+            }
+
+            var data = ctx.Allocate(vertexCount, indexCount);
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(indices);
         }
 
         void PaintInnerShadow(Painter2D p, Rect rect, ShadowLayer layer)
@@ -1557,7 +1656,13 @@ namespace ODDGames.Html2Uxml
 
         static Vector2[] RoundedRectPoints(Rect rect, float radius)
         {
-            int segmentsPerCorner = RoundedCornerSegmentCount(radius);
+            return RoundedRectPoints(rect, radius, RoundedCornerSegmentCount(radius));
+        }
+
+        static Vector2[] RoundedRectPoints(Rect rect, float radius, int segmentsPerCorner)
+        {
+            segmentsPerCorner = Mathf.Max(2, segmentsPerCorner);
+            radius = Mathf.Clamp(radius, 0f, Mathf.Min(rect.width, rect.height) * 0.5f);
             var points = new Vector2[segmentsPerCorner * 4];
             int i = 0;
             AddArc(points, ref i, new Vector2(rect.xMin + radius, rect.yMin + radius), radius, 180f, 270f, segmentsPerCorner);

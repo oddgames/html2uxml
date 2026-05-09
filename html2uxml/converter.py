@@ -161,7 +161,10 @@ def convert(
         used_selectors.update(rs.matched_selectors)
     _emit_css_rules(parsed_rules, state, allowed_selectors=used_selectors)
 
-    body_xml = _emit_node_children(parsed.root, resolved, state, rule_bridge_flags, indent=2)
+    if parsed.root.tag == "__root__":
+        body_xml = _emit_node_children(parsed.root, resolved, state, rule_bridge_flags, indent=2)
+    else:
+        body_xml = _emit_node(parsed.root, resolved, state, rule_bridge_flags, indent=2)
     uxml = _wrap_uxml(body_xml, uss_filename, with_bridge=state.used_bridge)
     uss = _emit_uss(state)
     state.stats.uss_rules = len(state.uss_order)
@@ -1285,6 +1288,7 @@ _RICH_TEXT = {
     "b": "b", "strong": "b",
     "i": "i", "em": "i",
     "u": "u",
+    "s": "s", "strike": "s", "del": "s",
     "br": "br",
 }
 
@@ -1776,6 +1780,33 @@ def _inline_or_resolved_value(node: Node, style: ResolvedStyle | None, prop: str
     return _resolved_value(style, prop)
 
 
+def _normal_flow_child_decls(
+    node: Node,
+    style: ResolvedStyle | None,
+    parent: Node | None,
+    resolved: dict[int, ResolvedStyle],
+) -> list[tuple[str, str]]:
+    if parent is None or parent.tag == "__root__" or node.is_text or node.tag == "__root__":
+        return []
+    if parent.tag in _INTERACTIVE_TAGS:
+        return []
+    if _inline_or_resolved_value(node, style, "flex-shrink") is not None:
+        return []
+
+    position = (_inline_or_resolved_value(node, style, "position") or "static").strip().lower()
+    if position in ("absolute", "fixed"):
+        return []
+
+    parent_style = resolved.get(id(parent))
+    parent_display = (
+        _inline_or_resolved_value(parent, parent_style, "display") or "block"
+    ).strip().lower()
+    if parent_display in ("flex", "inline-flex", "grid", "inline-grid"):
+        return []
+
+    return [("flex-shrink", "0")]
+
+
 def _parse_z_index(value: str) -> int | None:
     v = value.strip().lower()
     if v in ("auto", "initial", "inherit", "unset"):
@@ -2175,6 +2206,13 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             cache=False,
         )
         own_classes.append(spaced_wrapper_class)
+        if created:
+            state.stats.inline_overrides += 1
+
+    normal_flow_decls = _normal_flow_child_decls(node, style, parent, resolved)
+    if normal_flow_decls:
+        normal_flow_class, created = state.class_for_generated_decls(normal_flow_decls, name_hint)
+        own_classes.append(normal_flow_class)
         if created:
             state.stats.inline_overrides += 1
 
@@ -3741,8 +3779,11 @@ _INLINE_TEXT_TAGS = {
     "i",
     "label",
     "mark",
+    "del",
     "small",
     "span",
+    "s",
+    "strike",
     "strong",
     "sub",
     "sup",
