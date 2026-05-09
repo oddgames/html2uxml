@@ -7,7 +7,8 @@ For each URL:
   * Local relative paths are resolved against `base_dir` and copied to
     `assets_dir`.
   * http(s) URLs are downloaded to `assets_dir` if `download_remote` is set.
-  * data: URIs and unresolved references are left alone with a warning.
+  * data:image/* URIs are decoded and written to `assets_dir`; the URL is
+    rewritten to the project-relative path. Other data: URIs are left alone.
 
 The url() reference in USS is rewritten to point at the copied file using a
 project-relative path (for generated output, usually `Images/star.png`).
@@ -18,12 +19,15 @@ TTF/OTF files are used as a fallback.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import os
 import re
 import shutil
 import struct
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,8 +74,18 @@ def collect_and_rewrite(
 
     def repl(m: re.Match) -> str:
         raw = m.group(1) or m.group(2) or m.group(3) or ""
-        if not raw or raw.startswith("data:"):
+        if not raw:
             return m.group(0)
+        if raw.startswith("data:"):
+            decoded = _decode_image_data_uri(raw)
+            if decoded is None:
+                report.failed.append((_truncate_for_report(raw), "unsupported data URI"))
+                return m.group(0)
+            data, ext = decoded
+            target_name = f"embedded-{hashlib.sha1(data).hexdigest()[:12]}{ext}"
+            target_name = _write_bytes_smart(assets_dir, target_name, data)
+            report.copied.append("data:")
+            return f'url("{project_subdir}/{target_name}")'
         # Already a project-relative path (e.g. emitted by SVG inlining).
         if raw.startswith(("Assets/", "Assets\\")):
             return m.group(0)
@@ -249,6 +263,49 @@ def _download(
 
 _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+_DATA_URI_RE = re.compile(
+    r"^data:(image/[A-Za-z0-9+\-.]+)\s*(;base64)?\s*,(.*)$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_DATA_URI_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/svg+xml": ".svg",
+    "image/x-icon": ".ico",
+    "image/vnd.microsoft.icon": ".ico",
+}
+
+
+def _decode_image_data_uri(uri: str) -> tuple[bytes, str] | None:
+    """Decode a `data:image/*` URI to (bytes, extension) or None if unsupported."""
+    m = _DATA_URI_RE.match(uri)
+    if not m:
+        return None
+    mime = m.group(1).lower()
+    is_base64 = m.group(2) is not None
+    payload = m.group(3)
+    try:
+        if is_base64:
+            data = base64.b64decode(payload, validate=False)
+        else:
+            data = urllib.parse.unquote_to_bytes(payload)
+    except (binascii.Error, ValueError):
+        return None
+    ext = _DATA_URI_EXTENSIONS.get(mime)
+    if ext is None:
+        subtype = mime.split("/", 1)[1] if "/" in mime else "bin"
+        ext = "." + re.sub(r"[^A-Za-z0-9]+", "", subtype)[:8] or ".bin"
+    return data, ext
+
+
+def _truncate_for_report(value: str, limit: int = 80) -> str:
+    return value if len(value) <= limit else value[:limit] + "..."
+
 
 def _safe_name(name: str) -> str:
     name = _NAME_RE.sub("_", name)
@@ -322,17 +379,399 @@ _GENERIC_FAMILIES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Embedded @font-face support
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EmbeddedFontReport:
+    extracted: list[tuple[str, str]] = field(default_factory=list)   # (family, project-relative path)
+    failed: list[tuple[str, str]] = field(default_factory=list)      # (family/url, reason)
+    skipped: list[tuple[str, str]] = field(default_factory=list)     # (url, reason) e.g. woff2 unsupported
+
+
+_AT_FONT_FACE_RE = re.compile(r"@font-face\s*\{([^}]*)\}", re.IGNORECASE | re.DOTALL)
+_FF_FACE_FAMILY_RE = re.compile(r"font-family\s*:\s*([^;]+)", re.IGNORECASE)
+_FF_FACE_SRC_RE = re.compile(r"src\s*:\s*((?:[^;]|;(?=base64))+)", re.IGNORECASE)
+_FF_FACE_SRC_ENTRY_RE = re.compile(
+    r"""url\(\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^)\s]+))\s*\)"""
+    r"""(?:\s*format\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]+))\s*\))?""",
+    re.IGNORECASE | re.DOTALL,
+)
+_FONT_DATA_URI_RE = re.compile(
+    r"^data:(?P<mime>[^;,]*)(?P<base64>;base64)?,(?P<payload>.*)$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_TTF_OTF_FORMATS = {"truetype", "opentype", "ttf", "otf"}
+_TTF_OTF_MIMES = {
+    "font/ttf", "font/otf",
+    "application/x-font-ttf", "application/x-font-otf",
+    "application/x-font-truetype", "application/x-font-opentype",
+    "application/font-ttf", "application/font-otf",
+    "application/font-sfnt",
+    "application/octet-stream",  # browsers commonly mislabel font payloads
+}
+# WOFF / WOFF2 are supported by transcoding to SFNT through fontTools (woff2
+# also needs brotli). They sit at a worse rank than direct TTF/OTF so the
+# resolver still prefers a native source when both ship in the same `src:`.
+_WOFF_FORMATS = {"woff", "woff2"}
+_WOFF_MIMES = {
+    "font/woff", "font/woff2",
+    "application/font-woff", "application/font-woff2",
+}
+_UNSUPPORTED_FORMATS = {"embedded-opentype", "svg"}
+
+
+def extract_embedded_font_faces(
+    css_text: str,
+    *,
+    base_dir: Path | None,
+    fonts_dir: Path,
+    project_subdir: str = "Fonts",
+    timeout: float = 8.0,
+    download_remote: bool = True,
+    families_filter: set[str] | None = None,
+) -> tuple[dict[str, list[FontVariant]], EmbeddedFontReport]:
+    """Pull `@font-face` rules out of the supplied CSS text and persist each
+    referenced font into `fonts_dir`.
+
+    Supports three `src:` shapes:
+      * `url(data:font/ttf;base64,...)` — decoded and written.
+      * `url(https://...)` — downloaded when `download_remote` is true.
+      * `url('relative/path.ttf')` — copied from `base_dir`.
+
+    WOFF / WOFF2 payloads are decompressed to SFNT (TTF/OTF) using
+    fontTools when available; entries that cannot be decoded land in
+    `report.skipped` so the caller can fall back to Google Fonts.
+
+    Pages from font-host services (Google Fonts, Adobe Fonts) ship one
+    `@font-face` per `unicode-range` subset, so naively writing every
+    block produces dozens of near-duplicate TTFs per family/weight. This
+    pass groups by `(family, weight, italic)` and writes only the best
+    candidate, ranked by unicode-range coverage.
+
+    `families_filter`, when provided, limits extraction to those family
+    names. Useful for skipping `@font-face` declarations the converted
+    page never references.
+    """
+    report = EmbeddedFontReport()
+    mapping: dict[str, list[FontVariant]] = {}
+    if not css_text:
+        return mapping, report
+
+    fonts_dir = Path(fonts_dir)
+    fonts_dir.mkdir(parents=True, exist_ok=True)
+
+    candidates: dict[tuple[str, int, bool], dict] = {}
+    for face_body in _AT_FONT_FACE_RE.findall(css_text):
+        family_match = _FF_FACE_FAMILY_RE.search(face_body)
+        src_match = _FF_FACE_SRC_RE.search(face_body)
+        if not family_match or not src_match:
+            continue
+        family = _clean_face_family(family_match.group(1))
+        if not family:
+            continue
+        if families_filter is not None and family not in families_filter:
+            continue
+        weight = _font_face_weight(face_body)
+        italic = _font_face_italic(face_body)
+        chosen = _choose_face_src_entry(src_match.group(1))
+        if chosen is None:
+            report.failed.append((family, "no usable src in @font-face"))
+            continue
+        unicode_range = _font_face_unicode_range(face_body)
+        score = _embedded_face_unicode_score(unicode_range)
+        key = (family, weight, italic)
+        existing = candidates.get(key)
+        if existing is None or score < existing["score"]:
+            candidates[key] = {
+                "family": family,
+                "weight": weight,
+                "italic": italic,
+                "src": chosen,
+                "score": score,
+                "unicode_range": unicode_range,
+            }
+
+    used_names: set[str] = set()
+    for key in sorted(candidates.keys()):
+        c = candidates[key]
+        family = c["family"]
+        weight = c["weight"]
+        italic = c["italic"]
+        url, fmt = c["src"]
+        try:
+            data, suffix = _resolve_face_src(
+                url,
+                fmt,
+                base_dir=base_dir,
+                timeout=timeout,
+                download_remote=download_remote,
+                report=report,
+            )
+        except _FaceSrcError as e:
+            report.failed.append((family, str(e)))
+            continue
+        if data is None:
+            continue
+
+        target_name = _unique_name(
+            _safe_font_name(family, suffix, weight=weight, italic=italic),
+            used_names,
+        )
+        target_name = _write_bytes_smart(fonts_dir, target_name, data)
+        relpath = f"{project_subdir}/{target_name}"
+        mapping.setdefault(family, []).append(FontVariant(
+            path=relpath,
+            weight=weight,
+            italic=italic,
+            source="embedded",
+        ))
+        report.extracted.append((family, relpath))
+
+    return mapping, report
+
+
+def _embedded_face_unicode_score(unicode_range: str) -> int:
+    """Lower score wins. Prefer faces that cover Basic Latin so English
+    text sees no missing glyphs; treat unrestricted ranges as equivalent."""
+    if not unicode_range:
+        return 0
+    r = unicode_range.lower()
+    if "u+0000-00ff" in r or "u+0000-007f" in r or "u+0020-007f" in r:
+        return 1
+    if "u+0100-02af" in r:
+        return 5
+    return 10
+
+
+def _clean_face_family(raw: str) -> str | None:
+    name = raw.strip().rstrip(",").strip()
+    name = name.split(",", 1)[0].strip().strip('"').strip("'")
+    if not name or name.lower() in _GENERIC_FAMILIES:
+        return None
+    return name
+
+
+def _choose_face_src_entry(src: str) -> tuple[str, str] | None:
+    """Pick the most Unity-friendly entry from a @font-face `src:` list.
+
+    Preference: TTF/OTF format hint > TTF/OTF extension > anything else.
+    Returns ``(url, format)`` or None when nothing usable was found.
+    """
+    candidates: list[tuple[int, str, str]] = []
+    for m in _FF_FACE_SRC_ENTRY_RE.finditer(src):
+        url = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+        fmt = (m.group(4) or m.group(5) or m.group(6) or "").strip().lower()
+        if not url:
+            continue
+        rank = _face_src_rank(url, fmt)
+        candidates.append((rank, url, fmt))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    rank, url, fmt = candidates[0]
+    if rank >= 100:
+        return None  # all entries unsupported
+    return url, fmt
+
+
+def _face_src_rank(url: str, fmt: str) -> int:
+    if fmt in _UNSUPPORTED_FORMATS:
+        return 100
+    suffix = Path(url.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
+    if suffix == ".eot":
+        return 100
+    if fmt in _TTF_OTF_FORMATS:
+        return 0
+    if suffix in (".ttf", ".otf"):
+        return 1
+    if fmt in _WOFF_FORMATS:
+        return 50
+    if suffix in (".woff", ".woff2"):
+        return 51
+    if url.startswith("data:"):
+        m = _FONT_DATA_URI_RE.match(url)
+        if m:
+            mime = (m.group("mime") or "").lower()
+            if mime in _TTF_OTF_MIMES:
+                return 0
+            if mime in _WOFF_MIMES or "woff" in mime:
+                return 50
+    return 5
+
+
+class _FaceSrcError(RuntimeError):
+    pass
+
+
+def _resolve_face_src(
+    url: str,
+    fmt: str,
+    *,
+    base_dir: Path | None,
+    timeout: float,
+    download_remote: bool,
+    report: EmbeddedFontReport,
+) -> tuple[bytes | None, str]:
+    """Resolve a @font-face src URL to (bytes, suffix). Returns (None, "")
+    when the entry is intentionally skipped (unsupported format)."""
+    if fmt in _UNSUPPORTED_FORMATS:
+        report.skipped.append((url, f"format {fmt!r} not supported by Unity TextCore"))
+        return None, ""
+
+    if url.startswith("data:"):
+        data, suffix = _read_data_uri_font(url, report)
+        if data is None:
+            return None, ""
+        return _maybe_decode_woff(data, suffix, report, source=url[:60] + "…")
+
+    if url.startswith(("http://", "https://")):
+        if not download_remote:
+            report.skipped.append((url, "remote (use --download-fonts)"))
+            return None, ""
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "html2uxml/0.2"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise _FaceSrcError(f"download failed: {e}") from e
+        suffix = _font_suffix_from_url(url)
+        return _maybe_decode_woff(data, suffix, report, source=url)
+
+    src = Path(url)
+    if not src.is_absolute() and base_dir is not None:
+        src = base_dir / url
+    try:
+        data = src.read_bytes()
+    except OSError as e:
+        raise _FaceSrcError(f"file not found: {url}") from e
+    suffix = src.suffix.lower()
+    if suffix not in (".ttf", ".otf", ".woff", ".woff2"):
+        suffix = ".ttf"
+    return _maybe_decode_woff(data, suffix, report, source=str(src))
+
+
+_SFNT_TAGS = (b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1")
+
+
+def _maybe_decode_woff(
+    data: bytes,
+    suffix: str,
+    report: EmbeddedFontReport,
+    *,
+    source: str,
+) -> tuple[bytes | None, str]:
+    """If `data` is WOFF/WOFF2 bytes, decompress to SFNT (TTF/OTF). Otherwise
+    return the bytes unchanged. WOFF detection by magic prefix is more
+    reliable than trusting `format(...)` hints, since exporters often
+    mislabel data: URIs.
+    """
+    if not data:
+        return data, suffix
+    head = data[:4]
+    if head in _SFNT_TAGS:
+        return data, suffix if suffix in (".ttf", ".otf") else ".ttf"
+    if head == b"wOFF":
+        return _decode_woff_bytes(data, suffix, report, source=source, version=1)
+    if head == b"wOF2":
+        return _decode_woff_bytes(data, suffix, report, source=source, version=2)
+    # Unknown header — let the caller write the bytes anyway. TextCore will
+    # surface the error during import if it can't parse it.
+    return data, suffix if suffix in (".ttf", ".otf") else ".ttf"
+
+
+def _decode_woff_bytes(
+    data: bytes,
+    suffix: str,
+    report: EmbeddedFontReport,
+    *,
+    source: str,
+    version: int,
+) -> tuple[bytes | None, str]:
+    label = "woff2" if version == 2 else "woff"
+    try:
+        from fontTools.ttLib import TTFont
+    except ImportError as e:
+        report.skipped.append((source, f"{label} decode requires fonttools: {e}"))
+        return None, ""
+    if version == 2:
+        try:
+            import brotli  # noqa: F401
+        except ImportError as e:
+            report.skipped.append((source, f"woff2 decode requires brotli: {e}"))
+            return None, ""
+
+    import io as _io
+    try:
+        with _io.BytesIO(data) as buf:
+            font = TTFont(buf)
+            font.flavor = None
+            out = _io.BytesIO()
+            font.save(out, reorderTables=False)
+            decoded = out.getvalue()
+    except Exception as e:  # fontTools raises a few different exception types
+        report.skipped.append((source, f"{label} decode failed: {e}"))
+        return None, ""
+
+    new_suffix = ".otf" if decoded[:4] == b"OTTO" else ".ttf"
+    return decoded, new_suffix
+
+
+def _read_data_uri_font(
+    url: str,
+    report: EmbeddedFontReport,
+) -> tuple[bytes | None, str]:
+    m = _FONT_DATA_URI_RE.match(url)
+    if not m:
+        raise _FaceSrcError("malformed data: URI")
+    mime = (m.group("mime") or "").lower()
+    payload = m.group("payload")
+    if m.group("base64"):
+        try:
+            data = base64.b64decode(payload, validate=False)
+        except (binascii.Error, ValueError) as e:
+            raise _FaceSrcError(f"base64 decode failed: {e}") from e
+    else:
+        data = urllib.parse.unquote_to_bytes(payload)
+    if "woff2" in mime:
+        suffix = ".woff2"
+    elif "woff" in mime:
+        suffix = ".woff"
+    elif "otf" in mime or "opentype" in mime:
+        suffix = ".otf"
+    else:
+        suffix = ".ttf"
+    return data, suffix
+
+
 def download_google_fonts(
     families: list[str],
     *,
     assets_dir: Path,
     project_subdir: str = "Fonts",
     timeout: float = 8.0,
+    wanted: dict[str, set[tuple[int, bool]]] | None = None,
+    seed: dict[str, list[FontVariant]] | None = None,
 ) -> tuple[dict[str, list[FontVariant]], AssetReport]:
     """Best-effort download of TTF/OTF files for each family.
 
     Google Fonts is preferred. If Google does not have a TTF for a family,
     the converter falls back to installed local fonts, such as Windows Fonts.
+
+    `wanted` optionally narrows which `(weight, italic)` variants are
+    fetched per family. When provided, only those variants are pulled and
+    cache / local-font fallbacks are filtered to the same set. Families
+    listed with an empty wanted set are skipped entirely.
+
+    `seed` lets callers supply variants that already live in `assets_dir`
+    (typically extracted from `@font-face` blocks via
+    :func:`extract_embedded_font_faces`). Seeded variants count toward the
+    `wanted` coverage check, so families that the source page embeds in
+    full skip the Google round-trip.
+
     Returns (mapping family -> variants, report).
     """
     report = AssetReport()
@@ -341,13 +780,50 @@ def download_google_fonts(
     fonts_dir.mkdir(parents=True, exist_ok=True)
     for family in families:
         report.fonts_seen.append(family)
-        variants = _copy_cached_font_variants(
+        # wanted dict semantics:
+        #   None         -> no narrowing (broad download)
+        #   missing key  -> no narrowing for this family (broad download)
+        #   empty set    -> skip family entirely (caller said no usage)
+        #   non-empty    -> only fetch listed (weight, italic) variants
+        if wanted is None:
+            wanted_set: set[tuple[int, bool]] | None = None
+        elif family not in wanted:
+            wanted_set = None
+        else:
+            wanted_set = wanted[family]
+            if not wanted_set:
+                continue
+
+        seeded = list(seed.get(family, [])) if seed else []
+        seeded_keys = {(v.weight, v.italic) for v in seeded}
+        if seeded:
+            # Embedded `@font-face` payloads are authoritative — they were
+            # bundled into the page deliberately. Skip cache/Google probes
+            # entirely. Missing weight/italic variants are rendered with
+            # `_select_font_variant`'s synthetic bold/italic fallback.
+            out[family] = seeded
+            continue
+
+        remaining = (
+            (wanted_set - seeded_keys) if wanted_set is not None else None
+        )
+        # remaining == set() means wanted is fully covered by seed already
+        # (handled above) so we never hand cache/google a vacant filter.
+
+        variants = list(seeded)
+        variants.extend(_copy_cached_font_variants(
             family,
             fonts_dir=fonts_dir,
             project_subdir=project_subdir,
             report=report,
-        )
-        if _has_common_font_axis_coverage(variants):
+            wanted=remaining,
+        ))
+        if wanted_set is not None:
+            covered = {(v.weight, v.italic) for v in variants}
+            if wanted_set.issubset(covered):
+                out[family] = variants
+                continue
+        elif _has_common_font_axis_coverage(variants):
             out[family] = variants
             continue
 
@@ -371,6 +847,11 @@ def download_google_fonts(
                 css_errors.append(str(e))
 
         faces = _preferred_google_faces(_google_ttf_faces(css) if css else [])
+        if remaining is not None:
+            faces = [
+                f for f in faces
+                if (int(f["weight"]), bool(f["italic"])) in remaining
+            ]
         existing_keys = {(v.weight, v.italic) for v in variants}
         seen_urls: set[str] = set()
         used_names: set[str] = {Path(v.path).name.lower() for v in variants}
@@ -406,6 +887,7 @@ def download_google_fonts(
                 fonts_dir=fonts_dir,
                 project_subdir=project_subdir,
                 report=report,
+                wanted=remaining,
             )
 
         if variants:
@@ -448,6 +930,7 @@ def _copy_cached_font_variants(
     fonts_dir: Path,
     project_subdir: str,
     report: AssetReport,
+    wanted: set[tuple[int, bool]] | None = None,
 ) -> list[FontVariant]:
     cache_dir = _font_cache_dir()
     if not cache_dir.is_dir():
@@ -470,7 +953,10 @@ def _copy_cached_font_variants(
 
     selected: dict[tuple[int, bool], Path] = {}
     for candidate in sorted(candidates, key=lambda p: p.name.lower()):
-        selected.setdefault(_local_font_variant(candidate), candidate)
+        key = _local_font_variant(candidate)
+        if wanted is not None and key not in wanted:
+            continue
+        selected.setdefault(key, candidate)
 
     variants: list[FontVariant] = []
     used_names: set[str] = set()
@@ -504,12 +990,15 @@ def _copy_local_font_variants(
     fonts_dir: Path,
     project_subdir: str,
     report: AssetReport,
+    wanted: set[tuple[int, bool]] | None = None,
 ) -> list[FontVariant]:
     local_fonts = _find_local_font_files(family)
     variants: list[FontVariant] = []
     used_names: set[str] = set()
     for local_font in local_fonts:
         weight, italic = _local_font_variant(local_font)
+        if wanted is not None and (weight, italic) not in wanted:
+            continue
         target_name = _unique_name(
             _safe_font_name(family, local_font.suffix, weight=weight, italic=italic),
             used_names,

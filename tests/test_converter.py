@@ -16,6 +16,7 @@ from html2uxml.assets import (
     FontVariant,
     collect_and_rewrite,
     download_google_fonts,
+    extract_embedded_font_faces,
     inject_image_aspect_ratios,
     _copy_cached_font_variants,
     _font_search_prefixes,
@@ -43,14 +44,14 @@ class ConvertBasicsTest(unittest.TestCase):
             '<div style="display: flex; flex-direction: column; '
             'background: rgb(255,0,0); padding: 8px;">hi</div>'
         )
-        self.assertIn("ui:Label", r.uxml)
+        self.assertIn("odd:Html2UxmlLabel", r.uxml)
         self.assertIn("display: flex", r.uss)
         self.assertIn("background-color: rgb(255,0,0)", r.uss)
         self.assertIn("padding: 8px", r.uss)
 
     def test_button_text_attribute(self):
         r = convert("<button>Click</button>")
-        self.assertIn('<ui:Button text="Click"', r.uxml)
+        self.assertIn('<odd:Html2UxmlButton name="click" text="Click"', r.uxml)
 
     def test_button_with_styled_inline_children_preserves_child_labels(self):
         r = convert(
@@ -60,9 +61,9 @@ class ConvertBasicsTest(unittest.TestCase):
             ".cam-label { font-style: italic; font-weight: 800; font-size: 9px; letter-spacing: 1.2px; }",
         )
         self.assertNotIn('text="◉CHASE"', r.uxml)
-        self.assertIn('<ui:Button class="cam">', r.uxml)
-        self.assertRegex(r.uxml, r'<ui:Label class="cam-icon(?: h2u-\d+)*" text="◉"')
-        self.assertRegex(r.uxml, r'<ui:Label class="cam-label(?: h2u-\d+)*" text="CHASE"')
+        self.assertIn('<odd:Html2UxmlButton class="cam" name="cam">', r.uxml)
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="cam-icon(?: h2u-\d+)*" name="cam-icon" text="◉"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="cam-label(?: h2u-\d+)*" name="cam-label" text="CHASE"')
         self.assertIn('--odd-font-family: "Barlow Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
 
@@ -71,8 +72,8 @@ class ConvertBasicsTest(unittest.TestCase):
             '<button id="chat"><svg width="16" height="16" viewBox="0 0 24 24">'
             '<path stroke-width="2" d="M0 0h1"/></svg></button>'
         )
-        self.assertIn('<ui:Button name="chat">', r.uxml)
-        self.assertIn("<ui:VisualElement", r.uxml)
+        self.assertIn('<odd:Html2UxmlButton name="chat">', r.uxml)
+        self.assertIn("<odd:Html2UxmlElement", r.uxml)
         self.assertEqual(1, len(r.svg_files))
         self.assertEqual("chat.svg", r.svg_files[0][0])
         self.assertIn('background-image: url("Images/chat.svg")', r.uss)
@@ -112,10 +113,65 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn("border-top-width: 0.5px", r.uss)
         self.assertIn("padding: 4px", r.uss)
 
+    def test_all_core_elements_emit_odd_runtime_types(self):
+        r = convert(
+            "<div><span>Label</span><button>Go</button><input value='A'>"
+            "<input type='number' value='2'><input type='range'>"
+            "<input type='checkbox'><input type='radio'>"
+            "<select><option>One</option></select><progress value='3' max='10'></progress>"
+            "<details><summary>More</summary><p>Body</p></details><fieldset></fieldset>"
+            "<div style='overflow:auto'><div>Scroll</div></div></div>"
+        )
+        for tag in (
+            "odd:Html2UxmlElement",
+            "odd:Html2UxmlLabel",
+            "odd:Html2UxmlButton",
+            "odd:Html2UxmlTextField",
+            "odd:Html2UxmlFloatField",
+            "odd:Html2UxmlSlider",
+            "odd:Html2UxmlToggle",
+            "odd:Html2UxmlRadioButton",
+            "odd:Html2UxmlDropdownField",
+            "odd:Html2UxmlProgressBar",
+            "odd:Html2UxmlFoldout",
+            "odd:Html2UxmlGroupBox",
+            "odd:Html2UxmlScrollView",
+        ):
+            self.assertIn(tag, r.uxml)
+
+    def test_keyframe_animation_emits_runtime_custom_properties(self):
+        r = convert(
+            "<style>"
+            "@keyframes pulse {"
+            "  from { opacity: .25; transform: scale(1); }"
+            "  to { opacity: 1; transform: scale(1.2); }"
+            "}"
+            ".dot { animation: pulse 900ms ease-in-out infinite alternate; }"
+            "</style>"
+            '<div class="dot"></div>'
+        )
+        self.assertIn('<odd:Html2UxmlElement class="dot"', r.uxml)
+        self.assertIn('--odd-animation-name: "pulse"', r.uss)
+        self.assertIn("--odd-animation-duration-ms: 900.0", r.uss)
+        self.assertIn('--odd-animation-timing: "ease-in-out"', r.uss)
+        self.assertIn('--odd-animation-iteration-count: "infinite"', r.uss)
+        self.assertIn('--odd-animation-direction: "alternate"', r.uss)
+        self.assertIn("0|opacity=.25&scale=1;1|opacity=1&scale=1.2", r.uss)
+
+    def test_inline_keyframe_animation_emits_generated_class(self):
+        r = convert(
+            "<style>@keyframes fade { 0% { opacity: 0; } 100% { opacity: 1; } }</style>"
+            '<div style="animation: fade 2s linear forwards"></div>'
+        )
+        self.assertIn('<odd:Html2UxmlElement class="h2u-', r.uxml)
+        self.assertIn('--odd-animation-name: "fade"', r.uss)
+        self.assertIn("--odd-animation-duration-ms: 2000.0", r.uss)
+        self.assertIn('--odd-animation-fill-mode: "forwards"', r.uss)
+
     def test_text_only_div_keeps_class_on_label(self):
         r = convert('<div class="title">Detroit Lobby</div>')
-        self.assertIn('<ui:Label class="title" text="Detroit Lobby"', r.uxml)
-        self.assertNotIn('<ui:VisualElement class="title"', r.uxml)
+        self.assertIn('<odd:Html2UxmlLabel class="title" name="title" text="Detroit Lobby"', r.uxml)
+        self.assertNotIn('<odd:Html2UxmlElement class="title"', r.uxml)
 
     def test_mixed_inline_text_run_gets_horizontal_generated_class(self):
         r = convert(
@@ -124,8 +180,8 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         self.assertIn('class="title h2u-1"', r.uxml)
         self.assertIn("flex-direction: row", r.uss)
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="Detroit"')
-        self.assertRegex(r.uxml, r'class="accent(?: h2u-\d+)+\" text="Lobby"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="Detroit"')
+        self.assertRegex(r.uxml, r'class="accent(?: h2u-\d+)+\" name="accent" text="Lobby"')
         self.assertIn("height: 24px", r.uss)
         self.assertIn("-unity-text-align: middle-left", r.uss)
 
@@ -136,7 +192,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "color: #ffbf13; text-shadow: 1px 1px 0 #000; }</style>"
             '<div class="title">TA<span>P</span></div>'
         )
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="TA"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="TA"')
         self.assertIn('--odd-font-family: "Saira Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
         self.assertIn("font-size: 11px", r.uss)
@@ -150,8 +206,8 @@ class ConvertBasicsTest(unittest.TestCase):
             ".num { padding:2px 4px; }</style>"
             '<div class="time"><span class="num">02</span><span>:</span></div>'
         )
-        self.assertRegex(r.uxml, r'class="num(?: h2u-\d+)+\" text="02"')
-        self.assertRegex(r.uxml, r'<ui:Label class="(?:h2u-\d+ ?)+\" text=":"')
+        self.assertRegex(r.uxml, r'class="num(?: h2u-\d+)+\" name="num" text="02"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="(?:h2u-\d+ ?)+\" name="h2u-\d+" text=":"')
         self.assertIn("min-height: 16px", r.uss)
         self.assertIn("-unity-text-align: middle-center", r.uss)
         self.assertIn("padding: 2px 4px", r.uss)
@@ -175,7 +231,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "color: #ffbf13; text-shadow: 1px 1px 0 #000; }"
             ".dot { width: 5px; height: 5px; background: #ffbf13; }",
         )
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="TAP TO READY UP"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="TAP TO READY UP"')
         self.assertIn('--odd-font-family: "Saira Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
         self.assertIn("font-size: 11px", r.uss)
@@ -193,14 +249,14 @@ class ConvertBasicsTest(unittest.TestCase):
             ".dot { width: 5px; height: 5px; background: #ffbf13; }",
         )
         self.assertNotIn('text="TAP TO READY UP"', r.uxml)
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="T"')
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="A"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="T"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="A"')
         self.assertIn("margin-right: 1.35px", r.uss)
         self.assertIn("width: 3.77px", r.uss)
         self.assertIn('--odd-font-family: "Saira Condensed"', r.uss)
         self.assertIn("text-shadow: 1px 1px 0 #000", r.uss)
 
-    def test_button_with_flex_gap_uses_gap_bridge_button(self):
+    def test_button_with_flex_gap_bakes_child_margin(self):
         r = convert(
             '<button class="ready"><span class="dot"></span><span>TAP TO READY UP</span></button>',
             ".ready { display: flex; flex-direction: row; align-items: center; "
@@ -210,9 +266,11 @@ class ConvertBasicsTest(unittest.TestCase):
             ".dot { width: 5px; height: 5px; border-radius: 999px; background: #ffbf13; }",
         )
         self.assertIn('xmlns:odd="ODDGames.Html2Uxml"', r.uxml)
-        self.assertIn('<odd:Html2UxmlButton class="ready">', r.uxml)
-        self.assertIn("--odd-column-gap: 8", r.uss)
-        self.assertIn('<ui:VisualElement class="dot"', r.uxml)
+        self.assertIn('<odd:Html2UxmlButton class="ready" name="ready">', r.uxml)
+        # Gap baked statically into per-child margin; no runtime --odd-column-gap.
+        self.assertNotIn("--odd-column-gap", r.uss)
+        self.assertIn("margin-left: 8px", r.uss)
+        self.assertIn('<odd:Html2UxmlElement class="dot"', r.uxml)
         self.assertNotIn('text="TAP TO READY UP"', r.uxml)
 
     def test_static_flex_gap_bakes_child_margin_without_panel_promotion(self):
@@ -230,7 +288,7 @@ class ConvertBasicsTest(unittest.TestCase):
             ".ready { font-family: 'Saira Condensed', sans-serif; font-style: italic; "
             "font-weight: 800; font-size: 11px; letter-spacing: 1.5px; color: #ffbf13; }",
         )
-        self.assertRegex(r.uxml, r'<ui:Label class="(?:h2u-\d+ ?)+" text="TAP"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="(?:h2u-\d+ ?)+" name="(?:tap|h2u-\d+)" text="TAP"')
         self.assertIn('--odd-font-family: "Saira Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
         self.assertIn("letter-spacing: 1.5px", r.uss)
@@ -243,8 +301,8 @@ class ConvertBasicsTest(unittest.TestCase):
             "font-weight: 800; font-size: 11px; letter-spacing: 3px; color: #ffbf13; }",
         )
         self.assertNotIn('text="TAP"', r.uxml)
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="T"')
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="A"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="T"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="A"')
         self.assertIn("margin-right: 1.35px", r.uss)
         self.assertIn("color: #ffbf13", r.uss)
 
@@ -256,7 +314,7 @@ class ConvertBasicsTest(unittest.TestCase):
             ".badge::before { content: 'go'; }</style>"
             '<div class="badge"></div>'
         )
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="GO"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="GO"')
         self.assertIn('--odd-font-family: "Saira Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
         self.assertIn("font-size: 11px", r.uss)
@@ -268,7 +326,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "<style>.list { font-size: 14px; letter-spacing: 2px; color: #ffbf13; }</style>"
             '<ul class="list"><li>Ready</li></ul>'
         )
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="•"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="•"')
         self.assertIn("font-size: 14px", r.uss)
         self.assertIn("letter-spacing: 2px", r.uss)
         self.assertIn("color: #ffbf13", r.uss)
@@ -347,11 +405,11 @@ class ConvertBasicsTest(unittest.TestCase):
         # picks; the real <span> child is not a synthetic and stays default.
         self.assertRegex(
             r.uxml,
-            r'<ui:Label picking-mode="Ignore"[^/]*text="Tap to ready"',
+            r'<odd:Html2UxmlLabel picking-mode="Ignore"[^/]*text="Tap to ready"',
         )
         self.assertNotRegex(
             r.uxml,
-            r'<ui:Label picking-mode="Ignore"[^/]*text="icon"',
+            r'<odd:Html2UxmlLabel picking-mode="Ignore"[^/]*text="icon"',
         )
 
     def test_pointer_events_none_propagates_to_pseudo_label(self):
@@ -370,8 +428,8 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         self.assertRegex(
             r.uxml,
-            r'<ui:Label picking-mode="Ignore"[^/]*text="\xb7"|'
-            r'<ui:Label picking-mode="Ignore"[^/]*text="•"',
+            r'<odd:Html2UxmlLabel picking-mode="Ignore"[^/]*text="\xb7"|'
+            r'<odd:Html2UxmlLabel picking-mode="Ignore"[^/]*text="•"',
         )
 
     def test_text_gradient_vertical_emits_sidecar_and_wraps_label(self):
@@ -472,6 +530,31 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn("scale: -1 1", r.uss)
         self.assertIn("translate3d() flattened to 2D", "\n".join(r.warnings))
 
+    def test_transform_matrix_translate_is_preserved(self):
+        r = convert(
+            '<div style="position:absolute; left:380px; top:180px; '
+            'transform: matrix(1, 0, 0, 1, -380, -180);"></div>'
+        )
+        self.assertIn("left: 380px", r.uss)
+        self.assertIn("top: 180px", r.uss)
+        self.assertIn("translate: -380px -180px", r.uss)
+        self.assertNotIn("matrix() not supported", "\n".join(r.warnings))
+
+    def test_content_box_width_includes_padding_and_border_for_uss(self):
+        r = convert(
+            '<div style="box-sizing: content-box; width: 100px; height: 20px; '
+            'padding: 10px 5px; border-width: 2px 4px;"></div>'
+        )
+        self.assertIn("width: 114px", r.uss)
+        self.assertIn("height: 42px", r.uss)
+
+    def test_border_box_width_is_not_inflated_for_uss(self):
+        r = convert(
+            '<div style="box-sizing: border-box; width: 100px; '
+            'padding-left: 5px; padding-right: 5px;"></div>'
+        )
+        self.assertIn("width: 100px", r.uss)
+
     def test_box_shadow_emits_bridge_props(self):
         r = convert(
             '<div style="box-shadow: rgba(0,0,0,0.5) 0px 4px 10px;"></div>'
@@ -550,6 +633,77 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn('--odd-gradient: "linear-gradient(180deg, #111 0%, #000 100%)"', r.uss)
         self.assertIn("odd:Html2UxmlPanel", r.uxml)
 
+    def test_img_with_data_uri_extracts_bytes_and_uses_alt_for_name(self):
+        # 1x1 transparent PNG.
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgAAIAAAUAAeImBZsAAAAASUVORK5CYII="
+        )
+        r = convert(
+            f'<img alt="Monster Truck Destruction" src="data:image/png;base64,{png_b64}">'
+        )
+        self.assertEqual(1, len(r.data_uri_files))
+        filename, data = r.data_uri_files[0]
+        self.assertEqual("monster-truck-destruction.png", filename)
+        self.assertGreater(len(data), 0)
+        self.assertIn(f'background-image: url("Images/{filename}")', r.uss)
+        self.assertNotIn("data:image", r.uss)
+
+    def test_div_inline_data_uri_uses_class_for_name_when_no_alt(self):
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgAAIAAAUAAeImBZsAAAAASUVORK5CYII="
+        )
+        r = convert(
+            f'<div class="logo" style="background-image: url(data:image/png;base64,{png_b64})"></div>'
+        )
+        self.assertEqual(1, len(r.data_uri_files))
+        filename, _ = r.data_uri_files[0]
+        self.assertEqual("logo.png", filename)
+        self.assertNotIn("data:image", r.uss)
+
+    def test_duplicate_data_uri_dedupes_to_single_file(self):
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgAAIAAAUAAeImBZsAAAAASUVORK5CYII="
+        )
+        r = convert(
+            f'<img alt="A" src="data:image/png;base64,{png_b64}">'
+            f'<img alt="A" src="data:image/png;base64,{png_b64}">'
+        )
+        self.assertEqual(1, len(r.data_uri_files))
+
+    def test_background_image_two_radial_layers_are_bridged(self):
+        # Computed-style background-image often emits multiple comma-separated
+        # gradient layers. All should survive, not just the first.
+        r = convert(
+            '<div style="background-image: '
+            'radial-gradient(at 0% 50%, rgb(8,32,82) 0%, rgba(0,0,0,0) 55%), '
+            'radial-gradient(at 100% 50%, rgb(90,10,10) 0%, rgba(0,0,0,0) 55%), '
+            'none;"></div>'
+        )
+        self.assertIn('--odd-radial-gradient: "radial-gradient(at 0% 50%, rgb(8,32,82)', r.uss)
+        self.assertIn('--odd-radial-gradient-2: "radial-gradient(at 100% 50%, rgb(90,10,10)', r.uss)
+
+    def test_computed_border_image_slice_does_not_corrupt_background_images(self):
+        r = convert(
+            '<div style="background-image:url(logo.png);'
+            'border-image-source:none;border-image-slice:100%;"></div>'
+        )
+        self.assertIn("background-image: url(logo.png)", r.uss)
+        self.assertNotIn("-unity-slice-top", r.uss)
+        self.assertNotIn("-unity-slice-right", r.uss)
+        self.assertNotIn("-unity-slice-bottom", r.uss)
+        self.assertNotIn("-unity-slice-left", r.uss)
+
+    def test_real_border_image_still_emits_unity_slices(self):
+        r = convert(
+            '<div style="border-image-source:url(frame.png);'
+            'border-image-slice:8 12 16 20;"></div>'
+        )
+        self.assertIn("background-image: url(frame.png)", r.uss)
+        self.assertIn("-unity-slice-top: 8", r.uss)
+        self.assertIn("-unity-slice-right: 12", r.uss)
+        self.assertIn("-unity-slice-bottom: 16", r.uss)
+        self.assertIn("-unity-slice-left: 20", r.uss)
+
     def test_repeating_linear_gradient_uses_pattern_bridge(self):
         r = convert(
             '<div style="background-image: repeating-linear-gradient(0deg, '
@@ -592,8 +746,8 @@ class ConvertBasicsTest(unittest.TestCase):
             ".chip { background: linear-gradient(180deg, #fff, #000); "
             "display: flex; align-items: center; justify-content: center; }",
         )
-        self.assertIn('<odd:Html2UxmlPanel class="chip">', r.uxml)
-        self.assertIn('<ui:Label text="★"', r.uxml)
+        self.assertIn('<odd:Html2UxmlPanel class="chip" name="chip">', r.uxml)
+        self.assertIn('<odd:Html2UxmlLabel text="★"', r.uxml)
         self.assertIn("--odd-gradient", r.uss)
 
     def test_decorative_star_bridge_uses_vector_icon(self):
@@ -605,7 +759,7 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn('<odd:Html2UxmlPanel class="chip h2u-', r.uxml)
         self.assertIn("border-top-left-radius: 999px", r.uss)
         self.assertIn('--odd-vector-icon: "star"', r.uss)
-        self.assertNotIn('<ui:Label text="★"', r.uxml)
+        self.assertNotIn('<odd:Html2UxmlLabel text="★"', r.uxml)
 
     def test_compact_nowrap_hud_labels_get_unity_line_boxes(self):
         r = convert(
@@ -657,7 +811,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "letter-spacing: 0.9px; color: white; }"
             ".item { display: inline; }",
         )
-        self.assertRegex(r.uxml, r'class="item(?: h2u-\d+)+" text="RAYNES vs BLOOD"')
+        self.assertRegex(r.uxml, r'class="item(?: h2u-\d+)+" name="item" text="RAYNES vs BLOOD"')
         self.assertIn("height: 15px", r.uss)
         self.assertIn("max-height: 15px", r.uss)
         self.assertIn("-unity-text-align: middle-left", r.uss)
@@ -704,8 +858,8 @@ class ConvertBasicsTest(unittest.TestCase):
             '<button><span class="dot"></span><span>Ready</span></button>',
             ".dot { width: 5px; height: 5px; border-radius: 999px; background: #ffbf13; }",
         )
-        self.assertIn('<ui:VisualElement class="dot"', r.uxml)
-        self.assertNotIn('<ui:Label class="dot"', r.uxml)
+        self.assertIn('<odd:Html2UxmlElement class="dot"', r.uxml)
+        self.assertNotIn('<odd:Html2UxmlLabel class="dot"', r.uxml)
 
     def test_rem_em_coerced_to_px(self):
         r = convert('<div style="font-size: 1.5rem; padding: 0.5em;"></div>')
@@ -736,7 +890,7 @@ class ConvertBasicsTest(unittest.TestCase):
 
     def test_img_uses_background_visual_element_for_unity_preview(self):
         r = convert('<img class="logo" src="mtd-logo.png" alt="MTD" />')
-        self.assertIn('<ui:VisualElement class="logo h2u-1" tooltip="MTD"', r.uxml)
+        self.assertIn('<odd:Html2UxmlElement class="logo h2u-1" name="logo" tooltip="MTD"', r.uxml)
         self.assertIn('background-image: url("mtd-logo.png")', r.uss)
         self.assertIn("-unity-background-scale-mode: scale-to-fit", r.uss)
 
@@ -780,6 +934,40 @@ class ConvertBasicsTest(unittest.TestCase):
             self.assertEqual(2, len(list(assets_dir.glob("icon*.png"))))
             self.assertIn('url("Images/icon.png")', rewritten)
             self.assertIn('url("Images/icon-2.png")', rewritten)
+
+    def test_data_uri_image_is_decoded_and_written(self):
+        # Smallest valid PNG (1x1 transparent). Encoded inline as base64.
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgAAIAAAUAAeImBZsAAAAASUVORK5CYII="
+        )
+        with TemporaryDirectory() as td:
+            assets_dir = Path(td) / "out" / "UI" / "Images"
+            uss = f'.logo {{ background-image: url("data:image/png;base64,{png_b64}"); }}\n'
+            rewritten, report = collect_and_rewrite(
+                uss,
+                base_dir=None,
+                assets_dir=assets_dir,
+                project_subdir="Images",
+            )
+            written = list(assets_dir.glob("embedded-*.png"))
+            self.assertEqual(1, len(written))
+            self.assertIn(f'url("Images/{written[0].name}")', rewritten)
+            self.assertNotIn("data:image", rewritten)
+            self.assertEqual([], report.failed)
+            self.assertEqual(["data:"], report.copied)
+
+    def test_data_uri_unsupported_mime_left_alone(self):
+        with TemporaryDirectory() as td:
+            assets_dir = Path(td) / "out" / "UI" / "Images"
+            uss = '.x { background-image: url("data:application/octet-stream;base64,AAAA"); }\n'
+            rewritten, report = collect_and_rewrite(
+                uss,
+                base_dir=None,
+                assets_dir=assets_dir,
+                project_subdir="Images",
+            )
+            self.assertEqual(uss, rewritten)
+            self.assertEqual(1, len(report.failed))
 
     def test_project_relative_asset_urls_are_not_rebundled(self):
         with TemporaryDirectory() as td:
@@ -1054,7 +1242,7 @@ class ConvertBasicsTest(unittest.TestCase):
         r = convert(html)
         self.assertEqual(1, r.uss.count("opacity: 0.55"))
         self.assertIn("opacity: 1", r.uss)
-        self.assertRegex(r.uxml, r'<ui:Label class="h2u-\d+" text="2" />')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" name="(?:2|h2u-\d+)" text="2" />')
         self.assertIn("CSS opacity group approximated", "\n".join(r.warnings))
 
     def test_direct_label_opacity_still_maps(self):
@@ -1065,7 +1253,7 @@ class ConvertBasicsTest(unittest.TestCase):
         # Sources from docx text extraction often substitute NBSP for spaces.
         html = "<div class=\"a\" style=\"color:red;\">hi</div>"
         r = convert(html)
-        self.assertIn("ui:Label", r.uxml)
+        self.assertIn("odd:Html2UxmlLabel", r.uxml)
         self.assertIn("color: red", r.uss)
 
     def test_dropped_props_recorded_in_stats(self):
@@ -1212,18 +1400,18 @@ class ConvertBasicsTest(unittest.TestCase):
 
     def test_overflow_auto_promotes_to_scrollview(self):
         r = convert('<div style="overflow: auto;"><span>x</span></div>')
-        self.assertIn("ui:ScrollView", r.uxml)
+        self.assertIn("odd:Html2UxmlScrollView", r.uxml)
 
     def test_details_summary_to_foldout(self):
         r = convert("<details><summary>Title</summary><span>body</span></details>")
-        self.assertIn('<ui:Foldout', r.uxml)
+        self.assertIn('<odd:Html2UxmlFoldout', r.uxml)
         self.assertIn('text="Title"', r.uxml)
         self.assertIn("body", r.uxml)
-        self.assertNotIn("ui:Label text=\"Title\"", r.uxml)  # summary consumed
+        self.assertNotIn("odd:Html2UxmlLabel text=\"Title\"", r.uxml)  # summary consumed
 
     def test_progress_to_progressbar(self):
         r = convert('<progress value="40" max="100"></progress>')
-        self.assertIn("ui:ProgressBar", r.uxml)
+        self.assertIn("odd:Html2UxmlProgressBar", r.uxml)
         self.assertIn('value="40"', r.uxml)
         self.assertIn('high-value="100"', r.uxml)
 
@@ -1281,7 +1469,7 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         self.assertIn('--odd-font-family: "Inter"', r.uss)
         self.assertNotIn("odd:Html2UxmlPanel", r.uxml)
-        self.assertNotIn('xmlns:odd="ODDGames.Html2Uxml"', r.uxml)
+        self.assertIn('xmlns:odd="ODDGames.Html2Uxml"', r.uxml)
 
     def test_self_closing_stylesheet_link_is_loaded(self):
         with TemporaryDirectory() as td:
@@ -1560,7 +1748,11 @@ class ConvertBasicsTest(unittest.TestCase):
                 (base / "out" / "UI" / "fonted.uss").read_text(encoding="utf-8"),
             )
             manifest = json.loads((base / "out" / "UI" / "Fonts" / "html2uxml-fonts.json").read_text(encoding="utf-8"))
+            self.assertIn("x", manifest["defaultCharacters"])
+            self.assertIn("0123456789", manifest["defaultCharacters"])
             self.assertIn("ABCDEFGHIJKLMNOPQRSTUVWXYZ", manifest["defaultCharacters"])
+            # Symbol bucket dropped to shrink the atlas footprint.
+            self.assertNotIn("•", manifest["defaultCharacters"])
             self.assertEqual("static", manifest["fonts"][0]["atlasMode"])
             self.assertEqual("Inter-700.ttf", manifest["fonts"][0]["fontFile"])
             self.assertIn("x", manifest["fonts"][0]["characters"])
@@ -1589,6 +1781,360 @@ class ConvertBasicsTest(unittest.TestCase):
             manifest = json.loads((base / "out" / "UI" / "Fonts" / "html2uxml-fonts.json").read_text(encoding="utf-8"))
             self.assertEqual("dynamic", manifest["fonts"][0]["atlasMode"])
             self.assertIn("runtime", manifest["fonts"][0]["characters"])
+
+    def test_cli_font_alias_merges_families_before_download(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "merged.html"
+            source.write_text(
+                '<style>'
+                '.a { font-family: Inter; font-weight: 700; }'
+                '.b { font-family: "Roboto"; font-weight: 400; }'
+                '</style>'
+                '<div class="a">A</div><span class="b">B</span>',
+                encoding="utf-8",
+            )
+            with mock.patch("html2uxml.cli.download_google_fonts") as mocked_fonts:
+                mocked_fonts.return_value = (
+                    {"Inter": [
+                        FontVariant("Fonts/Inter-400.ttf", 400, False),
+                        FontVariant("Fonts/Inter-700.ttf", 700, False),
+                    ]},
+                    AssetReport(),
+                )
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = cli_main([
+                        str(source),
+                        "-o", str(base / "out"),
+                        "--font-alias", "Roboto=Inter",
+                        "-q",
+                    ])
+            self.assertEqual(0, rc)
+            mocked_fonts.assert_called_once()
+            kwargs = mocked_fonts.call_args.kwargs
+            families_called = mocked_fonts.call_args.args[0]
+            self.assertIn("Inter", families_called)
+            self.assertNotIn("Roboto", families_called)
+            wanted = kwargs["wanted"]
+            self.assertEqual({(400, False), (700, False)}, wanted["Inter"])
+            uss = (base / "out" / "UI" / "merged.uss").read_text(encoding="utf-8")
+            self.assertNotIn("Roboto", uss)
+            self.assertIn(
+                '-unity-font-definition: url("Fonts/Inter-700 SDF.asset")',
+                uss,
+            )
+            self.assertIn(
+                '-unity-font-definition: url("Fonts/Inter-400 SDF.asset")',
+                uss,
+            )
+
+    def test_cli_list_families_emits_json_and_skips_writes(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "x.html"
+            source.write_text(
+                '<style>'
+                '.a { font-family: Inter; font-weight: 700; }'
+                '.b { font-family: "Roboto"; font-weight: 400; font-style: italic; }'
+                '</style>'
+                '<div class="a">Hello</div><span class="b">World</span>',
+                encoding="utf-8",
+            )
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(io.StringIO()):
+                rc = cli_main([
+                    str(source),
+                    "-o", str(base / "out"),
+                    "--list-families",
+                ])
+            self.assertEqual(0, rc)
+            payload = json.loads(captured.getvalue())
+            families = {f["family"]: f for f in payload["families"]}
+            self.assertEqual({"Inter", "Roboto"}, set(families))
+            self.assertEqual([{"weight": 700, "italic": False}], families["Inter"]["variants"])
+            self.assertEqual([{"weight": 400, "italic": True}], families["Roboto"]["variants"])
+            # No UXML/USS should have been written when --list-families is set.
+            self.assertFalse((base / "out" / "UI" / "x.uxml").exists())
+
+    def test_cli_list_families_includes_fallback_entries(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "x.html"
+            # font-family stack: primary "Saira" + two fallbacks. Use HTML
+            # entities the way real exported HTML embeds inline styles.
+            source.write_text(
+                '<div style="font-family:&quot;Saira&quot;,&quot;Barlow&quot;,sans-serif;'
+                'font-weight:700;">Hi</div>',
+                encoding="utf-8",
+            )
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(io.StringIO()):
+                rc = cli_main([
+                    str(source),
+                    "-o", str(base / "out"),
+                    "--list-families",
+                ])
+            self.assertEqual(0, rc)
+            payload = json.loads(captured.getvalue())
+            families = {f["family"]: f for f in payload["families"]}
+            self.assertIn("Saira", families)
+            self.assertIn("Barlow", families)
+            self.assertEqual("primary", families["Saira"]["role"])
+            self.assertEqual("fallback", families["Barlow"]["role"])
+            self.assertEqual([], families["Barlow"]["variants"])
+            self.assertEqual([{"weight": 700, "italic": False}], families["Saira"]["variants"])
+
+    def test_cli_only_downloads_used_variants(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "x.html"
+            source.write_text(
+                '<style>.a { font-family: Inter; font-weight: 600; }</style>'
+                '<div class="a">x</div>',
+                encoding="utf-8",
+            )
+            with mock.patch("html2uxml.cli.download_google_fonts") as mocked_fonts:
+                mocked_fonts.return_value = (
+                    {"Inter": [FontVariant("Fonts/Inter-600.ttf", 600, False)]},
+                    AssetReport(),
+                )
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = cli_main([str(source), "-o", str(base / "out"), "-q"])
+            self.assertEqual(0, rc)
+            wanted = mocked_fonts.call_args.kwargs["wanted"]
+            self.assertEqual({"Inter": {(600, False)}}, wanted)
+
+    def test_extract_embedded_font_face_data_uri_writes_file(self):
+        import base64 as _b64
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            fonts_dir = base / "Fonts"
+            payload = b"\x00\x01\x02fake-ttf-bytes\xffhello"
+            css = (
+                "@font-face {"
+                f"  font-family: 'BrandSans';"
+                f"  font-weight: 700;"
+                f"  font-style: italic;"
+                f"  src: url(data:font/ttf;base64,{_b64.b64encode(payload).decode()}) format('truetype');"
+                "}"
+            )
+            mapping, report = extract_embedded_font_faces(
+                css,
+                base_dir=base,
+                fonts_dir=fonts_dir,
+                project_subdir="Fonts",
+                download_remote=False,
+            )
+            self.assertIn("BrandSans", mapping)
+            variant = mapping["BrandSans"][0]
+            self.assertEqual(700, variant.weight)
+            self.assertTrue(variant.italic)
+            self.assertEqual("embedded", variant.source)
+            written = fonts_dir / Path(variant.path).name
+            self.assertEqual(payload, written.read_bytes())
+            self.assertEqual(1, len(report.extracted))
+            self.assertEqual([], report.failed)
+            self.assertEqual([], report.skipped)
+
+    def test_extract_embedded_font_face_relative_url_copies_local_file(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            fonts_dir = base / "Fonts"
+            local = base / "fonts-src" / "BrandSans-Regular.ttf"
+            local.parent.mkdir()
+            payload = b"local-ttf-content"
+            local.write_bytes(payload)
+            css = (
+                "@font-face {"
+                "  font-family: BrandSans;"
+                "  font-weight: 400;"
+                "  src: url('fonts-src/BrandSans-Regular.ttf') format('truetype');"
+                "}"
+            )
+            mapping, report = extract_embedded_font_faces(
+                css,
+                base_dir=base,
+                fonts_dir=fonts_dir,
+                project_subdir="Fonts",
+                download_remote=False,
+            )
+            self.assertIn("BrandSans", mapping)
+            written = fonts_dir / Path(mapping["BrandSans"][0].path).name
+            self.assertEqual(payload, written.read_bytes())
+            self.assertEqual([], report.failed)
+
+    def test_extract_embedded_font_face_decodes_real_woff2(self):
+        # End-to-end woff2: build a real TTF, transcode to woff2, embed via
+        # data URI, and confirm the extractor lands a TTF on disk.
+        import base64 as _b64
+        import io as _io
+        try:
+            from fontTools.fontBuilder import FontBuilder
+            from fontTools.pens.ttGlyphPen import TTGlyphPen
+            from fontTools.ttLib import TTFont
+            import brotli  # noqa: F401  woff2 transcoding requires brotli
+        except ImportError:
+            self.skipTest("fontTools+brotli not available")
+
+        fb = FontBuilder(unitsPerEm=1024, isTTF=True)
+        fb.setupGlyphOrder([".notdef", "A"])
+        fb.setupCharacterMap({65: "A"})
+        pen = TTGlyphPen(None)
+        pen.moveTo((0, 0)); pen.lineTo((100, 0)); pen.lineTo((100, 100)); pen.lineTo((0, 100)); pen.closePath()
+        glyph = pen.glyph()
+        fb.setupGlyf({".notdef": glyph, "A": glyph})
+        fb.setupHorizontalMetrics({".notdef": (100, 0), "A": (100, 0)})
+        fb.setupHorizontalHeader(ascent=800, descent=-200)
+        fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, sTypoLineGap=0,
+                    usWinAscent=800, usWinDescent=200)
+        fb.setupNameTable({"familyName": "BrandSans", "styleName": "Regular"})
+        fb.setupPost()
+        ttf_buf = _io.BytesIO()
+        fb.save(ttf_buf)
+
+        font = TTFont(_io.BytesIO(ttf_buf.getvalue()))
+        font.flavor = "woff2"
+        woff2_buf = _io.BytesIO()
+        font.save(woff2_buf)
+        woff2_bytes = woff2_buf.getvalue()
+        self.assertEqual(b"wOF2", woff2_bytes[:4])
+
+        css = (
+            "@font-face {"
+            "  font-family: 'BrandSans';"
+            "  font-weight: 700;"
+            "  src: url(data:font/woff2;base64,"
+            + _b64.b64encode(woff2_bytes).decode()
+            + ") format('woff2');"
+            "}"
+        )
+        with TemporaryDirectory() as td:
+            fonts_dir = Path(td) / "Fonts"
+            mapping, report = extract_embedded_font_faces(
+                css,
+                base_dir=None,
+                fonts_dir=fonts_dir,
+                project_subdir="Fonts",
+                download_remote=False,
+            )
+            self.assertIn("BrandSans", mapping)
+            written = fonts_dir / Path(mapping["BrandSans"][0].path).name
+            self.assertEqual(b"\x00\x01\x00\x00", written.read_bytes()[:4])  # SFNT magic
+            self.assertEqual([], report.failed)
+            self.assertEqual([], report.skipped)
+
+    def test_extract_embedded_font_face_handles_corrupt_woff2(self):
+        # Magic-prefixed garbage: extractor must attempt decode (rank no
+        # longer rejects woff2) and surface the parse failure cleanly.
+        import base64 as _b64
+        bogus = b"wOF2" + b"\x00" * 256
+        css = (
+            "@font-face {"
+            "  font-family: BrandSans;"
+            "  src: url(data:font/woff2;base64,"
+            + _b64.b64encode(bogus).decode()
+            + ") format('woff2');"
+            "}"
+        )
+        with TemporaryDirectory() as td:
+            mapping, report = extract_embedded_font_faces(
+                css,
+                base_dir=None,
+                fonts_dir=Path(td),
+                project_subdir="Fonts",
+                download_remote=False,
+            )
+        self.assertEqual({}, mapping)
+        self.assertTrue(report.skipped)
+        self.assertTrue(any("woff2" in why.lower() for _u, why in report.skipped))
+
+    def test_extract_embedded_font_face_skips_woff_format(self):
+        css = (
+            "@font-face {"
+            "  font-family: BrandSans;"
+            "  src: url('https://example.com/BrandSans.woff2') format('woff2');"
+            "}"
+        )
+        with TemporaryDirectory() as td:
+            mapping, report = extract_embedded_font_faces(
+                css,
+                base_dir=None,
+                fonts_dir=Path(td),
+                project_subdir="Fonts",
+                download_remote=False,
+            )
+        self.assertEqual({}, mapping)
+        # woff2-only entries are skipped before reaching the resolver.
+        self.assertTrue(report.skipped or report.failed)
+
+    def test_cli_seeds_download_with_embedded_font_face(self):
+        import base64 as _b64
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "embedded.html"
+            payload = b"\x00\x01\x02ttf-bytes-here\xffend"
+            data_uri = "data:font/ttf;base64," + _b64.b64encode(payload).decode()
+            source.write_text(
+                "<style>"
+                "@font-face {"
+                "  font-family: 'BrandSans';"
+                "  font-weight: 700;"
+                f"  src: url({data_uri}) format('truetype');"
+                "}"
+                ".a { font-family: BrandSans; font-weight: 700; }"
+                "</style>"
+                "<div class=\"a\">Hi</div>",
+                encoding="utf-8",
+            )
+            with mock.patch("html2uxml.cli.download_google_fonts") as mocked_fonts:
+                # Pass-through: return the seed unchanged. Using a real seeded
+                # path verifies the cli forwards seeded variants without ever
+                # falling back to Google.
+                def fake(_families, **kwargs):
+                    return kwargs.get("seed") or {}, AssetReport()
+                mocked_fonts.side_effect = fake
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = cli_main([
+                        str(source),
+                        "-o", str(base / "out"),
+                        "-q",
+                    ])
+            self.assertEqual(0, rc)
+            seed = mocked_fonts.call_args.kwargs["seed"]
+            self.assertIn("BrandSans", seed)
+            seeded_variant = seed["BrandSans"][0]
+            self.assertEqual(700, seeded_variant.weight)
+            self.assertEqual("embedded", seeded_variant.source)
+            written = base / "out" / "UI" / "Fonts" / Path(seeded_variant.path).name
+            self.assertEqual(payload, written.read_bytes())
+            uss = (base / "out" / "UI" / "embedded.uss").read_text(encoding="utf-8")
+            self.assertIn("-unity-font-definition: url(\"Fonts/", uss)
+            self.assertIn("BrandSans", seeded_variant.path)
+
+    def test_converter_passes_through_data_aria_role_attrs(self):
+        r = convert(
+            '<button id="ready-btn" role="button" '
+            'aria-label="Ready up" '
+            'data-team="dragon" data-score="0" '
+            'data-h2u-internal="hidden" data-om-id="strip-me" '
+            'class="cta">go</button>'
+        )
+        # name from id
+        self.assertIn('name="ready-btn"', r.uxml)
+        # role passed through
+        self.assertIn('role="button"', r.uxml)
+        # aria-label becomes tooltip (already supported as fallback)
+        self.assertIn('tooltip="Ready up"', r.uxml)
+        # data-* preserved verbatim
+        self.assertIn('data-team="dragon"', r.uxml)
+        self.assertIn('data-score="0"', r.uxml)
+        # converter-internal data-* stripped
+        self.assertNotIn("data-h2u-internal", r.uxml)
+        self.assertNotIn("data-om-id", r.uxml)
+
+    def test_converter_uses_html_name_attr_when_no_id(self):
+        r = convert('<input type="text" name="player-name" />')
+        self.assertIn('name="player-name"', r.uxml)
 
     def test_cli_can_opt_out_of_font_downloads(self):
         with TemporaryDirectory() as td:

@@ -16,15 +16,17 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urljoin
 
 from .assets import (
     AssetReport,
+    EmbeddedFontReport,
     FontVariant,
     collect_and_rewrite,
     download_google_fonts,
+    extract_embedded_font_faces,
     inject_image_aspect_ratios,
 )
 from .converter import convert
@@ -85,6 +87,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="Network timeout in seconds for URL fetches (default: 10).")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="Suppress the conversion report.")
+    p.add_argument("--list-selectors", action="store_true",
+                   help="Print available selectors (ids and screen-* candidates) as JSON and exit, "
+                        "without converting.")
+    p.add_argument("--list-families", action="store_true",
+                   help="Print detected font-family usage as JSON and exit, "
+                        "without writing any files. Each entry includes the family name, "
+                        "used (weight, italic) variants, and a sample of characters.")
+    p.add_argument("--font-alias", action="append", default=[], metavar="OLD=NEW",
+                   help="Merge font family OLD into NEW. Pass once per merge. "
+                        "Applied before font download so unused families are skipped.")
     args = p.parse_args(argv)
 
     is_url = bool(re.match(r"^https?://", args.input))
@@ -130,6 +142,10 @@ def main(argv: list[str] | None = None) -> int:
         base = args.name or in_path.stem
         page_url = None
         local_base_dir = in_path.parent
+
+    if args.list_selectors:
+        print(_emit_selector_list(html))
+        return 0
 
     ui_dir = out_dir / "UI"
     ui_dir.mkdir(parents=True, exist_ok=True)
@@ -190,6 +206,16 @@ def main(argv: list[str] | None = None) -> int:
         text_gradients_assets_subdir="TextGradients",
     )
     _prefix_text_gradient_assets(result, base)
+    result.uss = _drop_size_when_anchored_to_parent(result.uss, result.uxml)
+
+    alias_map = _parse_font_aliases(args.font_alias)
+    if alias_map:
+        _apply_font_aliases(result, alias_map)
+
+    if args.list_families:
+        referenced = _all_referenced_families(html, extra_css)
+        print(_emit_family_list(result, referenced=referenced))
+        return 0
 
     images_dir = ui_dir / "Images"
     svg_report: SvgRasterReport | None = None
@@ -211,6 +237,12 @@ def main(argv: list[str] | None = None) -> int:
         for filename, raw in result.text_gradient_files:
             _write_text_asset_smart(text_gradients_dir, filename, raw)
 
+    if result.data_uri_files:
+        images_dir.mkdir(parents=True, exist_ok=True)
+        for filename, data in result.data_uri_files:
+            written = _write_bytes_asset_smart(images_dir, filename, data)
+            _write_unity_png_meta_if_png(images_dir / written)
+
     asset_report: AssetReport | None = None
     if args.bundle_assets or args.download_assets:
         result.uss, asset_report = collect_and_rewrite(
@@ -220,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             project_subdir="Images",
             download_remote=args.download_assets,
         )
+        _write_unity_png_metas(images_dir)
         result.uss = inject_image_aspect_ratios(
             result.uss,
             assets_dir=images_dir,
@@ -227,14 +260,38 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     font_report: AssetReport | None = None
+    embedded_report: EmbeddedFontReport | None = None
     if args.download_fonts:
-        families = _families_from_uss(result.uss)
+        wanted = _wanted_variants_from_usages(result)
+        families = _used_families(result.uss, wanted)
         fonts_dir = ui_dir / "Fonts"
+
+        embedded_seed: dict[str, list[FontVariant]] | None = None
+        raw_css = _collect_raw_css(html, extra_css)
+        if raw_css:
+            referenced = set(_all_referenced_families(html, extra_css))
+            referenced.update(families)
+            embedded_seed, embedded_report = extract_embedded_font_faces(
+                raw_css,
+                base_dir=local_base_dir,
+                fonts_dir=fonts_dir,
+                project_subdir="Fonts",
+                timeout=args.timeout,
+                download_remote=True,
+                families_filter=referenced or None,
+            )
+            for family in embedded_seed:
+                if family not in families:
+                    families.append(family)
+
         family_to_path, font_report = download_google_fonts(
             families,
             assets_dir=fonts_dir,
             project_subdir="Fonts",
+            wanted=wanted,
+            seed=embedded_seed,
         )
+        family_to_path = _dedupe_font_files(family_to_path, fonts_dir)
         result.uss = _inject_font_definitions(
             result.uss,
             family_to_path,
@@ -254,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
             asset_report,
             font_report,
             svg_report,
+            embedded_report=embedded_report,
             rendered_by_browser=rendered_by_browser,
             rendered_html_path=rendered_html_path,
             file=sys.stderr,
@@ -328,6 +386,27 @@ def _write_svg_files_smart(result, images_dir: Path, project_subdir: str) -> lis
     return written
 
 
+def _write_bytes_asset_smart(dest_dir: Path, target_name: str, data: bytes) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", target_name).strip("._") or "asset"
+    stem = Path(safe_name).stem
+    suffix = Path(safe_name).suffix
+    candidate = safe_name
+    i = 2
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        target = dest_dir / candidate
+        if not target.exists():
+            target.write_bytes(data)
+            return candidate
+        try:
+            if target.read_bytes() == data:
+                return candidate
+        except OSError:
+            pass
+        candidate = f"{stem}-{i}{suffix}"
+        i += 1
+
+
 def _write_text_asset_smart(dest_dir: Path, target_name: str, text: str) -> str:
     data = text.encode("utf-8")
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", target_name).strip("._") or "asset"
@@ -376,21 +455,28 @@ def _rasterize_svg_assets(
         png_path = images_dir / png_name
         errors: list[str] = []
         renderer_used: str | None = None
+        # Figma / Onlook exports stuff every SVG element with a massive
+        # inline `style=` attribute (every computed CSS prop). CairoSVG
+        # interprets that as authoritative and silently renders an empty
+        # PNG — the presentation attrs (`fill`, `stroke`, `stroke-width`)
+        # are what we actually want. Strip the inline `style=` blocks
+        # before rasterising so the icons come through.
+        raw_clean = _strip_svg_inline_styles(raw)
         try:
             if has_cairosvg:
-                _rasterize_one_svg_with_cairosvg(raw, png_path, scale=scale, min_px=min_px)
+                _rasterize_one_svg_with_cairosvg(raw_clean, png_path, scale=scale, min_px=min_px)
                 renderer_used = "CairoSVG"
             elif magick:
-                _rasterize_one_svg_with_magick(magick, raw, png_path, scale=scale, min_px=min_px)
+                _rasterize_one_svg_with_magick(magick, raw_clean, png_path, scale=scale, min_px=min_px)
                 renderer_used = "ImageMagick"
             else:
-                _rasterize_one_svg(browser, raw, png_path, scale=scale, min_px=min_px)
+                _rasterize_one_svg(browser, raw_clean, png_path, scale=scale, min_px=min_px)
                 renderer_used = "browser"
         except Exception as e:  # pragma: no cover - exact browser failures are platform-specific
             errors.append(f"CairoSVG: {e}" if has_cairosvg else str(e))
             if magick:
                 try:
-                    _rasterize_one_svg_with_magick(magick, raw, png_path, scale=scale, min_px=min_px)
+                    _rasterize_one_svg_with_magick(magick, raw_clean, png_path, scale=scale, min_px=min_px)
                 except Exception as magick_e:  # pragma: no cover - exact ImageMagick failures are platform-specific
                     errors.append(f"ImageMagick: {magick_e}")
                 else:
@@ -400,7 +486,7 @@ def _rasterize_svg_assets(
                 browser = _find_browser_executable()
             if errors and browser:
                 try:
-                    _rasterize_one_svg(browser, raw, png_path, scale=scale, min_px=min_px)
+                    _rasterize_one_svg(browser, raw_clean, png_path, scale=scale, min_px=min_px)
                 except Exception as browser_e:  # pragma: no cover - exact browser failures are platform-specific
                     errors.append(f"browser: {browser_e}")
                 else:
@@ -547,6 +633,18 @@ TextureImporter:
     png_path.with_suffix(png_path.suffix + ".meta").write_text(meta, encoding="utf-8")
 
 
+def _write_unity_png_meta_if_png(path: Path) -> None:
+    if path.suffix.lower() == ".png" and path.is_file():
+        _write_unity_png_meta(path)
+
+
+def _write_unity_png_metas(images_dir: Path) -> None:
+    if not images_dir.is_dir():
+        return
+    for png_path in images_dir.glob("*.png"):
+        _write_unity_png_meta(png_path)
+
+
 def _has_cairosvg() -> bool:
     return importlib.util.find_spec("cairosvg") is not None
 
@@ -566,6 +664,22 @@ def _find_magick_executable() -> str | None:
         if Path(path).is_file():
             return path
     return None
+
+
+_SVG_INLINE_STYLE_RE = re.compile(r'\sstyle\s*=\s*"[^"]*"', re.IGNORECASE)
+
+
+def _strip_svg_inline_styles(raw: str) -> str:
+    """Remove `style="..."` attributes from every tag in an SVG payload.
+
+    Figma/Onlook exports drop a multi-kilobyte computed-CSS dump on every
+    `<svg>` and `<path>` element. CairoSVG (and several other rasterisers)
+    treat that inline style as authoritative and end up rendering empty
+    pixels — the icons' actual fill / stroke information lives in the
+    presentation attributes (`fill`, `stroke`, `stroke-width`, etc.) which
+    survive the strip.
+    """
+    return _SVG_INLINE_STYLE_RE.sub("", raw)
 
 
 def _rasterize_one_svg_with_cairosvg(
@@ -882,6 +996,85 @@ def _simple_selector_token(selector_raw: str) -> str | None:
     return None
 
 
+def _emit_selector_list(html: str) -> str:
+    """Walk the rendered DOM and produce a JSON list of pickable selectors.
+
+    Each entry: {selector, kind, tag, text}. ``kind`` is "id" or "class".
+    Ids come first; screen-prefixed ids float to the top so the importer's UI
+    can highlight them as the obvious picks.
+    """
+    parsed = parse_html(html)
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    def add(selector: str, kind: str, tag: str, text: str) -> None:
+        if selector in seen:
+            return
+        seen.add(selector)
+        entries.append({
+            "selector": selector,
+            "kind": kind,
+            "tag": tag,
+            "text": text[:80].strip(),
+        })
+
+    def gather_text(node, limit: int = 80) -> str:
+        out: list[str] = []
+        def walk(n):
+            if n.is_text:
+                t = (n.text or "").strip()
+                if t:
+                    out.append(t)
+                return
+            for c in n.children:
+                walk(c)
+                if sum(len(s) for s in out) >= limit:
+                    return
+        walk(node)
+        return " ".join(out)
+
+    def visit(node) -> None:
+        if node.is_text:
+            return
+        attr_id = node.attrs.get("id")
+        if attr_id:
+            add(f"#{attr_id}", "id", node.tag, gather_text(node))
+        for child in node.children:
+            visit(child)
+
+    visit(parsed.root)
+
+    classes_seen: set[str] = set()
+    def visit_classes(node) -> None:
+        if node.is_text:
+            return
+        cls = node.attrs.get("class") or ""
+        for token in cls.split():
+            if token in classes_seen:
+                continue
+            classes_seen.add(token)
+            add(f".{token}", "class", node.tag, gather_text(node))
+        for child in node.children:
+            visit_classes(child)
+    visit_classes(parsed.root)
+
+    # Sort: screen-* ids first, then other ids, then classes.
+    def sort_key(item: dict) -> tuple[int, str]:
+        sel = item["selector"]
+        if sel.startswith("#screen-") or "screen" in sel.lower() and item["kind"] == "id":
+            rank = 0
+        elif item["kind"] == "id":
+            rank = 1
+        else:
+            rank = 2
+        return (rank, sel.lower())
+    entries.sort(key=sort_key)
+
+    # ensure_ascii=True so Windows consoles (cp1252) can print this without
+    # tripping on emoji or wide unicode in the gathered text snippets.
+    return json.dumps({"selectors": entries}, ensure_ascii=True, indent=2)
+
+
 def _collect_attr_values(html: str, attr_name: str) -> list[str]:
     parsed = parse_html(html)
     seen: set[str] = set()
@@ -1054,6 +1247,277 @@ _UNITY_FONT_STYLE_RE = re.compile(r"-unity-font-style\s*:\s*([^;]+);?")
 _USS_RULE_RE = re.compile(r"(?P<head>[^{]+)\{(?P<body>[^{}]*)\}", re.MULTILINE)
 
 
+_USS_BLOCK_RE = re.compile(r"(?P<head>[^{]+)\{(?P<body>[^{}]*)\}", re.MULTILINE)
+_USS_DECL_RE = re.compile(r"\s*([A-Za-z-][A-Za-z0-9-]*)\s*:\s*([^;}]+);?")
+
+
+def _drop_size_when_anchored_to_parent(uss: str, uxml: str) -> str:
+    """Strip redundant `width:Wpx; height:Hpx` from rules whose four-edge
+    anchoring already pins them to their parent's bounds.
+
+    Figma exports give us BOTH `top/right/bottom/left` insets AND an
+    explicit `width: Npx; height: Npx;` that matches the design canvas.
+    CSS lets the explicit size win, so when the parent grows beyond the
+    design size the anchored child stays its design size with empty
+    space on the right/bottom. Dropping the size lets the inset
+    arithmetic compute it from the parent.
+
+    Only strip when the explicit dims actually match the inset-derived
+    box. A decorative element (e.g. a 4×4 screw at `top:290 left:724
+    right:6 bottom:6`) has insets that imply a larger box than the
+    explicit size — keeping the explicit dims is correct there.
+
+    Parent dimensions come from a child→parent map built from the UXML
+    plus a {class → (width,height)} map built from the USS itself.
+    """
+    if not uss:
+        return uss
+
+    rule_dims = _parse_rule_dimensions(uss)
+    parent_class = _build_parent_class_map(uxml)
+
+    def parent_dims(cls: str) -> tuple[float | None, float | None]:
+        seen: set[str] = set()
+        cur = parent_class.get(cls)
+        while cur and cur not in seen:
+            seen.add(cur)
+            w, h = rule_dims.get(cur, (None, None))
+            if w is not None or h is not None:
+                return w, h
+            cur = parent_class.get(cur)
+        return None, None
+
+    def repl(m: re.Match) -> str:
+        head = m.group("head").strip()
+        body = m.group("body")
+        if "position" not in body:
+            return m.group(0)
+        decls = list(_USS_DECL_RE.findall(body))
+        if not decls:
+            return m.group(0)
+        keyed = {prop.strip().lower(): value.strip() for prop, value in decls}
+        if keyed.get("position") not in ("absolute", "fixed"):
+            return m.group(0)
+        edges = ("top", "right", "bottom", "left")
+        if not all(_is_pixel_or_zero(keyed.get(edge)) for edge in edges):
+            return m.group(0)
+
+        cls = head[1:] if head.startswith(".") else head
+        parent_w, parent_h = parent_dims(cls)
+
+        strip_width = _is_pixel_length(keyed.get("width"))
+        strip_height = _is_pixel_length(keyed.get("height"))
+        if strip_width and parent_w is not None:
+            implied_w = parent_w - _px(keyed["left"]) - _px(keyed["right"])
+            if abs(implied_w - _px(keyed["width"])) > 0.5:
+                strip_width = False
+        elif strip_width and parent_w is None:
+            # No parent context — fall back to "all zero insets" safety net.
+            if not all(_is_zero_length(keyed.get(edge)) for edge in edges):
+                strip_width = False
+        if strip_height and parent_h is not None:
+            implied_h = parent_h - _px(keyed["top"]) - _px(keyed["bottom"])
+            if abs(implied_h - _px(keyed["height"])) > 0.5:
+                strip_height = False
+        elif strip_height and parent_h is None:
+            if not all(_is_zero_length(keyed.get(edge)) for edge in edges):
+                strip_height = False
+
+        if not strip_width and not strip_height:
+            return m.group(0)
+
+        def strip(line: str) -> bool:
+            stripped = line.strip()
+            if not stripped:
+                return False
+            mm = re.match(r"([A-Za-z-][A-Za-z0-9-]*)\s*:", stripped)
+            if not mm:
+                return False
+            prop = mm.group(1).lower()
+            if prop == "width" and strip_width:
+                return True
+            if prop == "height" and strip_height:
+                return True
+            return False
+
+        kept = [line for line in body.splitlines() if not strip(line)]
+        new_body = "\n".join(kept)
+        return f"{m.group('head')}{{{new_body}}}"
+
+    return _USS_BLOCK_RE.sub(repl, uss)
+
+
+def _parse_rule_dimensions(uss: str) -> dict[str, tuple[float | None, float | None]]:
+    out: dict[str, tuple[float | None, float | None]] = {}
+    for m in _USS_BLOCK_RE.finditer(uss):
+        head = m.group("head").strip()
+        if not head.startswith("."):
+            continue
+        cls = head.split()[0][1:].split(",", 1)[0]
+        body = m.group("body")
+        keyed: dict[str, str] = {}
+        for prop, val in _USS_DECL_RE.findall(body):
+            keyed[prop.strip().lower()] = val.strip()
+        w = _px_or_none(keyed.get("width"))
+        h = _px_or_none(keyed.get("height"))
+        if w is not None or h is not None:
+            existing = out.get(cls, (None, None))
+            out[cls] = (w if w is not None else existing[0], h if h is not None else existing[1])
+    return out
+
+
+_UXML_OPEN_TAG_RE = re.compile(
+    r"<(?:ui|odd):[A-Za-z0-9_-]+\b[^/>]*?\bclass\s*=\s*\"([^\"]+)\"[^/>]*>",
+    re.DOTALL,
+)
+_UXML_SELF_CLOSE_RE = re.compile(
+    r"<(?:ui|odd):[A-Za-z0-9_-]+\b[^>]*\bclass\s*=\s*\"([^\"]+)\"[^>]*/>",
+    re.DOTALL,
+)
+_UXML_CLOSE_TAG_RE = re.compile(r"</(?:ui|odd):[A-Za-z0-9_-]+>")
+
+
+def _build_parent_class_map(uxml: str) -> dict[str, str]:
+    """Walk the UXML linearly and emit a child→parent mapping keyed by
+    each element's first class name."""
+    out: dict[str, str] = {}
+    if not uxml:
+        return out
+    stack: list[str] = []
+    pos = 0
+    n = len(uxml)
+    while pos < n:
+        opener = _UXML_OPEN_TAG_RE.search(uxml, pos)
+        closer = _UXML_CLOSE_TAG_RE.search(uxml, pos)
+        self_close = _UXML_SELF_CLOSE_RE.search(uxml, pos)
+
+        candidates = [(c.start(), c, kind)
+                      for c, kind in ((opener, "open"), (closer, "close"), (self_close, "self"))
+                      if c is not None]
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: item[0])
+        _, m, kind = candidates[0]
+
+        if kind == "self":
+            cls = m.group(1).split()[0]
+            if stack:
+                out.setdefault(cls, stack[-1])
+        elif kind == "open":
+            cls = m.group(1).split()[0]
+            if stack:
+                out.setdefault(cls, stack[-1])
+            stack.append(cls)
+        else:  # close
+            if stack:
+                stack.pop()
+        pos = m.end()
+    return out
+
+
+def _px(value: str) -> float:
+    v = value.strip().rstrip(";").strip().lower()
+    if v in ("0", "0px"):
+        return 0.0
+    m = re.match(r"^(-?\d+(?:\.\d+)?)px$", v)
+    return float(m.group(1)) if m else 0.0
+
+
+def _px_or_none(value: str | None) -> float | None:
+    if value is None:
+        return None
+    return _px(value) if _is_pixel_or_zero(value) else None
+
+
+def _is_zero_length(value: str | None) -> bool:
+    if value is None:
+        return False
+    v = value.strip().rstrip(";").strip().lower()
+    return v in ("0", "0px", "0%", "0em", "0rem")
+
+
+def _is_pixel_or_zero(value: str | None) -> bool:
+    if value is None:
+        return False
+    v = value.strip().rstrip(";").strip().lower()
+    if v in ("0", "0px"):
+        return True
+    return bool(re.match(r"^-?\d+(?:\.\d+)?px$", v))
+
+
+def _is_pixel_length(value: str | None) -> bool:
+    if value is None:
+        return False
+    v = value.strip().rstrip(";").strip().lower()
+    return bool(re.match(r"^-?\d+(?:\.\d+)?px$", v))
+
+
+_HTML_STYLE_BLOCK_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.IGNORECASE | re.DOTALL)
+_HTML_STYLE_ATTR_RE = re.compile(r'\bstyle\s*=\s*"([^"]*)"', re.IGNORECASE)
+_FONT_FACE_BLOCK_RE = re.compile(r"@font-face\s*\{[^}]*\}", re.IGNORECASE | re.DOTALL)
+_FONT_FAMILY_DECL_RE = re.compile(r"font-family\s*:\s*([^;}]+)", re.IGNORECASE)
+
+# Generic CSS keywords to ignore when collecting referenced families.
+_GENERIC_CSS_FAMILIES = {
+    "serif", "sans-serif", "monospace", "cursive", "fantasy",
+    "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace",
+    "ui-rounded", "math", "emoji", "fangsong",
+    "-apple-system", "blinkmacsystemfont",
+    "inherit", "initial", "unset", "revert", "revert-layer",
+}
+
+
+def _all_referenced_families(html: str, extra_css: str) -> list[str]:
+    """Return every non-generic font-family token referenced by a use site.
+
+    Walks `<style>` blocks, `style="..."` attribute values, and any
+    already-fetched linked CSS. `@font-face` blocks are stripped so
+    declaration-side families are not mistaken for uses. Fallback families
+    in a comma list are kept (the converter's FontUsage only tracks the
+    primary, so without this pass the manual font-merge UI would never
+    see fallbacks)."""
+    import html as _html_mod
+
+    chunks: list[str] = []
+    if extra_css:
+        chunks.append(extra_css)
+    if html:
+        for m in _HTML_STYLE_BLOCK_RE.finditer(html):
+            chunks.append(m.group(1))
+        for m in _HTML_STYLE_ATTR_RE.finditer(html):
+            chunks.append(_html_mod.unescape(m.group(1)))
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for css in chunks:
+        css = _FONT_FACE_BLOCK_RE.sub("", css)
+        for m in _FONT_FAMILY_DECL_RE.finditer(css):
+            for tok in m.group(1).split(","):
+                name = tok.strip().strip('"').strip("'")
+                if not name:
+                    continue
+                if name.lower() in _GENERIC_CSS_FAMILIES:
+                    continue
+                if name not in seen:
+                    seen.add(name)
+                    out.append(name)
+    return out
+
+
+def _collect_raw_css(html: str, extra_css: str) -> str:
+    """Concatenate inline `<style>` blocks plus already-fetched linked CSS.
+
+    Used to scan for `@font-face` rules that the css_parser intentionally
+    drops (every `@`-rule is skipped during selector parsing)."""
+    parts: list[str] = []
+    if extra_css:
+        parts.append(extra_css)
+    if html:
+        for m in _HTML_STYLE_BLOCK_RE.finditer(html):
+            parts.append(m.group(1))
+    return "\n".join(parts)
+
+
 def _families_from_uss(uss: str) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -1065,11 +1529,242 @@ def _families_from_uss(uss: str) -> list[str]:
     return out
 
 
-_DEFAULT_STATIC_FONT_CHARSET = (
-    "".join(chr(i) for i in range(32, 127))
+def _used_families(uss: str, wanted: dict[str, set[tuple[int, bool]]]) -> list[str]:
+    """Return every family declared by a `--odd-font-family` marker in `uss`.
+
+    Families that do appear in `wanted` with a non-empty variant set are
+    narrowed by `download_google_fonts`. Families absent from `wanted`
+    (i.e. families the converter declared a marker for but did not emit a
+    FontUsage for, typically because they are inherited or referenced
+    without an emitted text node) fall back to the broad download path.
+    """
+    return _families_from_uss(uss)
+
+
+def _wanted_variants_from_usages(result) -> dict[str, set[tuple[int, bool]]]:
+    out: dict[str, set[tuple[int, bool]]] = {}
+    for usage in getattr(result, "font_usages", []) or []:
+        family = getattr(usage, "family", None)
+        if not family:
+            continue
+        out.setdefault(family, set()).add((
+            int(getattr(usage, "weight", 400) or 400),
+            bool(getattr(usage, "italic", False)),
+        ))
+    return out
+
+
+_FONT_ALIAS_FAMILY_LITERAL_RE = re.compile(r'(?P<lhs>--odd-font-family\s*:\s*)"(?P<name>[^"]*)"')
+
+
+def _parse_font_aliases(raw_args: list[str]) -> dict[str, str]:
+    """Parse --font-alias OLD=NEW pairs into a dict, ignoring no-op self maps."""
+    out: dict[str, str] = {}
+    for raw in raw_args or []:
+        if "=" not in raw:
+            print(f"warning: ignoring --font-alias {raw!r} (expected OLD=NEW)", file=sys.stderr)
+            continue
+        old, new = raw.split("=", 1)
+        old = old.strip().strip('"').strip("'")
+        new = new.strip().strip('"').strip("'")
+        if not old or not new or old == new:
+            continue
+        out[old] = new
+    # Resolve transitive maps: A->B, B->C  =>  A->C, B->C
+    resolved: dict[str, str] = {}
+    for src in out:
+        cur = src
+        seen: set[str] = {src}
+        while cur in out and out[cur] not in seen:
+            cur = out[cur]
+            seen.add(cur)
+        resolved[src] = out.get(cur, cur)
+    return resolved
+
+
+def _apply_font_aliases(result, aliases: dict[str, str]) -> None:
+    """Rewrite family references in the converter result's USS markers and
+    font_usages list. Both must agree before download_google_fonts runs."""
+    if not aliases:
+        return
+
+    def repl(m: re.Match) -> str:
+        name = m.group("name")
+        new = aliases.get(name)
+        return f'{m.group("lhs")}"{new}"' if new else m.group(0)
+
+    result.uss = _FONT_ALIAS_FAMILY_LITERAL_RE.sub(repl, result.uss)
+
+    new_usages = []
+    for usage in getattr(result, "font_usages", []) or []:
+        family = getattr(usage, "family", None)
+        new = aliases.get(family) if family else None
+        if new and new != family:
+            new_usages.append(replace(usage, family=new))
+        else:
+            new_usages.append(usage)
+    result.font_usages = new_usages
+
+
+def _emit_family_list(result, *, referenced: list[str] | None = None) -> str:
+    """JSON describing detected font usage. Consumed by the Unity importer
+    to build the manual font-merge UI.
+
+    `referenced` carries every non-generic family name that appears as a
+    font-family token (including comma-separated fallbacks) anywhere in
+    the source CSS. Families that show up only as fallbacks have empty
+    variants — that's how the importer flags them as "fallback" so the
+    user can still pick them as merge targets."""
+    families: dict[str, dict] = {}
+    for usage in getattr(result, "font_usages", []) or []:
+        family = getattr(usage, "family", None)
+        if not family:
+            continue
+        entry = families.setdefault(family, {
+            "family": family,
+            "variants": set(),
+            "characters": "",
+            "dynamic": False,
+            "role": "primary",
+        })
+        entry["variants"].add((
+            int(getattr(usage, "weight", 400) or 400),
+            bool(getattr(usage, "italic", False)),
+        ))
+        entry["characters"] = _unique_chars(
+            entry["characters"] + (getattr(usage, "text", "") or "")
+        )
+        if getattr(usage, "dynamic", False):
+            entry["dynamic"] = True
+
+    if referenced:
+        for fam in referenced:
+            if fam in families:
+                continue
+            families[fam] = {
+                "family": fam,
+                "variants": set(),
+                "characters": "",
+                "dynamic": False,
+                "role": "fallback",
+            }
+
+    out = []
+    for entry in sorted(families.values(), key=lambda e: e["family"].lower()):
+        out.append({
+            "family": entry["family"],
+            "variants": [
+                {"weight": w, "italic": i}
+                for (w, i) in sorted(entry["variants"])
+            ],
+            "characters": entry["characters"][:120],
+            "characterCount": len(entry["characters"]),
+            "dynamic": entry["dynamic"],
+            "role": entry["role"],
+        })
+    return json.dumps({"families": out}, ensure_ascii=True, indent=2)
+
+
+def _dedupe_font_files(
+    mapping: dict[str, list[FontVariant] | str],
+    fonts_dir: Path,
+) -> dict[str, list[FontVariant] | str]:
+    """Collapse identical TTF/OTF byte-payloads to a single canonical file.
+
+    Different families (e.g. an alias merged into a system match, or two
+    families that share a Google Fonts entry) can each pull a copy of the
+    same TTF. Unity imports each one separately, doubling atlas memory and
+    confusing the FontAsset references. This pass keeps the lex-first
+    filename and rewrites every other variant to point at it.
+    """
+    if not mapping:
+        return mapping
+    by_hash: dict[str, str] = {}
+    redirect: dict[str, str] = {}
+    for variants_raw in mapping.values():
+        variants = _normalise_font_variants(variants_raw) \
+            if not isinstance(variants_raw, list) else variants_raw
+        for v in variants:
+            rel = v.path.replace("\\", "/") if isinstance(v, FontVariant) else str(v).replace("\\", "/")
+            abs_path = fonts_dir / Path(rel).name
+            if not abs_path.is_file():
+                continue
+            try:
+                digest = hashlib.sha1(abs_path.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            canonical = by_hash.get(digest)
+            if canonical is None or _font_path_rank(rel) < _font_path_rank(canonical):
+                if canonical is not None:
+                    redirect[canonical] = rel
+                by_hash[digest] = rel
+            elif rel != canonical:
+                redirect[rel] = canonical
+
+    if not redirect:
+        return mapping
+
+    final_redirect: dict[str, str] = {}
+    for src, dst in redirect.items():
+        cur = dst
+        seen = {src}
+        while cur in redirect and redirect[cur] not in seen:
+            cur = redirect[cur]
+            seen.add(cur)
+        final_redirect[src] = cur
+
+    new_mapping: dict[str, list[FontVariant] | str] = {}
+    for family, variants_raw in mapping.items():
+        if isinstance(variants_raw, str):
+            new_mapping[family] = final_redirect.get(variants_raw, variants_raw)
+            continue
+        new_variants: list[FontVariant] = []
+        for v in variants_raw:
+            target = final_redirect.get(v.path)
+            new_variants.append(replace(v, path=target) if target else v)
+        new_mapping[family] = new_variants
+
+    for old_rel in final_redirect:
+        path = fonts_dir / Path(old_rel).name
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    return new_mapping
+
+
+def _font_path_rank(rel: str) -> tuple[int, str]:
+    """Lower is better when picking a canonical filename."""
+    name = Path(rel).name
+    return (len(name), name.lower())
+
+
+_DEFAULT_STATIC_FONT_FALLBACK = (
+    "".join(chr(i) for i in range(32, 127))  # printable ASCII
     + "\n\t"
-    + "•·–—…“”‘’©®™°×÷±←→↑↓✓✕★☆○●◉□■▲▼△▽"
 )
+
+
+def _build_default_charset(result) -> str:
+    """Static atlas characters. Union of every FontUsage's text, plus a
+    fallback (printable ASCII + whitespace) so fonts still render runtime
+    text the converter could not see — input fields, formatted numbers,
+    and labels populated from data sources."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for usage in getattr(result, "font_usages", []) or []:
+        for ch in (getattr(usage, "text", "") or ""):
+            if ch in seen:
+                continue
+            seen.add(ch)
+            out.append(ch)
+    for ch in _DEFAULT_STATIC_FONT_FALLBACK:
+        if ch in seen:
+            continue
+        seen.add(ch)
+        out.append(ch)
+    return "".join(out)
 
 
 def _write_font_asset_manifest(
@@ -1102,7 +1797,7 @@ def _write_font_asset_manifest(
         entry["characters"] = _unique_chars(entry["characters"] + (getattr(usage, "text", "") or ""))
 
     payload = {
-        "defaultCharacters": _DEFAULT_STATIC_FONT_CHARSET,
+        "defaultCharacters": _build_default_charset(result),
         "fonts": sorted(entries.values(), key=lambda item: item["fontFile"].lower()),
     }
     fonts_dir.mkdir(parents=True, exist_ok=True)
@@ -1306,6 +2001,7 @@ def _print_report(
     font_report,
     svg_report,
     *,
+    embedded_report=None,
     rendered_by_browser: bool = False,
     rendered_html_path: Path | None = None,
     file,
@@ -1368,6 +2064,21 @@ def _print_report(
             print(f"  fonts: {rows}", file=file)
         for f, why in font_report.failed[:5]:
             print(f"    - {f}: {why}", file=file)
+    if embedded_report is not None and (
+        embedded_report.extracted or embedded_report.failed or embedded_report.skipped
+    ):
+        print(
+            f"  embedded fonts: extracted={len(embedded_report.extracted)} "
+            f"failed={len(embedded_report.failed)} "
+            f"skipped={len(embedded_report.skipped)}",
+            file=file,
+        )
+        for family, path in embedded_report.extracted[:5]:
+            print(f"    + {family} -> {path}", file=file)
+        for url, why in embedded_report.skipped[:3]:
+            print(f"    ~ {url}: {why}", file=file)
+        for url, why in embedded_report.failed[:3]:
+            print(f"    - {url}: {why}", file=file)
 
 
 def _dedupe(values: list[str]) -> list[str]:

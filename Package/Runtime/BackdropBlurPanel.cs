@@ -81,7 +81,7 @@ namespace ODDGames.Html2Uxml
                 _sourceId = value;
                 ConfigureSharedMaterial();
                 TryBindSharedTexture();
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
             }
         }
 
@@ -94,7 +94,7 @@ namespace ODDGames.Html2Uxml
                 if (_useScreenSpaceUv == value) return;
                 _useScreenSpaceUv = value;
                 ConfigureSharedMaterial();
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
             }
         }
 
@@ -155,7 +155,7 @@ namespace ODDGames.Html2Uxml
         {
             CaptureSourceCamera();
             UpdateBlurredTexture(force: true);
-            MarkDirtyRepaint();
+            // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
         }
 
         protected override void BeforeGenerateVisualContent()
@@ -251,7 +251,7 @@ namespace ODDGames.Html2Uxml
         void MarkBlurDirty()
         {
             _blurDirty = true;
-            MarkDirtyRepaint();
+            // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
         }
 
         void EnsureSourceTexture(int width, int height)

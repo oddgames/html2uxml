@@ -5,13 +5,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import math
 import re
+import urllib.parse
 
-from .css_parser import _parse_declarations, parse_css, parse_selector
+from .assets import _decode_image_data_uri, _safe_name
+from .css_parser import (
+    CompoundSelector,
+    Selector,
+    _parse_declarations,
+    parse_css,
+    parse_selector,
+)
 from .html_parser import Node, parse_html
 from .mappings import SKIP_TAGS, map_declarations, map_element
 from .resolver import (
     _ParsedRule, parse_rules, resolve, ResolvedStyle, selector_matches,
 )
+import hashlib
 
 
 @dataclass
@@ -22,6 +31,7 @@ class ConvertResult:
     stats: "ConvertStats | None" = None
     svg_files: list[tuple[str, str]] = field(default_factory=list)  # (filename, raw svg)
     text_gradient_files: list[tuple[str, str]] = field(default_factory=list)  # (filename, json body)
+    data_uri_files: list[tuple[str, bytes]] = field(default_factory=list)  # (filename, raw bytes)
     font_usages: list["FontUsage"] = field(default_factory=list)
 
 
@@ -57,6 +67,18 @@ class _OverlayClone:
     decls: list[tuple[str, str]]
 
 
+@dataclass
+class _AnimationFrame:
+    offset: float
+    decls: list[tuple[str, str]]
+
+
+@dataclass
+class _AnimationKeyframes:
+    name: str
+    frames: list[_AnimationFrame] = field(default_factory=list)
+
+
 def convert(
     html: str,
     extra_css: str = "",
@@ -84,7 +106,8 @@ def convert(
                 pass
     if extra_css:
         css_chunks.append(extra_css)
-    rules = parse_css("\n".join(css_chunks))
+    css_text = "\n".join(css_chunks)
+    rules = parse_css(css_text)
     parsed_rules = parse_rules(rules)
 
     # Subtree selection: find the first matching node, wrap it in a synthetic
@@ -113,6 +136,8 @@ def convert(
             parsed.root = new_root
 
     state = _EmitState()
+    state.used_bridge = True
+    state.animation_keyframes = _extract_animation_keyframes(css_text)
     state.svg_blocks = list(parsed.svg_blocks)
     state.svg_assets_subdir = svg_assets_subdir.strip("/\\") or "Images"
     state.text_gradients_assets_subdir = text_gradients_assets_subdir.strip("/\\") or "TextGradients"
@@ -144,6 +169,7 @@ def convert(
         uxml=uxml, uss=uss, warnings=state.warnings, stats=state.stats,
         svg_files=state.svg_files,
         text_gradient_files=state.text_gradient_files,
+        data_uri_files=state.data_uri_files,
         font_usages=state.font_usages,
     )
 
@@ -299,6 +325,9 @@ class _EmitState:
     svg_files: list[tuple[str, str]] = field(default_factory=list)
     svg_blocks: list[str] = field(default_factory=list)
     svg_assets_subdir: str = "Images"
+    data_uri_files: list[tuple[str, bytes]] = field(default_factory=list)
+    data_uri_dedup: dict[str, str] = field(default_factory=dict)  # sha1(data) -> filename
+    data_uri_name_counts: dict[str, int] = field(default_factory=dict)  # slug -> highest used count
     synthetic_by_selector: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     text_gradient_by_selector: dict[str, str] = field(default_factory=dict)
     text_gradient_files: list[tuple[str, str]] = field(default_factory=list)
@@ -307,7 +336,11 @@ class _EmitState:
     generated_class_cache: dict[tuple[tuple[str, str], ...], str] = field(default_factory=dict)
     svg_warning_emitted: bool = False
     svg_name_counts: dict[str, int] = field(default_factory=dict)
+    animation_keyframes: dict[str, _AnimationKeyframes] = field(default_factory=dict)
     font_usages: list[FontUsage] = field(default_factory=list)
+    # HTML tags whose CSS rules were rewritten to `.h2u-tag-<tag>` selectors.
+    # Used by _emit_node to know which elements need the matching class.
+    tagged_tags: set = field(default_factory=set)
     _gen_counter: int = 0
 
     def add_rule(self, selector: str, decls: list[tuple[str, str]]) -> None:
@@ -339,6 +372,33 @@ class _EmitState:
         suffix = "" if count == 1 else f"-{count}"
         return f"{slug}{suffix}.svg"
 
+    def intern_data_uri(self, data_uri: str, slug: str) -> str | None:
+        """Decode a `data:image/*` URI and register the bytes for later writing.
+
+        Returns the project-relative filename (without subdir prefix) on
+        success, or None if the URI is unsupported and should be left as-is.
+        """
+        decoded = _decode_image_data_uri(data_uri)
+        if decoded is None:
+            return None
+        data, ext = decoded
+        sha = hashlib.sha1(data).hexdigest()
+        existing = self.data_uri_dedup.get(sha)
+        if existing is not None:
+            return existing
+        base_slug = _safe_name(slug) or "embedded"
+        if base_slug == "embedded":
+            # No semantic source for the name; tag with the content hash so
+            # the file is at least identified by its bytes.
+            base_slug = f"embedded-{sha[:8]}"
+        count = self.data_uri_name_counts.get(base_slug, 0) + 1
+        self.data_uri_name_counts[base_slug] = count
+        suffix = "" if count == 1 else f"-{count}"
+        filename = _safe_name(f"{base_slug}{suffix}{ext}")
+        self.data_uri_dedup[sha] = filename
+        self.data_uri_files.append((filename, data))
+        return filename
+
     def warn_once(self, message: str) -> None:
         if message not in self.warnings:
             self.warnings.append(message)
@@ -367,6 +427,67 @@ def _decl_cache_key(decls: list[tuple[str, str]]) -> tuple[tuple[str, str], ...]
 # ---------------------------------------------------------------------------
 
 
+# USS recognises a small set of element-type selectors (Unity built-in
+# controls plus the Html2Uxml* runtime types). Every other tag in user CSS
+# (body, section, h1..h6, nav, p, ul, li, table, …) must be rewritten to a
+# class selector — `.h2u-tag-<tag>` — and the matching class added to each
+# emitted UXML node. Without this rewrite, plain HTML pages whose CSS uses
+# element-name selectors get zero styling in Unity.
+_UNITY_USS_TYPES_LOWER = frozenset({
+    "button", "toggle", "label", "scrollview", "textfield", "floatfield",
+    "integerfield", "slider", "sliderint", "image", "visualelement",
+    "radiobutton", "radiobuttongroup", "dropdownfield", "progressbar",
+    "foldout", "groupbox", "repeatbutton", "box", "listview", "treeview",
+    "minmaxslider", "vector2field", "vector3field", "vector4field",
+    "boundsfield", "rectfield", "colorfield", "objectfield", "enumfield",
+    "maskfield", "longfield", "doublefield", "helpbox", "tabview", "tab",
+    "html2uxmlpanel", "html2uxmlelement", "html2uxmlbutton", "html2uxmllabel",
+    "html2uxmlscrollview", "html2uxmltextfield", "html2uxmlfloatfield",
+    "html2uxmlslider", "html2uxmltoggle", "html2uxmlradiobutton",
+    "html2uxmldropdownfield", "html2uxmlprogressbar", "html2uxmlfoldout",
+    "html2uxmlgroupbox", "html2uxmlscaleroot",
+})
+
+
+def _is_unity_uss_type(tag: str) -> bool:
+    return bool(tag) and tag != "*" and tag.lower() in _UNITY_USS_TYPES_LOWER
+
+
+def _h2u_tag_class(tag: str) -> str:
+    return f"h2u-tag-{tag.lower()}"
+
+
+def _render_compound_for_uss(comp: "CompoundSelector",
+                              tagged_tags: set | None = None) -> str:
+    parts: list[str] = []
+    if comp.tag and comp.tag != "*":
+        if _is_unity_uss_type(comp.tag):
+            parts.append(comp.tag)
+        else:
+            parts.append("." + _h2u_tag_class(comp.tag))
+            if tagged_tags is not None:
+                tagged_tags.add(comp.tag.lower())
+    if comp.id:
+        parts.append(f"#{comp.id}")
+    for c in comp.classes:
+        parts.append(f".{c}")
+    for ps in comp.pseudo:
+        parts.append(ps if ps.startswith(":") else f":{ps}")
+    return "".join(parts) or "*"
+
+
+def _rewrite_selector_for_uss(sel: "Selector",
+                               tagged_tags: set | None = None) -> str:
+    if not sel.chain:
+        return sel.raw
+    out: list[str] = []
+    for i, (combinator, comp) in enumerate(sel.chain):
+        if i > 0:
+            out.append(" " if combinator == " " else f" {combinator} ")
+        out.append(_render_compound_for_uss(comp, tagged_tags))
+    return "".join(out)
+
+
 def _emit_css_rules(parsed_rules: list[_ParsedRule], state: _EmitState,
                     *, allowed_selectors: set | None = None) -> None:
     for rule in parsed_rules:
@@ -382,16 +503,28 @@ def _emit_css_rules(parsed_rules: list[_ParsedRule], state: _EmitState,
             continue
         mapped = map_declarations([(d.prop, d.value) for d in rule.declarations])
         _record_warnings(state, mapped.warnings)
-        if not mapped.decls:
+        animation_decls = _animation_custom_decls(
+            [(d.prop, d.value) for d in rule.declarations],
+            state,
+        )
+        if not mapped.decls and not animation_decls:
             continue
         real_decls, synth_decls = _split_synthetic_decls(mapped.decls)
+        if animation_decls:
+            real_decls = _combine_generated_decls(real_decls, animation_decls)
         for k, _ in real_decls:
             if _requires_bridge_prop(k):
                 state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
                 state.used_bridge = True
         for sel in emit_selectors:
+            uss_selector = _rewrite_selector_for_uss(sel, state.tagged_tags)
             if real_decls:
-                state.add_rule(sel.raw, real_decls)
+                # Resolve any data: URIs in the rule body using a slug derived
+                # from the selector. Each selector gets its own copy because
+                # the slug differs per rule.
+                rule_decls = list(real_decls)
+                _rewrite_data_uri_decls(rule_decls, state, _selector_slug(sel.raw))
+                state.add_rule(uss_selector, rule_decls)
                 state.stats.css_class_rules += 1
             if synth_decls:
                 state.synthetic_by_selector.setdefault(sel.raw, []).extend(synth_decls)
@@ -840,6 +973,292 @@ def _compute_rule_bridge_flags(parsed_rules: list[_ParsedRule]) -> list[bool]:
 
 
 # ---------------------------------------------------------------------------
+# CSS animation bridge
+# ---------------------------------------------------------------------------
+
+
+_ANIMATION_PROPS = {
+    "opacity",
+    "translate",
+    "rotate",
+    "scale",
+    "color",
+    "background-color",
+}
+
+_ANIMATION_TIMING_KEYWORDS = {
+    "linear", "ease", "ease-in", "ease-out", "ease-in-out",
+    "ease-in-sine", "ease-out-sine", "ease-in-out-sine",
+    "ease-in-quad", "ease-out-quad", "ease-in-out-quad",
+    "ease-in-cubic", "ease-out-cubic", "ease-in-out-cubic",
+}
+
+_ANIMATION_DIRECTION_KEYWORDS = {
+    "normal", "reverse", "alternate", "alternate-reverse",
+}
+
+_ANIMATION_FILL_KEYWORDS = {
+    "none", "forwards", "backwards", "both",
+}
+
+_ANIMATION_PLAY_STATE_KEYWORDS = {
+    "running", "paused",
+}
+
+
+_ODD_UXML_TAGS = {
+    "ui:VisualElement": "odd:Html2UxmlElement",
+    "ui:Label": "odd:Html2UxmlLabel",
+    "ui:Button": "odd:Html2UxmlButton",
+    "ui:ScrollView": "odd:Html2UxmlScrollView",
+    "ui:TextField": "odd:Html2UxmlTextField",
+    "ui:FloatField": "odd:Html2UxmlFloatField",
+    "ui:Slider": "odd:Html2UxmlSlider",
+    "ui:Toggle": "odd:Html2UxmlToggle",
+    "ui:RadioButton": "odd:Html2UxmlRadioButton",
+    "ui:DropdownField": "odd:Html2UxmlDropdownField",
+    "ui:ProgressBar": "odd:Html2UxmlProgressBar",
+    "ui:Foldout": "odd:Html2UxmlFoldout",
+    "ui:GroupBox": "odd:Html2UxmlGroupBox",
+}
+
+
+def _to_odd_uxml_tag(tag: str) -> str:
+    return _ODD_UXML_TAGS.get(tag, tag)
+
+
+def _extract_animation_keyframes(css_text: str) -> dict[str, _AnimationKeyframes]:
+    keyframes: dict[str, _AnimationKeyframes] = {}
+    pat = re.compile(r"@(?:-[A-Za-z]+-)?keyframes\s+([A-Za-z_][\w-]*)\s*\{", re.IGNORECASE)
+    pos = 0
+    while True:
+        m = pat.search(css_text, pos)
+        if not m:
+            break
+        body_start = m.end() - 1
+        body_end = _find_matching_brace(css_text, body_start)
+        if body_end < 0:
+            break
+        name = m.group(1)
+        frames = _parse_keyframe_body(css_text[body_start + 1:body_end])
+        if frames:
+            keyframes[name] = _AnimationKeyframes(name=name, frames=frames)
+        pos = body_end + 1
+    return keyframes
+
+
+def _find_matching_brace(source: str, open_index: int) -> int:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for idx in range(open_index, len(source)):
+        c = source[idx]
+        if quote:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in ("'", '"'):
+            quote = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _parse_keyframe_body(body: str) -> list[_AnimationFrame]:
+    frames: list[_AnimationFrame] = []
+    pos = 0
+    while pos < len(body):
+        brace = body.find("{", pos)
+        if brace < 0:
+            break
+        selector_text = body[pos:brace].strip()
+        end = _find_matching_brace(body, brace)
+        if end < 0:
+            break
+        decls = [(d.prop, d.value) for d in _parse_declarations(body[brace + 1:end])]
+        for raw_sel in _split_top_level_args(selector_text):
+            offset = _parse_keyframe_offset(raw_sel.strip())
+            if offset is not None:
+                frames.append(_AnimationFrame(offset=offset, decls=decls))
+        pos = end + 1
+    frames.sort(key=lambda f: f.offset)
+    return frames
+
+
+def _parse_keyframe_offset(value: str) -> float | None:
+    v = value.strip().lower()
+    if v == "from":
+        return 0.0
+    if v == "to":
+        return 1.0
+    if v.endswith("%"):
+        try:
+            return max(0.0, min(1.0, float(v[:-1].strip()) / 100.0))
+        except ValueError:
+            return None
+    return None
+
+
+def _animation_custom_decls(pairs: list[tuple[str, str]], state: _EmitState) -> list[tuple[str, str]]:
+    spec = _animation_spec_from_pairs(pairs)
+    name = spec.get("name", "").strip()
+    if not name or name.lower() == "none":
+        return []
+    keyframes = state.animation_keyframes.get(name)
+    if keyframes is None:
+        state.warn_once(f"animation '{name}' has no matching @keyframes; dropped")
+        return []
+    encoded = _encode_animation_keyframes(keyframes, state)
+    if not encoded:
+        state.warn_once(f"animation '{name}' has no supported keyframe properties; dropped")
+        return []
+
+    state.stats.bridged_props["--odd-animation"] = state.stats.bridged_props.get("--odd-animation", 0) + 1
+    return [
+        ("--odd-animation-name", _uss_string(name)),
+        ("--odd-animation-duration-ms", str(_duration_to_ms(spec.get("duration", "0s")))),
+        ("--odd-animation-delay-ms", str(_duration_to_ms(spec.get("delay", "0s")))),
+        ("--odd-animation-timing", _uss_string(spec.get("timing", "linear"))),
+        ("--odd-animation-iteration-count", _uss_string(spec.get("iteration-count", "1"))),
+        ("--odd-animation-direction", _uss_string(spec.get("direction", "normal"))),
+        ("--odd-animation-fill-mode", _uss_string(spec.get("fill-mode", "none"))),
+        ("--odd-animation-play-state", _uss_string(spec.get("play-state", "running"))),
+        ("--odd-animation-keyframes", _uss_string(encoded)),
+    ]
+
+
+def _animation_spec_from_pairs(pairs: list[tuple[str, str]]) -> dict[str, str]:
+    spec: dict[str, str] = {}
+    for prop, value in pairs:
+        low = prop.lower()
+        if low == "animation":
+            spec.update(_parse_animation_shorthand(_first_animation_layer(value)))
+        elif low.startswith("animation-"):
+            key = low[len("animation-"):]
+            spec[key] = _first_animation_layer(value).strip()
+    return spec
+
+
+def _first_animation_layer(value: str) -> str:
+    parts = _split_top_level_args(value)
+    return parts[0] if parts else value
+
+
+def _parse_animation_shorthand(value: str) -> dict[str, str]:
+    spec: dict[str, str] = {}
+    for token in _split_animation_tokens(value):
+        low = token.lower()
+        if _looks_like_duration(low):
+            if "duration" not in spec:
+                spec["duration"] = token
+            elif "delay" not in spec:
+                spec["delay"] = token
+        elif low in _ANIMATION_TIMING_KEYWORDS or low.startswith(("cubic-bezier(", "steps(")):
+            spec["timing"] = token
+        elif low in _ANIMATION_DIRECTION_KEYWORDS:
+            spec["direction"] = token
+        elif low in _ANIMATION_FILL_KEYWORDS:
+            spec["fill-mode"] = token
+        elif low in _ANIMATION_PLAY_STATE_KEYWORDS:
+            spec["play-state"] = token
+        elif low == "infinite" or _looks_like_number(low):
+            spec["iteration-count"] = token
+        elif low not in ("normal", "none"):
+            spec["name"] = token
+    return spec
+
+
+def _split_animation_tokens(value: str) -> list[str]:
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for c in value.strip():
+        if quote:
+            buf.append(c)
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in ("'", '"'):
+            quote = c
+            buf.append(c)
+        elif c == "(":
+            depth += 1
+            buf.append(c)
+        elif c == ")":
+            depth = max(0, depth - 1)
+            buf.append(c)
+        elif c.isspace() and depth == 0:
+            if buf:
+                out.append("".join(buf))
+                buf = []
+        else:
+            buf.append(c)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _looks_like_duration(value: str) -> bool:
+    return bool(re.fullmatch(r"-?\d*\.?\d+(ms|s)", value.strip(), re.IGNORECASE))
+
+
+def _looks_like_number(value: str) -> bool:
+    return bool(re.fullmatch(r"\d*\.?\d+", value.strip()))
+
+
+def _duration_to_ms(value: str) -> float:
+    v = value.strip().lower()
+    try:
+        if v.endswith("ms"):
+            return max(0.0, float(v[:-2]))
+        if v.endswith("s"):
+            return max(0.0, float(v[:-1]) * 1000.0)
+        return max(0.0, float(v))
+    except ValueError:
+        return 0.0
+
+
+def _encode_animation_keyframes(keyframes: _AnimationKeyframes, state: _EmitState) -> str:
+    records: list[str] = []
+    unsupported: set[str] = set()
+    for frame in keyframes.frames:
+        mapped = map_declarations(frame.decls)
+        _record_warnings(state, mapped.warnings)
+        props: list[str] = []
+        for prop, value in mapped.decls:
+            if prop in _ANIMATION_PROPS:
+                props.append(f"{prop}={urllib.parse.quote(value, safe='')}")
+            elif not prop.startswith("--"):
+                unsupported.add(prop)
+        if props:
+            records.append(f"{frame.offset:g}|" + "&".join(props))
+    if unsupported:
+        state.warn_once(
+            "animation keyframe properties ignored: " + ", ".join(sorted(unsupported))
+        )
+    return ";".join(records)
+
+
+def _uss_string(value: str) -> str:
+    inner = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{inner}"'
+
+
+# ---------------------------------------------------------------------------
 # UXML emission
 # ---------------------------------------------------------------------------
 
@@ -1023,6 +1442,57 @@ def _overlay_source_label(node: Node) -> str:
     return node.tag or "element"
 
 
+_OM_ID_FILE_LINE_RE = re.compile(r"([A-Za-z0-9_-]+)\.[A-Za-z0-9]+(:\d+(?::\d+)*)?$")
+
+
+def _slug_from_node_text(node: Node) -> str:
+    """Derive a short slug from a node's direct text content. Skips
+    descendant text so a deeply-nested container doesn't inherit the slug
+    of its grandchild's first label.
+
+    Returns ``""`` when the node has no usable text — the caller falls
+    through to the next naming strategy.
+    """
+    if node.is_text:
+        return ""
+    parts: list[str] = []
+    for child in node.children:
+        if child.is_text:
+            text = (child.text or "").strip()
+            if text:
+                parts.append(text)
+    raw = " ".join(parts)
+    if not raw:
+        return ""
+    raw = raw.strip()
+    if len(raw) > 32:
+        raw = raw[:32]
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", raw).strip("-").lower()
+    return slug
+
+
+def _slug_from_om_id(value: str) -> str:
+    """Extract a stable, human-readable slug from a Figma/Onlook
+    design-canvas `data-om-id` like
+    ``jsx:/.../screens/Bracket.jsx:6264:128:15`` -> ``Bracket-6264-128-15``.
+
+    Falls back to the last path segment, sanitised, when the value does
+    not match the expected `file.ext:line:col[...]` shape.
+    """
+    if not value:
+        return ""
+    last = re.sub(r".*[/\\]", "", value.strip())
+    match = _OM_ID_FILE_LINE_RE.search(last)
+    if match:
+        head = match.group(1)
+        tail = (match.group(2) or "").replace(":", "-")
+        slug = head + tail
+    else:
+        slug = re.sub(r"\.[A-Za-z0-9]+", "", last)
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", slug).strip("-")
+    return slug
+
+
 def _overlay_clone_name(node: Node, index: int) -> str:
     source = _overlay_source_label(node)
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", source).strip("-").lower()
@@ -1174,8 +1644,6 @@ def _flex_row_gap_px(style: ResolvedStyle | None) -> float:
 
 
 def _bakes_flex_gap(uxml_tag: str, style: ResolvedStyle | None) -> bool:
-    if uxml_tag in ("odd:Html2UxmlPanel", "odd:Html2UxmlButton"):
-        return False
     display = (_resolved_value(style, "display") or "").strip().lower()
     if display not in ("flex", "inline-flex"):
         return False
@@ -1417,6 +1885,16 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     uxml_tag, extra_attrs, text_mode = map_element(node.tag, node.attrs)
     pad = " " * indent
     classes = list(node.classes())
+    # Tag-as-class so element-name CSS selectors (e.g. `section`, `h1`,
+    # `body`) — rewritten to `.h2u-tag-<tag>` in USS — can match. Only
+    # add the class when the rewrite actually fired for this tag, so
+    # untargeted elements don't get noise classes.
+    if (node.tag
+            and node.tag != "__root__"
+            and node.tag.lower() in state.tagged_tags):
+        tag_class = _h2u_tag_class(node.tag)
+        if tag_class not in classes:
+            classes.insert(0, tag_class)
     style = resolved.get(id(node))
     isolated_parent_opacity = _css_group_opacity_needs_isolation(node, style, resolved)
     own_text_raw = _text_raw_from_style(style)
@@ -1452,13 +1930,17 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     if inline_pairs:
         mapped = map_declarations(inline_pairs)
         _record_warnings(state, mapped.warnings)
-        if mapped.decls:
+        animation_decls = _animation_custom_decls(inline_pairs, state)
+        if mapped.decls or animation_decls:
             real_decls, synth_decls = _split_synthetic_decls(mapped.decls)
+            if animation_decls:
+                real_decls = _combine_generated_decls(real_decls, animation_decls)
             if isolated_parent_opacity is not None:
                 real_decls = [(k, v) for k, v in real_decls if k != "opacity"]
                 synth_decls = [(k, v) for k, v in synth_decls if k != "opacity"]
             synthetic_attrs.extend(synth_decls)
             if real_decls:
+                _rewrite_data_uri_decls(real_decls, state, _data_uri_context_slug(node, parent))
                 own_class, created = state.class_for_generated_decls(real_decls)
                 own_classes.append(own_class)
                 if created:
@@ -1523,6 +2005,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             ratio = _aspect_ratio_from_attrs(node)
             if ratio is not None:
                 image_decls.append(("aspect-ratio", f"{ratio:g}"))
+            _rewrite_data_uri_decls(image_decls, state, _data_uri_context_slug(node, parent))
             image_class, created = state.class_for_generated_decls(image_decls)
             own_classes.append(image_class)
             if created:
@@ -1581,12 +2064,21 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         inline_class, created = state.class_for_generated_decls([
             ("display", "flex"),
             ("flex-direction", "row"),
+            ("flex-wrap", "wrap"),
             ("align-items", "center"),
         ])
         own_classes.append(inline_class)
         if created:
             state.stats.inline_overrides += 1
-        label_decls = _inline_text_run_label_decls(style)
+        # Mixed raw text + inline element ("Title <span>X</span>") needs the
+        # full line-box clamp + left alignment. Span-only rows already have
+        # their own widths/padding and only need shared min-height + center.
+        has_raw_text = any(c.is_text and (c.text or "").strip() for c in node.children)
+        label_decls = (
+            _inline_text_run_label_decls(style)
+            if has_raw_text
+            else _inline_child_label_decls(style)
+        )
         if label_decls:
             inline_label_decls = label_decls
             inline_label_class, created = state.class_for_generated_decls(label_decls)
@@ -1731,8 +2223,44 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         attrs_out.append(("class", " ".join(deduped)))
     if forced_name:
         attrs_out.append(("name", forced_name))
-    elif "id" in node.attrs and node.attrs["id"] and not suppress_name:
-        attrs_out.append(("name", node.attrs["id"]))
+    elif not suppress_name:
+        # Name precedence:
+        #   1. data-h2u-name override
+        #   2. HTML id
+        #   3. HTML name attr (`<input>`, `<form>`, etc.)
+        #   4. first source class — so Figma exports without ids still leave
+        #      every element addressable in UI Builder + via UQuery.
+        #   5. data-om-id slug — Figma/Onlook design-canvas IDs encode
+        #      `screens/Bracket.jsx:6264:128:15`; the slug `Bracket-6264-128-15`
+        #      is unique per source location and survives reconverts, so it
+        #      makes a far better hierarchy hint than `h2u-N`.
+        #   6. first synthesized class (h2u-N) — last-resort fallback so
+        #      every element gets a unique, stable name.
+        name_value = (
+            node.attrs.get("data-h2u-name")
+            or node.attrs.get("id")
+            or node.attrs.get("name")
+        )
+        if not name_value:
+            for cls in node.classes():
+                if cls and not cls.startswith("h2u-") and not cls.startswith("__om-"):
+                    name_value = cls
+                    break
+        if not name_value:
+            text_slug = _slug_from_node_text(node)
+            if text_slug:
+                name_value = text_slug
+        if not name_value:
+            om = node.attrs.get("data-om-id")
+            if om:
+                name_value = _slug_from_om_id(om)
+        if not name_value:
+            for cls in own_classes:
+                if cls and cls.startswith("h2u-"):
+                    name_value = cls
+                    break
+        if name_value:
+            attrs_out.append(("name", name_value))
     text_gradient_name = _node_text_gradient_name(style, state)
     if foldout_text is not None:
         state.record_font_text(foldout_text, effective_text_raw, dynamic=dynamic_font)
@@ -1753,6 +2281,29 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         attrs_out.append(("tooltip", node.attrs["title"]))
     elif "alt" in node.attrs and node.attrs["alt"]:
         attrs_out.append(("tooltip", node.attrs["alt"]))
+    elif "aria-label" in node.attrs and node.attrs["aria-label"]:
+        attrs_out.append(("tooltip", node.attrs["aria-label"]))
+
+    # Pass-through hooks — preserve `data-*`, `role`, and `aria-*` markup so
+    # gameplay code can find / decorate elements without re-parsing the source
+    # HTML. UXML accepts unknown attributes; UI Toolkit ignores ones it does
+    # not recognise, but they still show up when reading the file or via
+    # element.GetAttribute("data-…"). We skip converter-internal markers
+    # (`data-h2u-*`, `data-svg-*`, `data-om-*`) to keep the output clean.
+    for k, v in node.attrs.items():
+        if not v:
+            continue
+        kl = k.lower()
+        if kl == "role":
+            attrs_out.append((k, v))
+            continue
+        if kl.startswith("aria-") and kl != "aria-label":
+            attrs_out.append((k, v))
+            continue
+        if kl.startswith("data-"):
+            if kl.startswith(("data-h2u-", "data-svg-", "data-om-")):
+                continue
+            attrs_out.append((k, v))
 
     # In CSS, pointer-events does not inherit, but a direct text node, pseudo
     # content, or list marker is not its own element in the source DOM — so
@@ -1906,9 +2457,11 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             )
 
     if not rendered_children:
-        return f"{pad}<{uxml_tag}{attr_str} />\n"
+        emit_tag = _to_odd_uxml_tag(uxml_tag)
+        return f"{pad}<{emit_tag}{attr_str} />\n"
     body = "".join(rendered_children)
-    return f"{pad}<{uxml_tag}{attr_str}>\n{body}{pad}</{uxml_tag}>\n"
+    emit_tag = _to_odd_uxml_tag(uxml_tag)
+    return f"{pad}<{emit_tag}{attr_str}>\n{body}{pad}</{emit_tag}>\n"
 
 
 _SVG_DIM_RE = __import__("re").compile(
@@ -1974,7 +2527,7 @@ def _emit_svg(
             pass
     state.stats.elements += 1
     if not raw:
-        return f"{pad}<ui:VisualElement />\n"
+        return f"{pad}<odd:Html2UxmlElement />\n"
 
     filename = state.svg_filename(node, parent)
     state.svg_files.append((filename, raw))
@@ -2003,7 +2556,7 @@ def _emit_svg(
     classes = list(node.classes())
     classes.append(own_class)
     cls_attr = " ".join(classes)
-    return f'{pad}<ui:VisualElement class="{_xml_escape(cls_attr)}" />\n'
+    return f'{pad}<odd:Html2UxmlElement class="{_xml_escape(cls_attr)}" />\n'
 
 
 def _svg_context_slug(node: Node, parent: Node | None) -> str:
@@ -2021,6 +2574,75 @@ def _svg_context_slug(node: Node, parent: Node | None) -> str:
             if cls and not cls.startswith("h2u-"):
                 return _slugify_asset_label(cls)
     return "svg"
+
+
+def _selector_slug(selector: str) -> str:
+    """Pick a human slug from a CSS selector for naming an extracted asset.
+
+    Prefers an id (`#name`) or class (`.name`) token, ignoring synthesized
+    `h2u-N` classes; falls back to a sanitized form of the whole selector.
+    """
+    for m in re.finditer(r"[#.]([A-Za-z_][\w-]*)", selector):
+        token = m.group(1)
+        if not re.fullmatch(r"h2u-\d+", token):
+            return _slugify_asset_label(token)
+    return _slugify_asset_label(selector) or "embedded"
+
+
+_DATA_URI_IN_URL_RE = re.compile(
+    r"""url\(\s*(["']?)(data:[^)\s"']+)\1\s*\)""",
+    re.IGNORECASE,
+)
+
+
+def _rewrite_data_uri_decls(
+    decls: list[tuple[str, str]],
+    state: _EmitState,
+    slug: str,
+) -> None:
+    """Decode any `url("data:image/...;base64,...")` values inline.
+
+    Mutates `decls` in place: each data: URI becomes
+    `url("Images/<filename>")`, and the bytes are queued on `state` for the
+    CLI to write to disk.
+    """
+    if not decls:
+        return
+    subdir = state.svg_assets_subdir
+    for i, (prop, value) in enumerate(decls):
+        if "data:" not in value:
+            continue
+
+        def repl(m: re.Match) -> str:
+            uri = m.group(2)
+            filename = state.intern_data_uri(uri, slug=slug)
+            if filename is None:
+                return m.group(0)
+            return f'url("{subdir}/{filename}")'
+
+        new_value = _DATA_URI_IN_URL_RE.sub(repl, value)
+        if new_value != value:
+            decls[i] = (prop, new_value)
+
+
+def _data_uri_context_slug(node: Node | None, parent: Node | None) -> str:
+    """Slug for an extracted data: URI asset.
+
+    Prefers the element that owns the URI (e.g. an `<img alt="...">` or a
+    `<div id="...">`), falling back to the parent for context (e.g. an
+    `<a title="...">` wrapping a logo div).
+    """
+    for src in (node, parent):
+        if src is None:
+            continue
+        for key in ("alt", "id", "name", "title", "aria-label"):
+            value = src.attrs.get(key)
+            if value:
+                return _slugify_asset_label(value)
+        for cls in src.classes():
+            if cls and not cls.startswith("h2u-"):
+                return _slugify_asset_label(cls)
+    return "embedded"
 
 
 def _slugify_asset_label(value: str) -> str:
@@ -2073,7 +2695,7 @@ def _emit_synthetic_pseudo(
     pad = " " * indent
     attrs = [("class", own_class), ("text", text), *synthetic_attrs]
     attr_str = "".join(f' {k}="{_xml_escape(v)}"' for k, v in attrs)
-    return f"{pad}<ui:Label{attr_str} />\n"
+    return f"{pad}<odd:Html2UxmlLabel{attr_str} />\n"
 
 
 def _split_synthetic_decls(
@@ -2893,7 +3515,7 @@ _INLINE_TEXT_TAGS = {
 
 def _has_inline_text_run(node: Node) -> bool:
     saw_text = False
-    saw_element = False
+    element_count = 0
     for child in node.children:
         if child.is_text:
             if child.text:
@@ -2904,8 +3526,11 @@ def _has_inline_text_run(node: Node) -> bool:
             continue
         if child.tag not in _INLINE_TEXT_TAGS or not _has_only_inline_text(child):
             return False
-        saw_element = True
-    return saw_text and saw_element
+        element_count += 1
+    # Container needs row layout when it mixes raw text with inline elements
+    # (classic <div>text<span>...</span></div>) or stacks multiple inline
+    # children side by side (<div><span>...</span><span>...</span></div>).
+    return (saw_text and element_count > 0) or element_count >= 2
 
 
 def _has_only_inline_text(node: Node) -> bool:
@@ -3075,11 +3700,11 @@ def _emit_generated_text_label(
     body: list[str] = []
     for idx, ch in enumerate(value):
         if ch.isspace():
-            body.append(f'{child_pad}<ui:VisualElement{pick_attr} class="{_xml_escape(space_class)}" />\n')
+            body.append(f'{child_pad}<odd:Html2UxmlElement{pick_attr} class="{_xml_escape(space_class)}" />\n')
             continue
         cls = last_char_class if idx == last_index else char_class
-        body.append(f'{child_pad}<ui:Label{pick_attr} class="{_xml_escape(cls)}" text="{_xml_escape(ch)}" />\n')
-    return f'{pad}<ui:VisualElement{pick_attr} class="{_xml_escape(row_class)}">\n{"".join(body)}{pad}</ui:VisualElement>\n'
+        body.append(f'{child_pad}<odd:Html2UxmlLabel{pick_attr} class="{_xml_escape(cls)}" text="{_xml_escape(ch)}" />\n')
+    return f'{pad}<odd:Html2UxmlElement{pick_attr} class="{_xml_escape(row_class)}">\n{"".join(body)}{pad}</odd:Html2UxmlElement>\n'
 
 
 def _should_emit_spaced_text(text: str, effective_text_raw: dict[str, str]) -> bool:
@@ -3128,7 +3753,7 @@ def _emit_text_label(
     value = text if preserve else text.strip()
     class_attr = f' class="{_xml_escape(class_name)}"' if class_name else ""
     pick_attr = ' picking-mode="Ignore"' if picking_ignore else ""
-    return f'{pad}<ui:Label{pick_attr}{class_attr} text="{_xml_escape(value)}" />\n'
+    return f'{pad}<odd:Html2UxmlLabel{pick_attr}{class_attr} text="{_xml_escape(value)}" />\n'
 
 
 def _xml_escape(s: str) -> str:

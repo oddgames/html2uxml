@@ -568,12 +568,16 @@ Use:
 - `transition-property`
 - `transition-duration`
 - `transition-timing-function`
+- short `@keyframes` for `opacity`, `translate`, `scale`, `rotate`,
+  `color`, or `background-color`
 
 Avoid:
 
-- `@keyframes`
-- `animation`
-- infinite CSS animation
+- keyframes that change layout (`width`, `height`, `left`, `top`, margins,
+  padding, flex values)
+- animating filters, masks, clip paths, shadows, or background images
+- multiple simultaneous animations on the same element
+- infinite animation on large lists or full-screen panels
 - visual state that only exists in JavaScript
 - transitions between different unit types
 
@@ -705,7 +709,7 @@ Avoid these in design source:
 - Inline JavaScript event handlers.
 - Grid, table layout, floats, and multi-column layout.
 - `position: fixed` and `position: sticky`.
-- `@keyframes` and `animation`.
+- layout-changing keyframes and large infinite animations.
 - `backdrop-filter` and `-webkit-backdrop-filter`.
 - `mix-blend-mode` and `background-blend-mode`.
 - `conic-gradient`.
@@ -732,7 +736,7 @@ Before handing off a design, verify:
 - Fonts are open source, supplied, or known system fonts.
 - Each screen has one root ID.
 - Interactive elements have stable IDs or classes.
-- No keyframe animations.
+- Keyframe animations only touch opacity, translate, scale, rotate, color, or background color.
 - SVGs have `viewBox`, `width`, and `height`.
 - Complex logos and portraits are raster images.
 - Slanted panels use `clip-path: polygon(...)`.

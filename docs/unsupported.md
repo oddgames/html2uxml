@@ -10,19 +10,24 @@ per-property handlers in `_map_one`.
 
 ---
 
-## Hard-dropped properties (`DROP_PROPS`)
+## Dropped or Runtime-Bridged Properties
 
-These are silently rewritten to nothing. Warning text:
+These properties do not have direct USS equivalents. Some are rewritten to
+runtime custom properties; the rest are dropped with warning text:
 `unsupported in USS, dropped: <prop>: <value>`.
 
 ### `animation` / `animation-*`
 - **Used for**: keyframe-driven loops (pulse, ticker, fade-in).
-- **Today**: dropped. `@keyframes` rules also stripped.
-- **To support**: write a runtime bridge that registers a keyframe parser,
-  schedules a `IVisualElementScheduledItem`, and tweens style each tick. Map a
-  subset (`opacity`, `translate`, `scale`, `rotate`) and warn on the rest.
-  Cheaper alternative: detect the animated property + duration and emit a
-  `transition` instead so static toggles work.
+- **Today**: bridged when the animation targets `opacity`, `translate`,
+  `scale`, `rotate`, `color`, or `background-color`. The converter emits
+  `--odd-animation-*` custom USS and every generated ODD element installs a
+  dormant runtime animation binding. There is no root scan.
+- **Still unsupported**: layout animations (`width`, `height`, `left`, `top`,
+  flex values), SVG path animation, filters, multiple concurrent animations on
+  one element, and browser-exact `steps()` / `cubic-bezier(...)` timing.
+- **To support better**: extend `Html2UxmlAnimation` property samplers one
+  property at a time and keep conversion warnings for properties that would
+  force layout every frame.
 
 ### `mask`, `mask-type`
 - **Used for**: alpha cutouts, gradient fades to transparent.
@@ -256,14 +261,14 @@ files, or installed local/system fonts provide a matching TTF/OTF. Use
 ## Element-level features
 
 ### `<details>` / `<summary>`
-- Converted to `ui:Foldout` with the `<summary>` text hoisted to `text=`.
+- Converted to `odd:Html2UxmlFoldout` with the `<summary>` text hoisted to `text=`.
 
 ### `<select>` / `<option>`
-- Converted to `ui:DropdownField` with `choices=` set from option text. Values
+- Converted to `odd:Html2UxmlDropdownField` with `choices=` set from option text. Values
   are dropped (Unity dropdowns key by index).
 
 ### `<progress>` / `<meter>`
-- Converted to `ui:ProgressBar` with `value` / `high-value` / `low-value`.
+- Converted to `odd:Html2UxmlProgressBar` with `value` / `high-value` / `low-value`.
 
 ### `<img>`
 - Synthesized into a per-element class with `background-image: url(...)` so

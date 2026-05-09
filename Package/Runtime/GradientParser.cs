@@ -48,6 +48,7 @@ namespace ODDGames.Html2Uxml
         public static LinearGradient ParseLinear(string s)
         {
             if (string.IsNullOrWhiteSpace(s)) return null;
+            s = NormalizeQuotedString(s);
             var open = s.IndexOf('(');
             var close = s.LastIndexOf(')');
             if (open < 0 || close <= open) return null;
@@ -95,6 +96,7 @@ namespace ODDGames.Html2Uxml
         public static RadialGradient ParseRadial(string s)
         {
             if (string.IsNullOrWhiteSpace(s)) return null;
+            s = NormalizeQuotedString(s);
             var open = s.IndexOf('(');
             var close = s.LastIndexOf(')');
             if (open < 0 || close <= open) return null;
@@ -135,6 +137,18 @@ namespace ODDGames.Html2Uxml
                 grad.Stops.Add(stop);
             }
             return grad.IsValid ? grad : null;
+        }
+
+        static string NormalizeQuotedString(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return string.Empty;
+            value = value.Trim();
+            if (value.Length >= 2
+                && ((value[0] == '"' && value[value.Length - 1] == '"')
+                    || (value[0] == '\'' && value[value.Length - 1] == '\'')))
+                return value.Substring(1, value.Length - 2);
+            return value;
         }
 
         static void ParseRadialShape(string s, RadialGradient grad)

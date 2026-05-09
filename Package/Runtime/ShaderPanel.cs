@@ -25,7 +25,7 @@ namespace ODDGames.Html2Uxml
                 DisposeInstancedMaterial();
                 _material = value;
                 style.unityMaterial = value;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
             }
         }
 
@@ -51,7 +51,7 @@ namespace ODDGames.Html2Uxml
                 if (_texture == value)
                     return;
                 _texture = value;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
             }
         }
 
@@ -64,7 +64,7 @@ namespace ODDGames.Html2Uxml
                 if (_tint == value)
                     return;
                 _tint = value;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
             }
         }
 
@@ -72,7 +72,9 @@ namespace ODDGames.Html2Uxml
         {
             pickingMode = PickingMode.Ignore;
             generateVisualContent += OnGenerateVisualContent;
-            RegisterCallback<CustomStyleResolvedEvent>(_ => MarkDirtyRepaint());
+            // CustomStyleResolvedEvent dispatch already increments the version,
+            // and an explicit MarkDirtyRepaint here throws "cannot change render
+            // data during visual tree rendering" inside UI Builder previews.
             RegisterCallback<DetachFromPanelEvent>(_ => DisposeInstancedMaterial());
         }
 
@@ -106,7 +108,7 @@ namespace ODDGames.Html2Uxml
             if (string.IsNullOrWhiteSpace(resourcePath))
             {
                 style.unityMaterial = null;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
                 return;
             }
 
@@ -116,7 +118,7 @@ namespace ODDGames.Html2Uxml
             {
                 Debug.LogWarning($"[html2uxml] Missing material resource {normalized}.");
                 style.unityMaterial = null;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
                 return;
             }
 
@@ -124,7 +126,7 @@ namespace ODDGames.Html2Uxml
             _instancedMaterial.hideFlags = HideFlags.HideAndDontSave;
             _material = _instancedMaterial;
             style.unityMaterial = _material;
-            MarkDirtyRepaint();
+            // MarkDirtyRepaint elided to avoid Unity 6 render-time mutation guard.
         }
 
         void DisposeInstancedMaterial()

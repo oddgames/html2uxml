@@ -46,13 +46,8 @@ namespace ODDGames.Html2Uxml
         static readonly CustomStyleProperty<string> MaskImage = new CustomStyleProperty<string>("--odd-mask-image");
         static readonly CustomStyleProperty<Color> MaskFadeColor = new CustomStyleProperty<Color>("--odd-mask-fade-color");
         static readonly CustomStyleProperty<string> ClipPolygon  = new CustomStyleProperty<string>("--odd-clip-polygon");
-        static readonly CustomStyleProperty<float>  RowGap        = new CustomStyleProperty<float>("--odd-row-gap");
-        static readonly CustomStyleProperty<float>  ColumnGap     = new CustomStyleProperty<float>("--odd-column-gap");
         static readonly CustomStyleProperty<string> VectorIcon    = new CustomStyleProperty<string>("--odd-vector-icon");
 
-        float _rowGap;
-        float _columnGap;
-        bool  _hasGap;
 
         Vector2 _shadowOffset;
         float   _shadowBlur;
@@ -87,8 +82,8 @@ namespace ODDGames.Html2Uxml
 
         public Html2UxmlPanel()
         {
+            this.AddManipulator(new Html2UxmlAnimationManipulator());
             RegisterCallback<CustomStyleResolvedEvent>(OnStylesResolved);
-            RegisterCallback<GeometryChangedEvent>(_ => ApplyGap());
             generateVisualContent += OnGenerateVisualContent;
         }
 
@@ -227,18 +222,17 @@ namespace ODDGames.Html2Uxml
                 RemoveMaskOverlay();
             }
 
-            float rg = 0f, cg = 0f;
-            bool gapAny = false;
-            if (style.TryGetValue(RowGap, out var rgv))    { rg = rgv; gapAny = true; }
-            if (style.TryGetValue(ColumnGap, out var cgv)) { cg = cgv; gapAny = true; }
-            _rowGap = rg;
-            _columnGap = cg;
-            _hasGap = gapAny;
-            ApplyGap();
+            // CSS gap / row-gap / column-gap is baked into per-child margins at
+            // conversion time (see html2uxml._static_gap_decls). No runtime
+            // mutation needed, which avoids "VisualElements cannot change render
+            // data ... during visual tree rendering" errors that fire when style
+            // writes land mid-render in UI Builder previews.
 
             _hasPaintWork = ComputeHasPaintWork();
-            if (_hasPaintWork || hadPaintWork)
-                MarkDirtyRepaint();
+            // No explicit MarkDirtyRepaint: Unity's CustomStyleResolvedEvent
+            // dispatch already increments the version, and calling it from a
+            // style/scheduler callback in Unity 6 throws "cannot change render
+            // data ... during visual tree rendering" inside UI Builder previews.
         }
 
         bool ComputeHasPaintWork()
@@ -253,52 +247,6 @@ namespace ODDGames.Html2Uxml
                 || (_clipOverlay == null && _clipPoints != null && _clipPoints.Length >= 3 && _clipCoverColor.a > 0.001f);
         }
 
-        void ApplyGap()
-        {
-            if (!_hasGap || childCount < 2) return;
-            // Style writes are unsafe during render/layout callbacks (preview
-            // editor surfaces this with InvalidOperationException). Defer to
-            // the next scheduler tick so we run outside any active visual
-            // tree update.
-            schedule.Execute(ApplyGapImmediate);
-        }
-
-        void ApplyGapImmediate()
-        {
-            if (!_hasGap || childCount < 2) return;
-            bool isColumn = resolvedStyle.flexDirection == FlexDirection.Column
-                         || resolvedStyle.flexDirection == FlexDirection.ColumnReverse;
-            bool isReverse = resolvedStyle.flexDirection == FlexDirection.RowReverse
-                          || resolvedStyle.flexDirection == FlexDirection.ColumnReverse;
-            float spacing = isColumn ? _rowGap : _columnGap;
-            int visualIndex = 0;
-            for (int i = 0; i < childCount; i++)
-            {
-                var c = ElementAt(i);
-                if (c == _gradientLayer || c == _insetShadowOverlay || c == _iconOverlay || c == _clipOverlay || c == _maskOverlay) continue;
-                c.style.marginTop = 0f;
-                c.style.marginBottom = 0f;
-                c.style.marginLeft = 0f;
-                c.style.marginRight = 0f;
-                if (visualIndex == 0)
-                {
-                    visualIndex++;
-                    continue;
-                }
-
-                if (isColumn)
-                {
-                    if (isReverse) c.style.marginBottom = spacing;
-                    else           c.style.marginTop = spacing;
-                }
-                else
-                {
-                    if (isReverse) c.style.marginRight = spacing;
-                    else           c.style.marginLeft = spacing;
-                }
-                visualIndex++;
-            }
-        }
 
         void EnsureMaskOverlay(string maskStr, Color fadeColor)
         {
@@ -625,8 +573,61 @@ namespace ODDGames.Html2Uxml
                 + Mathf.Max(Mathf.Abs(layer.Offset.x), Mathf.Abs(layer.Offset.y))
                 + layer.Blur);
             int steps = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(1f, thickness) * 0.5f), 1, 8);
-            bool horizontal = Mathf.Abs(layer.Offset.x) > 0.001f;
-            bool vertical = Mathf.Abs(layer.Offset.y) > 0.001f || !horizontal;
+            bool offsetH = Mathf.Abs(layer.Offset.x) > 0.001f;
+            bool offsetV = Mathf.Abs(layer.Offset.y) > 0.001f;
+            // 0/0 inset shadows render as a uniform ring (CSS draws an
+            // inward feather on every side). The previous behaviour of
+            // falling back to a single top strip produced a hard
+            // horizontal bar across small circular elements like
+            // border-radius:50% screws.
+            bool symmetric = !offsetH && !offsetV;
+            float outerRadius = resolvedStyle.borderTopLeftRadius;
+            // 0/0 inset shadows render as a uniform inner ring so the
+            // shadow follows the element's rounded corners. Painting four
+            // axis-aligned strips here would draw a square inside a
+            // circular border-radius element (e.g. screws), which leaks
+            // sharp corners through the rounded bound.
+            if (symmetric)
+            {
+                float halfMin = Mathf.Min(rect.width, rect.height) * 0.5f;
+                if (halfMin <= 0.5f) return;
+                // On very small elements (e.g. 4×4 screws) the ring
+                // consumes most of the disc when rasterized at element
+                // size, but Chrome paints at the scaled-up screen DPI
+                // so the 1px feather is barely visible. Skip when the
+                // ring would dominate the element.
+                if (halfMin < thickness * 3f) return;
+                // Cap thickness to leave a visible inner core (>= 1px).
+                // Without this, the inner rect collapses to 0×0,
+                // RoundedRectReverse clamps its radius to 0, and the
+                // NonZero subtraction degenerates into a fully filled
+                // circle — the "black dot" artifact.
+                float ringThickness = Mathf.Min(thickness, halfMin - 0.5f);
+                if (ringThickness <= 0f) return;
+                for (int i = steps; i >= 1; i--)
+                {
+                    float t = i / (float)steps;
+                    Color c = layer.Color;
+                    c.a = layer.Color.a * t * 0.8f;
+                    p.fillColor = c;
+                    float band = ringThickness * (1f - (i - 1f) / steps);
+                    Rect inner = new Rect(
+                        rect.xMin + band,
+                        rect.yMin + band,
+                        Mathf.Max(0f, rect.width - band * 2f),
+                        Mathf.Max(0f, rect.height - band * 2f));
+                    p.BeginPath();
+                    RoundedRect(p, rect, outerRadius);
+                    RoundedRectReverse(p, inner, Mathf.Max(0f, outerRadius - band));
+                    p.Fill(FillRule.NonZero);
+                }
+                return;
+            }
+
+            bool top = offsetV && layer.Offset.y >= 0f;
+            bool bottom = offsetV && layer.Offset.y < 0f;
+            bool left = offsetH && layer.Offset.x >= 0f;
+            bool right = offsetH && layer.Offset.x < 0f;
             for (int i = steps; i >= 1; i--)
             {
                 float t = i / (float)steps;
@@ -634,27 +635,23 @@ namespace ODDGames.Html2Uxml
                 c.a = layer.Color.a * t * 0.8f;
                 p.fillColor = c;
                 float band = thickness * (1f - (i - 1f) / steps);
-                if (vertical)
-                {
-                    var top = layer.Offset.y >= 0f;
-                    Rect strip = top
-                        ? new Rect(rect.xMin, rect.yMin, rect.width, band)
-                        : new Rect(rect.xMin, rect.yMax - band, rect.width, band);
-                    p.BeginPath();
-                    RoundedRect(p, strip, Mathf.Min(resolvedStyle.borderTopLeftRadius, band * 0.5f));
-                    p.Fill();
-                }
-                if (horizontal)
-                {
-                    var left = layer.Offset.x >= 0f;
-                    Rect strip = left
-                        ? new Rect(rect.xMin, rect.yMin, band, rect.height)
-                        : new Rect(rect.xMax - band, rect.yMin, band, rect.height);
-                    p.BeginPath();
-                    RoundedRect(p, strip, Mathf.Min(resolvedStyle.borderTopLeftRadius, band * 0.5f));
-                    p.Fill();
-                }
+                float r = Mathf.Min(outerRadius, band * 0.5f);
+                if (top)
+                    DrawInsetStrip(p, new Rect(rect.xMin, rect.yMin, rect.width, band), r);
+                if (bottom)
+                    DrawInsetStrip(p, new Rect(rect.xMin, rect.yMax - band, rect.width, band), r);
+                if (left)
+                    DrawInsetStrip(p, new Rect(rect.xMin, rect.yMin, band, rect.height), r);
+                if (right)
+                    DrawInsetStrip(p, new Rect(rect.xMax - band, rect.yMin, band, rect.height), r);
             }
+        }
+
+        void DrawInsetStrip(Painter2D p, Rect strip, float radius)
+        {
+            p.BeginPath();
+            RoundedRect(p, strip, radius);
+            p.Fill();
         }
 
         void PaintClippedInnerShadow(Painter2D p, Rect rect, ShadowLayer layer)
@@ -988,8 +985,6 @@ namespace ODDGames.Html2Uxml
         {
             if (radialGradient == null || !radialGradient.IsValid || rect.width <= 0f || rect.height <= 0f)
                 return;
-            const int Rings = 32;
-            const int Segments = 64;
             Vector2 center = new Vector2(
                 rect.xMin + rect.width * radialGradient.Center.x,
                 rect.yMin + rect.height * radialGradient.Center.y);
@@ -1032,39 +1027,137 @@ namespace ODDGames.Html2Uxml
             rx = Mathf.Max(0.001f, rx);
             ry = Mathf.Max(0.001f, ry);
 
-            int vertexCount = 1 + Rings * Segments;
-            int indexCount = Segments * 3 + (Rings - 1) * Segments * 6;
+            if (IsCircleLikePaintRect(rect))
+            {
+                PaintCircularClippedRadialGradient(ctx, rect, radialGradient, center, rx, ry);
+                return;
+            }
+
+            PaintRectClippedRadialGradient(ctx, rect, radialGradient, center, rx, ry);
+        }
+
+        static void PaintRectClippedRadialGradient(
+            MeshGenerationContext ctx,
+            Rect rect,
+            RadialGradient radialGradient,
+            Vector2 center,
+            float rx,
+            float ry)
+        {
+            int columns = Mathf.Clamp(Mathf.CeilToInt(rect.width / 24f), 8, 48);
+            int rows = Mathf.Clamp(Mathf.CeilToInt(rect.height / 24f), 8, 32);
+            int vertexCount = (columns + 1) * (rows + 1);
+            int indexCount = columns * rows * 6;
             var vertices = new Vertex[vertexCount];
             var indices = new ushort[indexCount];
-            vertices[0] = MakeVertex(center, SampleGradient(radialGradient, 0f));
-            int vi = 1;
-            for (int ring = 1; ring <= Rings; ring++)
+
+            int vi = 0;
+            for (int row = 0; row <= rows; row++)
             {
-                float t = ring / (float)Rings;
-                Color c = SampleGradient(radialGradient, t);
-                for (int s = 0; s < Segments; s++)
+                float v = row / (float)rows;
+                float y = Mathf.Lerp(rect.yMin, rect.yMax, v);
+                for (int col = 0; col <= columns; col++)
                 {
-                    float a = s / (float)Segments * Mathf.PI * 2f;
+                    float u = col / (float)columns;
+                    float x = Mathf.Lerp(rect.xMin, rect.xMax, u);
+                    var pt = new Vector2(x, y);
                     vertices[vi++] = MakeVertex(
-                        new Vector2(center.x + Mathf.Cos(a) * rx * t,
-                                    center.y + Mathf.Sin(a) * ry * t),
-                        c);
+                        pt,
+                        SampleRadialGradientAtPoint(pt, center, rx, ry, radialGradient));
                 }
             }
+
             int ii = 0;
-            for (int s = 0; s < Segments; s++)
+            for (int row = 0; row < rows; row++)
+            {
+                int rowStart = row * (columns + 1);
+                int nextRowStart = (row + 1) * (columns + 1);
+                for (int col = 0; col < columns; col++)
+                {
+                    int a = rowStart + col;
+                    int b = a + 1;
+                    int c = nextRowStart + col;
+                    int d = c + 1;
+                    indices[ii++] = (ushort)a;
+                    indices[ii++] = (ushort)c;
+                    indices[ii++] = (ushort)d;
+                    indices[ii++] = (ushort)d;
+                    indices[ii++] = (ushort)b;
+                    indices[ii++] = (ushort)a;
+                }
+            }
+
+            var data = ctx.Allocate(vertices.Length, indices.Length);
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(indices);
+        }
+
+        bool IsCircleLikePaintRect(Rect rect)
+        {
+            float min = Mathf.Min(rect.width, rect.height);
+            float max = Mathf.Max(rect.width, rect.height);
+            if (min <= 0f || max - min > Mathf.Max(1f, min * 0.08f))
+                return false;
+
+            float radius = Mathf.Min(
+                Mathf.Min(resolvedStyle.borderTopLeftRadius, resolvedStyle.borderTopRightRadius),
+                Mathf.Min(resolvedStyle.borderBottomRightRadius, resolvedStyle.borderBottomLeftRadius));
+            return radius >= min * 0.45f;
+        }
+
+        static void PaintCircularClippedRadialGradient(
+            MeshGenerationContext ctx,
+            Rect rect,
+            RadialGradient radialGradient,
+            Vector2 gradientCenter,
+            float rx,
+            float ry)
+        {
+            float circleRadius = Mathf.Min(rect.width, rect.height) * 0.5f;
+            if (circleRadius <= 0f)
+                return;
+
+            int segments = Mathf.Clamp(Mathf.CeilToInt(circleRadius * 8f), 20, 64);
+            int rings = Mathf.Clamp(Mathf.CeilToInt(circleRadius * 2f), 3, 12);
+            int vertexCount = 1 + rings * segments;
+            int indexCount = segments * 3 + (rings - 1) * segments * 6;
+            var vertices = new Vertex[vertexCount];
+            var indices = new ushort[indexCount];
+            Vector2 shapeCenter = rect.center;
+            vertices[0] = MakeVertex(
+                shapeCenter,
+                SampleRadialGradientAtPoint(shapeCenter, gradientCenter, rx, ry, radialGradient));
+
+            int vi = 1;
+            for (int ring = 1; ring <= rings; ring++)
+            {
+                float r = circleRadius * ring / rings;
+                for (int s = 0; s < segments; s++)
+                {
+                    float a = s / (float)segments * Mathf.PI * 2f;
+                    var pt = new Vector2(
+                        shapeCenter.x + Mathf.Cos(a) * r,
+                        shapeCenter.y + Mathf.Sin(a) * r);
+                    vertices[vi++] = MakeVertex(
+                        pt,
+                        SampleRadialGradientAtPoint(pt, gradientCenter, rx, ry, radialGradient));
+                }
+            }
+
+            int ii = 0;
+            for (int s = 0; s < segments; s++)
             {
                 indices[ii++] = 0;
                 indices[ii++] = (ushort)(1 + s);
-                indices[ii++] = (ushort)(1 + ((s + 1) % Segments));
+                indices[ii++] = (ushort)(1 + ((s + 1) % segments));
             }
-            for (int ring = 2; ring <= Rings; ring++)
+            for (int ring = 2; ring <= rings; ring++)
             {
-                int prev = 1 + (ring - 2) * Segments;
-                int curr = 1 + (ring - 1) * Segments;
-                for (int s = 0; s < Segments; s++)
+                int prev = 1 + (ring - 2) * segments;
+                int curr = 1 + (ring - 1) * segments;
+                for (int s = 0; s < segments; s++)
                 {
-                    int sn = (s + 1) % Segments;
+                    int sn = (s + 1) % segments;
                     indices[ii++] = (ushort)(prev + s);
                     indices[ii++] = (ushort)(curr + s);
                     indices[ii++] = (ushort)(curr + sn);
@@ -1079,6 +1172,18 @@ namespace ODDGames.Html2Uxml
             data.SetAllIndices(indices);
         }
 
+        static Color SampleRadialGradientAtPoint(
+            Vector2 point,
+            Vector2 center,
+            float rx,
+            float ry,
+            RadialGradient radialGradient)
+        {
+            float dx = (point.x - center.x) / Mathf.Max(0.001f, rx);
+            float dy = (point.y - center.y) / Mathf.Max(0.001f, ry);
+            return SampleGradient(radialGradient, Mathf.Sqrt(dx * dx + dy * dy));
+        }
+
         void PaintTiledRadialPattern(MeshGenerationContext ctx, Rect rect)
         {
             if (_tiledRadialPattern == null || _tiledRadialPattern.Color.a <= 0f)
@@ -1086,9 +1191,17 @@ namespace ODDGames.Html2Uxml
 
             float tileW = Mathf.Max(1f, _patternSize.x);
             float tileH = Mathf.Max(1f, _patternSize.y);
-            float radius = Mathf.Max(0.25f, _tiledRadialPattern.RadiusPx);
+            // CSS radial-dot textures such as
+            // radial-gradient(rgba(...) 1px, transparent 1px) are antialiased
+            // circular image tiles in the browser. A full 2r square quad reads
+            // much larger/heavier in UI Toolkit, so draw a small radial fan
+            // with a transparent edge instead.
+            float radius = Mathf.Max(0.25f, _tiledRadialPattern.RadiusPx * 0.85f);
             float centerX = tileW * _tiledRadialPattern.Center.x;
             float centerY = tileH * _tiledRadialPattern.Center.y;
+            const int DotSegments = 6;
+            int verticesPerDot = DotSegments + 1;
+            int indicesPerDot = DotSegments * 3;
 
             int columns = Mathf.CeilToInt(rect.width / tileW) + 3;
             int rows = Mathf.CeilToInt(rect.height / tileH) + 3;
@@ -1114,15 +1227,17 @@ namespace ODDGames.Html2Uxml
                     dotCount++;
                 }
             }
-            if (dotCount <= 0 || dotCount > 16000)
+            if (dotCount <= 0 || dotCount * verticesPerDot > 65000)
                 return;
 
-            var data = ctx.Allocate(dotCount * 4, dotCount * 6);
-            var vertices = new Vertex[dotCount * 4];
-            var indices = new ushort[dotCount * 6];
+            var data = ctx.Allocate(dotCount * verticesPerDot, dotCount * indicesPerDot);
+            var vertices = new Vertex[dotCount * verticesPerDot];
+            var indices = new ushort[dotCount * indicesPerDot];
             int vi = 0;
             int ii = 0;
             Color color = _tiledRadialPattern.Color;
+            Color edgeColor = color;
+            edgeColor.a = 0f;
             for (int row = 0; row < rows; row++)
             {
                 float y = firstY + row * tileH;
@@ -1133,18 +1248,23 @@ namespace ODDGames.Html2Uxml
                     float x = firstX + col * tileW;
                     if (x < rect.xMin - radius || x > rect.xMax + radius)
                         continue;
-                    vertices[vi + 0] = MakeVertex(new Vector2(x - radius, y - radius), color);
-                    vertices[vi + 1] = MakeVertex(new Vector2(x + radius, y - radius), color);
-                    vertices[vi + 2] = MakeVertex(new Vector2(x + radius, y + radius), color);
-                    vertices[vi + 3] = MakeVertex(new Vector2(x - radius, y + radius), color);
-                    indices[ii + 0] = (ushort)(vi + 0);
-                    indices[ii + 1] = (ushort)(vi + 1);
-                    indices[ii + 2] = (ushort)(vi + 2);
-                    indices[ii + 3] = (ushort)(vi + 2);
-                    indices[ii + 4] = (ushort)(vi + 3);
-                    indices[ii + 5] = (ushort)(vi + 0);
-                    vi += 4;
-                    ii += 6;
+                    int centerIndex = vi;
+                    vertices[vi++] = MakeVertex(new Vector2(x, y), color);
+                    for (int s = 0; s < DotSegments; s++)
+                    {
+                        float angle = (s / (float)DotSegments) * Mathf.PI * 2f;
+                        vertices[vi++] = MakeVertex(
+                            new Vector2(
+                                x + Mathf.Cos(angle) * radius,
+                                y + Mathf.Sin(angle) * radius),
+                            edgeColor);
+                    }
+                    for (int s = 0; s < DotSegments; s++)
+                    {
+                        indices[ii++] = (ushort)centerIndex;
+                        indices[ii++] = (ushort)(centerIndex + 1 + s);
+                        indices[ii++] = (ushort)(centerIndex + 1 + ((s + 1) % DotSegments));
+                    }
                 }
             }
             data.SetAllVertices(vertices);
@@ -1483,7 +1603,10 @@ namespace ODDGames.Html2Uxml
                 _fallbackColor = fallbackColor;
                 _radius = Mathf.Max(0f, radius);
                 _clipPoints = clipPoints;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided: caller dispatches us from a style
+                // or attach path; Unity's own version bump covers the repaint
+                // and an explicit call here would throw "cannot change render
+                // data during visual tree rendering" inside UI Builder previews.
                 return true;
             }
 
@@ -1774,7 +1897,10 @@ namespace ODDGames.Html2Uxml
             {
                 _points = points;
                 _coverColor = coverColor;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided: caller dispatches us from a style
+                // or attach path; Unity's own version bump covers the repaint
+                // and an explicit call here would throw "cannot change render
+                // data during visual tree rendering" inside UI Builder previews.
             }
 
             void OnGenerateVisualContent(MeshGenerationContext ctx)
@@ -1834,7 +1960,10 @@ namespace ODDGames.Html2Uxml
             {
                 _layers = layers ?? new List<ShadowLayer>();
                 _radius = Mathf.Max(0f, radius);
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided: caller dispatches us from a style
+                // or attach path; Unity's own version bump covers the repaint
+                // and an explicit call here would throw "cannot change render
+                // data during visual tree rendering" inside UI Builder previews.
             }
 
             void OnGenerateVisualContent(MeshGenerationContext ctx)
@@ -1923,7 +2052,10 @@ namespace ODDGames.Html2Uxml
             {
                 _icon = icon;
                 _color = color.a > 0.001f ? color : Color.black;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided: caller dispatches us from a style
+                // or attach path; Unity's own version bump covers the repaint
+                // and an explicit call here would throw "cannot change render
+                // data during visual tree rendering" inside UI Builder previews.
             }
 
             void OnGenerateVisualContent(MeshGenerationContext ctx)
@@ -1985,7 +2117,10 @@ namespace ODDGames.Html2Uxml
             {
                 _mask = MaskGradientParser.Parse(maskStr);
                 _fadeColor = fadeColor;
-                MarkDirtyRepaint();
+                // MarkDirtyRepaint elided: caller dispatches us from a style
+                // or attach path; Unity's own version bump covers the repaint
+                // and an explicit call here would throw "cannot change render
+                // data during visual tree rendering" inside UI Builder previews.
             }
 
             void OnGenerateVisualContent(MeshGenerationContext ctx)

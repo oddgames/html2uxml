@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import colorsys
+import math
 from dataclasses import dataclass
 
 
@@ -116,7 +117,9 @@ def map_input(attrs: dict) -> tuple[str, dict, str | None]:
     if t in ("button", "submit", "reset"):
         return "ui:Button", {}, None
     if t == "color":
-        return "ui:ColorField", {}, None
+        # ColorField is editor-only in Unity. Runtime UI should still expose a
+        # queryable field, so keep the raw value in a TextField.
+        return "ui:TextField", ({"value": value} if value else {}), None
     if t == "date":
         return "ui:TextField", ({"value": value} if value else {}), None
     if t == "file":
@@ -150,7 +153,7 @@ SKIP_VALUES = {"unset", "initial", "inherit", "revert", "revert-layer"}
 
 # CSS properties that USS does not support and we drop with a warning.
 DROP_PROPS = {
-    "mask", "mask-type", "animation", "appearance",
+    "mask", "mask-type", "appearance",
     "float", "clear", "box-sizing", "user-select",
     "perspective", "perspective-origin", "transform-style",
     "backface-visibility", "mix-blend-mode", "background-blend-mode",
@@ -302,6 +305,8 @@ def map_declarations(decls: list[tuple[str, str]]) -> MapResult:
         seen[k] = val
     if "--odd-clip-polygon" in seen and "background-color" in seen:
         seen["--odd-background-color"] = seen.pop("background-color")
+    _drop_inert_unity_slices(seen, normalized_decls)
+    _apply_content_box_sizing(seen, normalized_decls)
     final = list(seen.items())
     return MapResult(decls=final, warnings=warnings)
 
@@ -859,6 +864,10 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop in ("text-decoration", "text-transform"):
         # These are consumed while emitting text nodes, not written as USS.
         return None
+    if prop == "animation" or prop.startswith("animation-"):
+        # CSS keyframes are converted by converter.py into --odd-animation-*
+        # props after @keyframes have been parsed. Keep this mapper quiet.
+        return []
     if prop == "z-index":
         # Consumed by the converter as a static sibling paint-order sort.
         # Unity has no z-index property to emit.
@@ -953,10 +962,10 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop == "background":
         return _map_background_layers(value, warnings)
     if prop == "background-image":
-        grad = _find_gradient(value)
-        if grad:
-            return _map_gradient(grad[2], warnings)
-        return [("background-image", value)]
+        # Computed-style background-image often comes through as multiple
+        # comma-separated layers (e.g. `radial-gradient(...), radial-gradient(...), none`).
+        # Route through the multi-layer bridge so all gradients survive.
+        return _map_background_layers(value, warnings)
     if prop == "background-color":
         return [("background-color", value)]
 
@@ -1029,18 +1038,12 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     if prop == "transform":
         return _split_transform(value, warnings)
 
-    # gap / row-gap / column-gap: USS doesn't support these. Bridge them by
-    # emitting --odd-row-gap / --odd-column-gap so Html2UxmlPanel can apply margin
-    # to direct children at runtime based on the parent's flex-direction.
-    if prop == "gap":
-        parts = value.split()
-        rg = _strip_unit(parts[0])
-        cg = _strip_unit(parts[1] if len(parts) > 1 else parts[0])
-        return [("--odd-row-gap", rg), ("--odd-column-gap", cg)]
-    if prop == "row-gap":
-        return [("--odd-row-gap", _strip_unit(value))]
-    if prop == "column-gap":
-        return [("--odd-column-gap", _strip_unit(value))]
+    # gap / row-gap / column-gap: USS doesn't support these natively, and the
+    # converter bakes them into per-child margins at conversion time via
+    # _static_gap_decls. The properties themselves are dropped from output;
+    # _flex_row_gap_px / _flex_column_gap_px read from the resolved style.
+    if prop in ("gap", "row-gap", "column-gap"):
+        return []
 
     # inset shorthand -> top/right/bottom/left.
     if prop == "inset":
@@ -1204,6 +1207,14 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         "transform-origin",
     }
     if prop in pass_through:
+        # USS treats background-repeat as a single enum, not a comma list,
+        # even though CSS allows `repeat, repeat, repeat` for multi-layer
+        # backgrounds. Collapse to the first non-empty token so Unity's
+        # style parser doesn't bail with
+        # "Trying to read value of type Enum while reading a value of type CommaSeparator".
+        if prop == "background-repeat" and "," in value:
+            first = value.split(",", 1)[0].strip()
+            value = first or "no-repeat"
         return [(prop, value)]
     # Pass-through CSS variables (USS supports `--var: value;` and `var()`).
     if prop.startswith("--"):
@@ -1388,7 +1399,42 @@ def _split_transform(value: str, warnings: list[str]) -> list[tuple[str, str]] |
             scale_y = parts[0]
             has_scale = True
             force_scale_pair = True
-        elif fn in ("rotatex", "rotatey", "translatez", "matrix",
+        elif fn == "matrix":
+            matrix = _parse_transform_matrix(parts)
+            if matrix is None:
+                warnings.append("transform function matrix() not supported in USS, ignored")
+                continue
+            a, b, c, d, e, f = matrix
+            if not _near_zero(e) or not _near_zero(f):
+                out_translate[0] = _format_matrix_px(e)
+                out_translate[1] = _format_matrix_px(f)
+                has_translate = True
+
+            sx = math.hypot(a, b)
+            sy = math.hypot(c, d)
+            shear = a * c + b * d
+            if sx > 0.00001 and sy > 0.00001 and abs(shear) <= 0.0001:
+                angle = math.degrees(math.atan2(b, a))
+                if not _near_zero(angle):
+                    out_rotate = _format_matrix_degrees(angle)
+                # Negative-determinant matrices include reflection. USS can
+                # represent the common axis-aligned case as negative scale;
+                # otherwise keep the position correction and warn.
+                det = a * d - b * c
+                if det < 0 and not (_near_zero(b) and _near_zero(c)):
+                    warnings.append("transform matrix() reflection/skew approximated; translate preserved")
+                else:
+                    if _near_zero(b) and _near_zero(c):
+                        sx = a
+                        sy = d
+                    if not _near(sx, 1.0) or not _near(sy, 1.0):
+                        scale_x = _format_matrix_scalar(sx)
+                        scale_y = _format_matrix_scalar(sy)
+                        has_scale = True
+                        force_scale_pair = not _near(sx, sy)
+            elif not (_near(a, 1.0) and _near_zero(b) and _near_zero(c) and _near(d, 1.0)):
+                warnings.append("transform matrix() with skew could not be represented in USS; translate preserved")
+        elif fn in ("rotatex", "rotatey", "translatez",
                     "skew", "skewx", "skewy", "perspective", "matrix3d"):
             warnings.append(f"transform function {fn}() not supported in USS, ignored")
     pairs: list[tuple[str, str]] = []
@@ -1402,6 +1448,176 @@ def _split_transform(value: str, warnings: list[str]) -> list[tuple[str, str]] |
         else:
             pairs.append(("scale", f"{scale_x} {scale_y}"))
     return pairs or None
+
+
+def _parse_transform_matrix(parts: list[str]) -> tuple[float, float, float, float, float, float] | None:
+    if len(parts) != 6:
+        return None
+    parsed: list[float] = []
+    for part in parts:
+        raw = part.strip().lower()
+        if raw.endswith("px"):
+            raw = raw[:-2].strip()
+        try:
+            parsed.append(float(raw))
+        except ValueError:
+            return None
+    return tuple(parsed)  # type: ignore[return-value]
+
+
+def _near(a: float, b: float) -> bool:
+    return abs(a - b) <= 0.0001
+
+
+def _near_zero(value: float) -> bool:
+    return abs(value) <= 0.0001
+
+
+def _format_matrix_scalar(value: float) -> str:
+    if _near_zero(value):
+        value = 0.0
+    return f"{value:g}"
+
+
+def _format_matrix_px(value: float) -> str:
+    if _near_zero(value):
+        value = 0.0
+    return f"{value:g}px"
+
+
+def _format_matrix_degrees(value: float) -> str:
+    if _near_zero(value):
+        value = 0.0
+    return f"{value:g}deg"
+
+
+def _apply_content_box_sizing(
+    seen: dict[str, str],
+    normalized_decls: list[tuple[str, str]],
+) -> None:
+    """Convert CSS content-box dimensions to Yoga/USS border-box dimensions.
+
+    Browsers treat `width`/`height` as the content box unless `box-sizing:
+    border-box` is set. UI Toolkit has no `box-sizing` and lays padding/border
+    inside the assigned width/height, so content-box elements need their fixed
+    pixel sizes inflated by their horizontal/vertical padding and borders.
+    """
+    box_sizing = None
+    for prop, value in normalized_decls:
+        if prop == "box-sizing":
+            box_sizing = value.strip().lower()
+    if box_sizing == "border-box":
+        return
+
+    horizontal = (
+        _box_side_px(seen, "padding", "left")
+        + _box_side_px(seen, "padding", "right")
+        + _box_side_px(seen, "border-width", "left")
+        + _box_side_px(seen, "border-width", "right")
+    )
+    vertical = (
+        _box_side_px(seen, "padding", "top")
+        + _box_side_px(seen, "padding", "bottom")
+        + _box_side_px(seen, "border-width", "top")
+        + _box_side_px(seen, "border-width", "bottom")
+    )
+
+    if horizontal > 0:
+        _inflate_px_dimension(seen, "width", horizontal)
+    if vertical > 0:
+        _inflate_px_dimension(seen, "height", vertical)
+
+
+def _drop_inert_unity_slices(
+    seen: dict[str, str],
+    normalized_decls: list[tuple[str, str]],
+) -> None:
+    """Drop computed border-image defaults that would 9-slice normal images.
+
+    Chrome reports `border-image-slice: 100%` even when
+    `border-image-source` is `none`. Unity applies `-unity-slice-*` to the
+    element background image, so carrying that computed default through will
+    corrupt ordinary PNG/SVG backgrounds.
+    """
+    if not any(prop.startswith("-unity-slice-") for prop in seen):
+        return
+
+    has_border_image_source = False
+    for prop, value in normalized_decls:
+        p = prop.lower()
+        v = value.strip().lower()
+        if p == "border-image" and re.search(r"\b(url|resource)\s*\(", value, re.IGNORECASE):
+            has_border_image_source = True
+            break
+        if p == "border-image-source" and v not in ("", "none", "initial", "unset"):
+            if re.search(r"\b(url|resource)\s*\(", value, re.IGNORECASE):
+                has_border_image_source = True
+                break
+
+    if has_border_image_source:
+        return
+
+    for prop in (
+        "-unity-slice-top",
+        "-unity-slice-right",
+        "-unity-slice-bottom",
+        "-unity-slice-left",
+    ):
+        seen.pop(prop, None)
+
+
+def _inflate_px_dimension(seen: dict[str, str], prop: str, delta: float) -> None:
+    base = _length_px(seen.get(prop))
+    if base is None:
+        return
+    seen[prop] = _format_px(base + delta)
+
+
+def _box_side_px(seen: dict[str, str], family: str, side: str) -> float:
+    longhand_prop = f"border-{side}-width" if family == "border-width" else f"{family}-{side}"
+    longhand = seen.get(longhand_prop)
+    parsed = _length_px(longhand)
+    if parsed is not None:
+        return parsed
+
+    shorthand = seen.get(family)
+    if not shorthand:
+        return 0.0
+    expanded = _expand_box(shorthand)
+    if not expanded:
+        return _length_px(shorthand) or 0.0
+    top, right, bottom, left = expanded
+    value = {
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "left": left,
+    }[side]
+    return _length_px(value) or 0.0
+
+
+_PX_LENGTH_RE = re.compile(r"^(-?\d*\.?\d+)(?:px)?$")
+
+
+def _length_px(value: str | None) -> float | None:
+    if value is None:
+        return None
+    raw = value.strip().lower()
+    if raw in ("", "auto", "none", "normal"):
+        return None
+    m = _PX_LENGTH_RE.match(raw)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _format_px(value: float) -> str:
+    if _near_zero(value):
+        return "0"
+    return f"{value:g}px"
 
 
 _NATIVE_FILTER_FUNCS = {

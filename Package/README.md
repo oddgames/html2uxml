@@ -58,6 +58,21 @@ For local development, use a file dependency that points at this folder:
   - Native Unity 6.4 `filter` functions such as `blur(...)` pass through
     as USS. `brightness(...)` and `saturate(...)` use the package
     `ODDGamesColorAdjust` custom filter asset.
+- ODD runtime element types
+  - Converted UXML emits ODD subclasses for core UI Toolkit elements:
+    `Html2UxmlElement`, `Html2UxmlLabel`, `Html2UxmlButton`,
+    `Html2UxmlScrollView`, fields, toggles, dropdowns, foldouts, and
+    progress/group containers.
+  - `Html2UxmlElement` inherits the paint-capable panel path. Typed controls
+    install dormant manipulators for animation and lightweight paint hooks
+    without scanning the visual tree.
+- CSS animation bridge
+  - `@keyframes` and `animation` are bridged for `opacity`, `translate`,
+    `scale`, `rotate`, `color`, and `background-color`.
+  - The runtime uses one shared ticker for active animated elements. Elements
+    with no `--odd-animation-*` custom properties do not tick.
+  - The bridge is implemented as `Manipulator` classes attached by the ODD
+    element constructors, not as hidden overlay children.
 - `ODDGames.Html2Uxml.Html2UxmlButton`
   - Button subclass used when a converted `<button>` needs runtime bridge
     behavior such as flex `gap` while still being queryable as a normal
@@ -117,11 +132,16 @@ Converted UXML that uses bridged CSS emits:
 xmlns:odd="ODDGames.Html2Uxml"
 ```
 
-and uses `odd:Html2UxmlPanel` where runtime painting is required.
+and uses ODD element types. Complex static paint uses the paint-capable
+`Html2UxmlPanel` / `Html2UxmlElement` path; typed controls use manipulators
+for bridge behavior.
+Current converter output emits ODD element subclasses for all supported
+HTML/UI Toolkit element mappings, so generated UXML depends on this package
+even when a screen does not contain a gradient or shadow bridge.
 
 The package must compile before Unity imports those UXML files. If UI Builder
-shows `Unknown Type Html2UxmlPanel`, first clear any package compile errors,
-then reimport the UXML or reopen the project.
+shows `Unknown Type Html2Uxml...`, first clear any package compile errors, then
+reimport the UXML or reopen the project.
 
 ## Shared Backdrop Blur
 
