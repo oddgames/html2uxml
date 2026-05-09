@@ -1207,14 +1207,18 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
         "transform-origin",
     }
     if prop in pass_through:
-        # USS treats background-repeat as a single enum, not a comma list,
-        # even though CSS allows `repeat, repeat, repeat` for multi-layer
-        # backgrounds. Collapse to the first non-empty token so Unity's
-        # style parser doesn't bail with
-        # "Trying to read value of type Enum while reading a value of type CommaSeparator".
-        if prop == "background-repeat" and "," in value:
+        # USS doesn't accept comma-separated multi-layer values for
+        # background-{repeat,position,size}, even though CSS allows
+        # `repeat, repeat, repeat` for stacked backgrounds. Collapse to
+        # the first non-empty token. Unity's style parser otherwise
+        # bails with "Expected end of value but found ','" and drops
+        # every subsequent declaration in the rule (including our
+        # `--odd-*` gradient props), so leaving the comma in place
+        # silently wipes out gradient/shadow paint on the panel.
+        if (prop in ("background-repeat", "background-position", "background-size")
+                and "," in value):
             first = value.split(",", 1)[0].strip()
-            value = first or "no-repeat"
+            value = first or ("no-repeat" if prop == "background-repeat" else "0% 0%")
         return [(prop, value)]
     # Pass-through CSS variables (USS supports `--var: value;` and `var()`).
     if prop.startswith("--"):
