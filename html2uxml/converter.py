@@ -342,6 +342,7 @@ class _EmitState:
     # Used by _emit_node to know which elements need the matching class.
     tagged_tags: set = field(default_factory=set)
     _gen_counter: int = 0
+    _name_class_counts: dict[str, int] = field(default_factory=dict)
 
     def add_rule(self, selector: str, decls: list[tuple[str, str]]) -> None:
         if not decls:
@@ -352,15 +353,29 @@ class _EmitState:
             self.uss_rules[selector] = list(decls)
             self.uss_order.append(selector)
 
-    def gen_class(self) -> str:
+    def gen_class(self, name_hint: str | None = None) -> str:
+        # Prefer a slug derived from the element's effective name
+        # (`tap-to-ready-up`, `finals`, etc.) so the generated USS class
+        # is recognisable in the inspector. Fall back to a counter when
+        # no usable hint is provided.
+        slug = _slug_for_class(name_hint)
+        if slug:
+            base = f"h2u-{slug}"
+            count = self._name_class_counts.get(base, 0) + 1
+            self._name_class_counts[base] = count
+            return base if count == 1 else f"{base}-{count}"
         self._gen_counter += 1
         return f"h2u-{self._gen_counter}"
 
-    def class_for_generated_decls(self, decls: list[tuple[str, str]]) -> tuple[str, bool]:
+    def class_for_generated_decls(
+        self,
+        decls: list[tuple[str, str]],
+        name_hint: str | None = None,
+    ) -> tuple[str, bool]:
         key = _decl_cache_key(decls)
         if key in self.generated_class_cache:
             return self.generated_class_cache[key], False
-        cls = self.gen_class()
+        cls = self.gen_class(name_hint)
         self.generated_class_cache[key] = cls
         self.add_rule(f".{cls}", decls)
         return cls, True
@@ -1896,6 +1911,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         if tag_class not in classes:
             classes.insert(0, tag_class)
     style = resolved.get(id(node))
+    name_hint = _resolve_node_name_hint(node, forced_name)
     isolated_parent_opacity = _css_group_opacity_needs_isolation(node, style, resolved)
     own_text_raw = _text_raw_from_style(style)
     effective_text_raw = _merge_inherited_text_raw(inherited_text_raw or {}, own_text_raw)
@@ -1941,7 +1957,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             synthetic_attrs.extend(synth_decls)
             if real_decls:
                 _rewrite_data_uri_decls(real_decls, state, _data_uri_context_slug(node, parent))
-                own_class, created = state.class_for_generated_decls(real_decls)
+                own_class, created = state.class_for_generated_decls(real_decls, name_hint)
                 own_classes.append(own_class)
                 if created:
                     state.stats.inline_overrides += 1
@@ -1950,7 +1966,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
                         needs_bridge = True
                         state.stats.bridged_props[k] = state.stats.bridged_props.get(k, 0) + 1
     if isolated_parent_opacity is not None:
-        opacity_reset_class, created = state.class_for_generated_decls([("opacity", "1")])
+        opacity_reset_class, created = state.class_for_generated_decls([("opacity", "1")], name_hint)
         own_classes.append(opacity_reset_class)
         if created:
             state.stats.inline_overrides += 1
@@ -1959,7 +1975,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             "parent opacity was pushed to non-overlay children"
         )
     if extra_generated_decls:
-        own_class, created = state.class_for_generated_decls(extra_generated_decls)
+        own_class, created = state.class_for_generated_decls(extra_generated_decls, name_hint)
         own_classes.append(own_class)
         if created:
             state.stats.inline_overrides += 1
@@ -2006,7 +2022,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             if ratio is not None:
                 image_decls.append(("aspect-ratio", f"{ratio:g}"))
             _rewrite_data_uri_decls(image_decls, state, _data_uri_context_slug(node, parent))
-            image_class, created = state.class_for_generated_decls(image_decls)
+            image_class, created = state.class_for_generated_decls(image_decls, name_hint)
             own_classes.append(image_class)
             if created:
                 state.stats.inline_overrides += 1
@@ -2066,7 +2082,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             ("flex-direction", "row"),
             ("flex-wrap", "wrap"),
             ("align-items", "center"),
-        ])
+        ], name_hint)
         own_classes.append(inline_class)
         if created:
             state.stats.inline_overrides += 1
@@ -2081,7 +2097,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         )
         if label_decls:
             inline_label_decls = label_decls
-            inline_label_class, created = state.class_for_generated_decls(label_decls)
+            inline_label_class, created = state.class_for_generated_decls(label_decls, name_hint)
             if created:
                 state.stats.inline_overrides += 1
 
@@ -2094,7 +2110,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         label_decls = _inline_child_label_decls(style)
         if label_decls:
             inline_label_decls = label_decls
-            inline_label_class, created = state.class_for_generated_decls(label_decls)
+            inline_label_class, created = state.class_for_generated_decls(label_decls, name_hint)
             if created:
                 state.stats.inline_overrides += 1
 
@@ -2117,7 +2133,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         )
         if direct_text_decls:
             direct_text_label_decls = direct_text_decls
-            direct_text_label_class, created = state.class_for_generated_decls(direct_text_decls)
+            direct_text_label_class, created = state.class_for_generated_decls(direct_text_decls, name_hint)
             if created:
                 state.stats.inline_overrides += 1
 
@@ -2125,7 +2141,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     if vector_icon and uxml_tag == "odd:Html2UxmlPanel":
         icon_class, created = state.class_for_generated_decls([
             ("--odd-vector-icon", f'"{vector_icon}"'),
-        ])
+        ], name_hint)
         own_classes.append(icon_class)
         inner_children = []
         text_attr = None
@@ -2136,7 +2152,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
 
     compact_container_decls = _compact_text_container_decls(node, resolved, style)
     if compact_container_decls and uxml_tag in ("ui:VisualElement", "odd:Html2UxmlPanel", "ui:ScrollView"):
-        compact_class, created = state.class_for_generated_decls(compact_container_decls)
+        compact_class, created = state.class_for_generated_decls(compact_container_decls, name_hint)
         own_classes.append(compact_class)
         if created:
             state.stats.inline_overrides += 1
@@ -2191,13 +2207,13 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     )
     has_text_output = text_attr is not None or spaced_text_attr is not None
     if compact_label_decls and has_text_output and uxml_tag in ("ui:Label", "ui:VisualElement"):
-        compact_class, created = state.class_for_generated_decls(compact_label_decls)
+        compact_class, created = state.class_for_generated_decls(compact_label_decls, name_hint)
         own_classes.append(compact_class)
         if created:
             state.stats.inline_overrides += 1
     inherited_text_label_decls = _inherited_text_label_decls(effective_text_raw, own_text_raw)
     if inherited_text_label_decls and uxml_tag == "ui:Label" and text_attr:
-        inherited_text_label_class, created = state.class_for_generated_decls(inherited_text_label_decls)
+        inherited_text_label_class, created = state.class_for_generated_decls(inherited_text_label_decls, name_hint)
         own_classes.append(inherited_text_label_class)
         if created:
             state.stats.inline_overrides += 1
@@ -2649,6 +2665,52 @@ def _slugify_asset_label(value: str) -> str:
     value = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", value)
     slug = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
     return slug[:64].strip("-") or "svg"
+
+
+def _resolve_node_name_hint(node: Node, forced_name: str | None) -> str | None:
+    """Pick the best human name for a node *without* falling back to a
+    synthesized `h2u-N` class. Used to seed generated USS class names so
+    they read like `.h2u-tap-to-ready-up` instead of `.h2u-1`.
+    """
+    if forced_name:
+        return forced_name
+    name = (
+        node.attrs.get("data-h2u-name")
+        or node.attrs.get("id")
+        or node.attrs.get("name")
+    )
+    if not name:
+        for cls in node.classes():
+            if cls and not cls.startswith("h2u-") and not cls.startswith("__om-"):
+                name = cls
+                break
+    if not name:
+        text_slug = _slug_from_node_text(node)
+        if text_slug:
+            name = text_slug
+    if not name:
+        om = node.attrs.get("data-om-id")
+        if om:
+            name = _slug_from_om_id(om)
+    return name
+
+
+def _slug_for_class(name_hint: str | None) -> str | None:
+    """Sanitize an element name hint for use as a USS class suffix.
+
+    Returns None when the hint is empty or already a synthetic
+    `h2u-N` placeholder (in which case the caller should fall back
+    to the counter-based gen path).
+    """
+    if not name_hint:
+        return None
+    raw = name_hint.strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"h2u-\d+", raw):
+        return None
+    slug = _slugify_asset_label(raw)
+    return slug or None
 
 
 def _emit_synthetic_pseudo(

@@ -62,8 +62,8 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         self.assertNotIn('text="◉CHASE"', r.uxml)
         self.assertIn('<odd:Html2UxmlButton class="cam" name="cam">', r.uxml)
-        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="cam-icon(?: h2u-\d+)*" name="cam-icon" text="◉"')
-        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="cam-label(?: h2u-\d+)*" name="cam-label" text="CHASE"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="cam-icon(?: h2u-[\w-]+)*" name="cam-icon" text="◉"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="cam-label(?: h2u-[\w-]+)*" name="cam-label" text="CHASE"')
         self.assertIn('--odd-font-family: "Barlow Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
 
@@ -178,10 +178,10 @@ class ConvertBasicsTest(unittest.TestCase):
             "<style>.title { font-size: 20px; font-style: italic; }</style>"
             '<div class="title">Detroit <span class="accent">Lobby</span></div>'
         )
-        self.assertIn('class="title h2u-1"', r.uxml)
+        self.assertIn('class="title h2u-title"', r.uxml)
         self.assertIn("flex-direction: row", r.uss)
-        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="Detroit"')
-        self.assertRegex(r.uxml, r'class="accent(?: h2u-\d+)+\" name="accent" text="Lobby"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-[\w-]+" text="Detroit"')
+        self.assertRegex(r.uxml, r'class="accent(?: h2u-[\w-]+)+\" name="accent" text="Lobby"')
         self.assertIn("height: 24px", r.uss)
         self.assertIn("-unity-text-align: middle-left", r.uss)
 
@@ -192,7 +192,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "color: #ffbf13; text-shadow: 1px 1px 0 #000; }</style>"
             '<div class="title">TA<span>P</span></div>'
         )
-        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="TA"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-[\w-]+" text="TA"')
         self.assertIn('--odd-font-family: "Saira Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
         self.assertIn("font-size: 11px", r.uss)
@@ -206,8 +206,8 @@ class ConvertBasicsTest(unittest.TestCase):
             ".num { padding:2px 4px; }</style>"
             '<div class="time"><span class="num">02</span><span>:</span></div>'
         )
-        self.assertRegex(r.uxml, r'class="num(?: h2u-\d+)+\" name="num" text="02"')
-        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="(?:h2u-\d+ ?)+\" name="h2u-\d+" text=":"')
+        self.assertRegex(r.uxml, r'class="num(?: h2u-[\w-]+)+\" name="num" text="02"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="(?:h2u-[\w-]+ ?)+\" name="h2u-[\w-]+" text=":"')
         self.assertIn("min-height: 16px", r.uss)
         self.assertIn("-unity-text-align: middle-center", r.uss)
         self.assertIn("padding: 2px 4px", r.uss)
@@ -231,7 +231,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "color: #ffbf13; text-shadow: 1px 1px 0 #000; }"
             ".dot { width: 5px; height: 5px; background: #ffbf13; }",
         )
-        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-\d+" text="TAP TO READY UP"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="h2u-[\w-]+" text="TAP TO READY UP"')
         self.assertIn('--odd-font-family: "Saira Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
         self.assertIn("font-size: 11px", r.uss)
@@ -288,7 +288,7 @@ class ConvertBasicsTest(unittest.TestCase):
             ".ready { font-family: 'Saira Condensed', sans-serif; font-style: italic; "
             "font-weight: 800; font-size: 11px; letter-spacing: 1.5px; color: #ffbf13; }",
         )
-        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="(?:h2u-\d+ ?)+" name="(?:tap|h2u-\d+)" text="TAP"')
+        self.assertRegex(r.uxml, r'<odd:Html2UxmlLabel class="(?:h2u-[\w-]+ ?)+" name="(?:tap|h2u-[\w-]+)" text="TAP"')
         self.assertIn('--odd-font-family: "Saira Condensed"', r.uss)
         self.assertIn("--odd-font-weight: 800", r.uss)
         self.assertIn("letter-spacing: 1.5px", r.uss)
@@ -811,7 +811,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "letter-spacing: 0.9px; color: white; }"
             ".item { display: inline; }",
         )
-        self.assertRegex(r.uxml, r'class="item(?: h2u-\d+)+" name="item" text="RAYNES vs BLOOD"')
+        self.assertRegex(r.uxml, r'class="item(?: h2u-[\w-]+)+" name="item" text="RAYNES vs BLOOD"')
         self.assertIn("height: 15px", r.uss)
         self.assertIn("max-height: 15px", r.uss)
         self.assertIn("-unity-text-align: middle-left", r.uss)
@@ -890,7 +890,7 @@ class ConvertBasicsTest(unittest.TestCase):
 
     def test_img_uses_background_visual_element_for_unity_preview(self):
         r = convert('<img class="logo" src="mtd-logo.png" alt="MTD" />')
-        self.assertIn('<odd:Html2UxmlElement class="logo h2u-1" name="logo" tooltip="MTD"', r.uxml)
+        self.assertIn('<odd:Html2UxmlElement class="logo h2u-logo" name="logo" tooltip="MTD"', r.uxml)
         self.assertIn('background-image: url("mtd-logo.png")', r.uss)
         self.assertIn("-unity-background-scale-mode: scale-to-fit", r.uss)
 
@@ -1179,9 +1179,9 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         self.assertIn(".card {", r.uss)
         self.assertIn("padding: 8px", r.uss)
-        self.assertIn(".h2u-1", r.uss)
+        self.assertIn(".h2u-card", r.uss)
         self.assertIn("background-color: red", r.uss)
-        self.assertIn('class="card h2u-1"', r.uxml)
+        self.assertIn('class="card h2u-card"', r.uxml)
 
     def test_identical_generated_styles_reuse_h2u_class(self):
         r = convert(
@@ -1190,7 +1190,7 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         self.assertEqual(1, r.stats.inline_overrides)
         self.assertEqual(1, r.uss.count(".h2u-"))
-        self.assertEqual(2, r.uxml.count('class="h2u-1"'))
+        self.assertEqual(2, r.uxml.count('class="h2u-a"'))
 
     def test_pseudo_classes_pass_through_with_generated_class(self):
         html = (
@@ -1369,7 +1369,7 @@ class ConvertBasicsTest(unittest.TestCase):
             '--odd-box-shadows: "outset|0|0|18|0|rgba(255,204,0,0.8)"',
             r.uss,
         )
-        self.assertIn('class="card h2u-1"', r.uxml)
+        self.assertIn('class="card h2u-card"', r.uxml)
         self.assertIn("odd:Html2UxmlPanel", r.uxml)
 
     def test_unity_specific_properties_pass_through(self):
@@ -1439,7 +1439,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "<style>.item:nth-child(2) { color: red; }</style>"
             '<span class="item">a</span><span class="item">b</span>'
         )
-        self.assertIn(".h2u-1", r.uss)
+        self.assertIn(".h2u-item", r.uss)
         self.assertIn("color: red", r.uss)
         self.assertEqual(1, r.uxml.count("h2u-"))
         self.assertNotIn(":nth-child", r.uss)
@@ -1449,7 +1449,7 @@ class ConvertBasicsTest(unittest.TestCase):
             "<style>.item:not(.active) { color: red; }</style>"
             '<span class="item active">a</span><span class="item">b</span>'
         )
-        self.assertIn(".h2u-1", r.uss)
+        self.assertIn(".h2u-item", r.uss)
         self.assertIn("color: red", r.uss)
         self.assertEqual(1, r.uxml.count("h2u-"))
         self.assertNotIn(":not", r.uss)
@@ -2182,7 +2182,7 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         # USS does not support sibling combinators; matching declarations are
         # hoisted to a generated class on the statically matched element.
-        self.assertIn(".h2u-1", r.uss)
+        self.assertIn(".h2u-b", r.uss)
         self.assertIn("color: red", r.uss)
         self.assertNotIn(".a + .b", r.uss)
 
