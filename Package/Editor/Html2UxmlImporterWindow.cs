@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.TextCore.LowLevel;
 using UnityEngine.TextCore.Text;
 using Debug = UnityEngine.Debug;
 
@@ -707,7 +708,7 @@ namespace ODDGames.Html2Uxml.Editor
             Directory.CreateDirectory(target);
             foreach (var f in Directory.EnumerateFiles(source))
             {
-                if (HasAllowedExt(f))
+                if (ShouldCopyBundleFile(f))
                     File.Copy(f, Path.Combine(target, Path.GetFileName(f)), overwrite: true);
             }
             CopyTree(Path.Combine(source, "Fonts"), Path.Combine(target, "Fonts"));
@@ -725,11 +726,17 @@ namespace ODDGames.Html2Uxml.Editor
             Directory.CreateDirectory(target);
             foreach (var f in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
             {
-                if (!HasAllowedExt(f)) continue; // drop sidecar JSON / .meta / scratch
+                if (!ShouldCopyBundleFile(f)) continue; // drop scratch / .meta sidecars
                 string dest = Path.Combine(target, Path.GetRelativePath(source, f));
                 Directory.CreateDirectory(Path.GetDirectoryName(dest));
                 File.Copy(f, dest, overwrite: true);
             }
+        }
+
+        static bool ShouldCopyBundleFile(string path)
+        {
+            if (HasAllowedExt(path)) return true;
+            return string.Equals(Path.GetFileName(path), "html2uxml-fonts.json", StringComparison.OrdinalIgnoreCase);
         }
 
         static bool HasAllowedExt(string path)
@@ -890,33 +897,152 @@ namespace ODDGames.Html2Uxml.Editor
         static int BuildFontAssets(string fontsDir)
         {
             if (!Directory.Exists(fontsDir)) return 0;
-            AssetDatabase.Refresh();
+            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
 
             int count = 0;
             string root = Path.GetDirectoryName(Application.dataPath).Replace('\\', '/');
-            foreach (var ttf in Directory.EnumerateFiles(fontsDir, "*.ttf", SearchOption.TopDirectoryOnly))
+            foreach (var entry in EnumerateFontBuildEntries(fontsDir))
             {
-                string norm = ttf.Replace('\\', '/');
+                string norm = entry.fontPath.Replace('\\', '/');
                 if (!norm.StartsWith(root + "/", StringComparison.Ordinal)) continue;
                 string assetTtf = norm.Substring(root.Length + 1);
+                AssetDatabase.ImportAsset(assetTtf, ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
                 var font = AssetDatabase.LoadAssetAtPath<Font>(assetTtf);
                 if (font == null) continue;
-                string sdf = $"{Path.GetDirectoryName(assetTtf)}/{Path.GetFileNameWithoutExtension(assetTtf)} SDF.asset".Replace('\\', '/');
+
+                string sdfAbs = entry.assetPath.Replace('\\', '/');
+                if (!sdfAbs.StartsWith(root + "/", StringComparison.Ordinal)) continue;
+                string sdf = sdfAbs.Substring(root.Length + 1);
                 var existing = AssetDatabase.LoadAssetAtPath<FontAsset>(sdf);
                 if (existing != null)
                 {
-                    bool stale = existing.sourceFontFile == null || existing.material == null;
+                    bool stale = !IsUsableFontAsset(existing, font);
                     if (!stale) continue;
                     AssetDatabase.DeleteAsset(sdf);
                 }
-                var fa = FontAsset.CreateFontAsset(font);
+
+                var fa = FontAsset.CreateFontAsset(
+                    font, 90, 9, GlyphRenderMode.SDFAA, 1024, 1024, AtlasPopulationMode.Dynamic, true);
                 if (fa == null) continue;
-                fa.atlasPopulationMode = AtlasPopulationMode.Dynamic;
+                string chars = string.Concat(entry.characters ?? "", entry.defaultCharacters ?? "");
+                if (!string.IsNullOrEmpty(chars))
+                    fa.TryAddCharacters(UniqueChars(chars), out _);
+                var material = fa.material;
+                var atlases = fa.atlasTextures?.ToArray();
                 AssetDatabase.CreateAsset(fa, sdf);
+                AddFontAssetSubAssets(fa, material, atlases);
+                AssetDatabase.ImportAsset(sdf, ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
                 count++;
             }
             if (count > 0) AssetDatabase.SaveAssets();
             return count;
+        }
+
+        static bool IsUsableFontAsset(FontAsset asset, Font sourceFont)
+        {
+            if (asset == null || sourceFont == null) return false;
+            var serialized = new SerializedObject(asset);
+            var source = serialized.FindProperty("m_SourceFontFile");
+            if (source == null || source.objectReferenceValue != sourceFont) return false;
+
+            var material = serialized.FindProperty("m_Material");
+            if (material == null || material.objectReferenceValue == null) return false;
+
+            var atlases = serialized.FindProperty("m_AtlasTextures");
+            if (atlases == null || !atlases.isArray || atlases.arraySize == 0) return false;
+            if (atlases.GetArrayElementAtIndex(0).objectReferenceValue == null) return false;
+
+            bool hasMaterialSubAsset = false;
+            bool hasAtlasSubAsset = false;
+            string path = AssetDatabase.GetAssetPath(asset);
+            foreach (var subAsset in AssetDatabase.LoadAllAssetsAtPath(path))
+            {
+                if (subAsset is Material) hasMaterialSubAsset = true;
+                if (subAsset is Texture2D) hasAtlasSubAsset = true;
+            }
+            return hasMaterialSubAsset && hasAtlasSubAsset;
+        }
+
+        static void AddFontAssetSubAssets(FontAsset fontAsset, Material material, Texture2D[] atlases)
+        {
+            if (material != null && !AssetDatabase.Contains(material))
+            {
+                AssetDatabase.AddObjectToAsset(material, fontAsset);
+                EditorUtility.SetDirty(material);
+            }
+            if (atlases != null)
+            {
+                foreach (var atlas in atlases)
+                {
+                    if (atlas == null || AssetDatabase.Contains(atlas)) continue;
+                    AssetDatabase.AddObjectToAsset(atlas, fontAsset);
+                    EditorUtility.SetDirty(atlas);
+                }
+            }
+            EditorUtility.SetDirty(fontAsset);
+        }
+
+        struct FontBuildEntry
+        {
+            public string fontPath;
+            public string assetPath;
+            public string characters;
+            public string defaultCharacters;
+        }
+
+        [Serializable] class FontAssetManifest { public string defaultCharacters; public FontAssetManifestEntry[] fonts; }
+        [Serializable] class FontAssetManifestEntry { public string fontFile; public string fontAsset; public string atlasMode; public string characters; }
+
+        static IEnumerable<FontBuildEntry> EnumerateFontBuildEntries(string fontsDir)
+        {
+            string manifestPath = Path.Combine(fontsDir, "html2uxml-fonts.json");
+            if (File.Exists(manifestPath))
+            {
+                FontAssetManifest manifest = null;
+                try { manifest = JsonUtility.FromJson<FontAssetManifest>(File.ReadAllText(manifestPath)); }
+                catch (Exception e) { Debug.LogWarning($"[Html2Uxml] font manifest: {e.Message}"); }
+
+                if (manifest?.fonts != null)
+                {
+                    foreach (var entry in manifest.fonts)
+                    {
+                        if (entry == null || string.IsNullOrWhiteSpace(entry.fontFile)) continue;
+                        string fontFile = Path.GetFileName(entry.fontFile);
+                        string assetFile = string.IsNullOrWhiteSpace(entry.fontAsset)
+                            ? Path.GetFileNameWithoutExtension(fontFile) + " SDF.asset"
+                            : Path.GetFileName(entry.fontAsset);
+                        yield return new FontBuildEntry
+                        {
+                            fontPath = Path.Combine(fontsDir, fontFile),
+                            assetPath = Path.Combine(fontsDir, assetFile),
+                            characters = entry.characters,
+                            defaultCharacters = manifest.defaultCharacters,
+                        };
+                    }
+                    yield break;
+                }
+            }
+
+            foreach (var font in Directory.EnumerateFiles(fontsDir, "*.*", SearchOption.TopDirectoryOnly))
+            {
+                string ext = Path.GetExtension(font).ToLowerInvariant();
+                if (ext != ".ttf" && ext != ".otf") continue;
+                yield return new FontBuildEntry
+                {
+                    fontPath = font,
+                    assetPath = Path.Combine(Path.GetDirectoryName(font), Path.GetFileNameWithoutExtension(font) + " SDF.asset"),
+                };
+            }
+        }
+
+        static string UniqueChars(string text)
+        {
+            var seen = new HashSet<char>();
+            var output = new StringBuilder(text.Length);
+            foreach (char ch in text)
+                if (seen.Add(ch))
+                    output.Append(ch);
+            return output.ToString();
         }
 
         static int BuildTextGradients(string sourceDir, string targetDir)
