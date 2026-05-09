@@ -1891,6 +1891,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
                indent: int, *, parent: Node | None = None,
                li_index: int = 1,
                inherited_label_class: str | None = None,
+               inherited_label_decls: list[tuple[str, str]] | None = None,
                inherited_text_raw: dict[str, str] | None = None,
                extra_generated_decls: list[tuple[str, str]] | None = None,
                suppress_name: bool = False,
@@ -2166,6 +2167,16 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         own_classes.append(compact_class)
         if created:
             state.stats.inline_overrides += 1
+    spaced_wrapper_decls = _spaced_text_wrapper_container_decls(node, resolved, style, parent)
+    if spaced_wrapper_decls and uxml_tag in ("ui:VisualElement", "odd:Html2UxmlPanel", "ui:ScrollView"):
+        spaced_wrapper_class, created = state.class_for_generated_decls(
+            spaced_wrapper_decls,
+            name_hint,
+            cache=False,
+        )
+        own_classes.append(spaced_wrapper_class)
+        if created:
+            state.stats.inline_overrides += 1
 
     # <details>: extract <summary> text into the Foldout's text= and skip it.
     foldout_text: str | None = None
@@ -2209,10 +2220,22 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             state.stats.labels -= 1
         state.stats.elements += 1
 
+    spaced_container_decls = _spaced_text_container_decls(style, flatten_inline_text_attr)
+    if spaced_text_attr is not None and spaced_container_decls:
+        spaced_container_class, created = state.class_for_generated_decls(
+            spaced_container_decls,
+            name_hint,
+            cache=False,
+        )
+        own_classes.append(spaced_container_class)
+        if created:
+            state.stats.inline_overrides += 1
+
     compact_label_decls = (
         _compact_nowrap_label_decls(style)
         or _compact_explicit_line_height_label_decls(style)
         or _compact_small_display_label_decls(style)
+        or _compact_computed_height_label_decls(style)
         or _compact_inherited_display_label_decls(effective_text_raw, style)
     )
     has_text_output = text_attr is not None or spaced_text_attr is not None
@@ -2227,7 +2250,18 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         own_classes.append(inherited_text_label_class)
         if created:
             state.stats.inline_overrides += 1
-    if inherited_label_class and uxml_tag == "ui:Label" and text_attr:
+    if inherited_label_decls and uxml_tag == "ui:Label" and text_attr:
+        # Inline parent helpers normalize line boxes/alignment for generated
+        # child Labels, so they must land after the child's own generated rule.
+        inherited_override_class, created = state.class_for_generated_decls(
+            inherited_label_decls,
+            name_hint,
+            cache=False,
+        )
+        own_classes.append(inherited_override_class)
+        if created:
+            state.stats.inline_overrides += 1
+    elif inherited_label_class and uxml_tag == "ui:Label" and text_attr:
         own_classes.append(inherited_label_class)
 
     # Build attributes
@@ -2441,6 +2475,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
                 _emit_node(child, resolved, state, rule_bridge_flags, indent + 2,
                            parent=node, li_index=inner_li,
                            inherited_label_class=inline_label_class,
+                           inherited_label_decls=inline_label_decls,
                            inherited_text_raw=effective_text_raw,
                            extra_generated_decls=(child_extra_decls or None),
                            suppress_name=suppress_name,
@@ -3197,6 +3232,53 @@ def _compact_explicit_line_height_label_decls(style) -> list[tuple[str, str]]:
     return decls
 
 
+def _compact_computed_height_label_decls(style) -> list[tuple[str, str]]:
+    """Normalize tight text boxes from browser computed-style snapshots.
+
+    Browser-rendered DOM snapshots often inline both physical `height` and
+    logical `block-size` for single-line labels. That height is already the
+    source line box, so the converter must not replace it with its own compact
+    estimate. Unity still needs paragraph spacing cleared, otherwise glyphs in
+    tiny clipped HUD rows sit high inside the preserved browser box.
+    """
+    font_px = _resolved_font_px(style)
+    if font_px is None or font_px > 18:
+        return []
+    height = _resolved_value(style, "height")
+    block_size = _resolved_value(style, "block-size")
+    if not height or not block_size:
+        return []
+    if _css_length_px(height) is None or _css_length_px(block_size) is None:
+        return []
+    if abs((_css_length_px(height) or 0) - (_css_length_px(block_size) or 0)) > 0.01:
+        return []
+    if _has_nonzero_box_length(style, "padding", "padding-top", "padding-bottom"):
+        return []
+
+    overflow_values = [
+        (_resolved_value(style, prop) or "").strip().lower()
+        for prop in ("overflow", "overflow-x", "overflow-y", "overflow-block", "overflow-inline")
+    ]
+    text_overflow = (_resolved_value(style, "text-overflow") or "").strip().lower()
+    if text_overflow != "ellipsis" and not any(v in ("hidden", "clip") for v in overflow_values):
+        return []
+
+    has_display_trait = (
+        _style_is_italic(style)
+        or _resolved_value(style, "letter-spacing") is not None
+        or _resolved_value(style, "text-shadow") is not None
+        or _font_weight_is_bold(style)
+        or (_resolved_value(style, "text-transform") or "").lower() == "uppercase"
+    )
+    if not has_display_trait:
+        return []
+
+    return [
+        ("padding", "0"),
+        ("-unity-paragraph-spacing", "0"),
+    ]
+
+
 def _compact_inherited_display_label_decls(
     effective_text_raw: dict[str, str],
     style,
@@ -3394,6 +3476,70 @@ def _compact_text_container_decls(node: Node, resolved: dict[int, ResolvedStyle]
     return []
 
 
+def _spaced_text_wrapper_container_decls(
+    node: Node,
+    resolved: dict[int, ResolvedStyle],
+    style,
+    parent: Node | None,
+) -> list[tuple[str, str]]:
+    if style is None or parent is None:
+        return []
+    parent_style = resolved.get(id(parent))
+    if parent_style is None:
+        return []
+    parent_display = (_resolved_value(parent_style, "display") or "").strip().lower()
+    parent_dir = (_resolved_value(parent_style, "flex-direction") or "").strip().lower()
+    parent_align = (_resolved_value(parent_style, "align-items") or "").strip().lower()
+    if parent_display not in ("flex", "inline-flex") or parent_dir != "column" or parent_align != "center":
+        return []
+
+    width = _resolved_value(style, "width")
+    if _css_length_px(width) is None:
+        return []
+    if _has_nonzero_box_length(style, "padding", "padding-left", "padding-right"):
+        return []
+    if _has_visible_resolved_background(style):
+        return []
+    if _resolved_value(style, "border") or _resolved_value(style, "border-left") or _resolved_value(style, "border-right"):
+        return []
+
+    children = [c for c in node.children if not c.is_text]
+    if len(children) != 1:
+        return []
+    if any(c.is_text and (c.text or "").strip() for c in node.children):
+        return []
+    child = children[0]
+    if not (_has_only_text_children(child) or _has_only_inline_text(child)):
+        return []
+    child_style = resolved.get(id(child))
+    if child_style is None:
+        return []
+    child_display = (_resolved_value(child_style, "display") or "").strip().lower()
+    if child_display not in ("inline", "inline-block", "block"):
+        return []
+    text = _gather_inline_text(child)
+    effective_text_raw = _merge_inherited_text_raw(
+        _text_raw_from_style(style),
+        _text_raw_from_style(child_style),
+    )
+    if not _should_emit_spaced_text(text, effective_text_raw):
+        return []
+    return [("width", "auto")]
+
+
+def _has_visible_resolved_background(style) -> bool:
+    background = _resolved_value(style, "background")
+    if background and not _is_transparent_css_color(background):
+        return True
+    background_color = _resolved_value(style, "background-color")
+    if background_color and not _is_transparent_css_color(background_color):
+        return True
+    background_image = (_resolved_value(style, "background-image") or "").strip().lower()
+    if background_image and background_image not in ("none", "initial", "inherit", "unset"):
+        return True
+    return False
+
+
 def _is_compact_text_stack(node: Node, resolved: dict[int, ResolvedStyle]) -> bool:
     style = resolved.get(id(node))
     if style is None:
@@ -3488,6 +3634,25 @@ def _css_length_px(value: str | None) -> float | None:
     if unit in ("rem", "em"):
         return n * 16.0
     return n
+
+
+def _has_nonzero_box_length(style, *props: str) -> bool:
+    for prop in props:
+        raw = _resolved_value(style, prop)
+        if raw is None:
+            continue
+        parts = raw.strip().lower().split()
+        if not parts:
+            continue
+        for part in parts:
+            px = _css_length_px(part)
+            if px is None:
+                if part not in ("0", "0px", "auto", "normal", "none"):
+                    return True
+                continue
+            if abs(px) > 0.01:
+                return True
+    return False
 
 
 def _apply_text_transform(text: str, transform: str) -> str:
@@ -3803,6 +3968,26 @@ def _should_emit_spaced_text(text: str, effective_text_raw: dict[str, str]) -> b
     if font_px is None or font_px > 18:
         return False
     return _last_non_space_index(value) >= 0
+
+
+def _spaced_text_container_decls(
+    style: ResolvedStyle | None,
+    flattened_inline_text: bool,
+) -> list[tuple[str, str]]:
+    if style is None or not flattened_inline_text:
+        return []
+    width = _resolved_value(style, "width")
+    if not width or width.strip().lower() == "auto":
+        return []
+    if _css_length_px(width) is None:
+        return []
+    position = (_resolved_value(style, "position") or "").strip().lower()
+    if position in ("absolute", "fixed"):
+        return []
+    display = (_resolved_value(style, "display") or "").strip().lower()
+    if display not in ("block", "inline", "inline-block"):
+        return []
+    return [("width", "auto")]
 
 
 def _last_non_space_index(text: str) -> int:

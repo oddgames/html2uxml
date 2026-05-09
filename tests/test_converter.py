@@ -212,6 +212,17 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn("-unity-text-align: middle-center", r.uss)
         self.assertIn("padding: 2px 4px", r.uss)
 
+    def test_inline_child_alignment_helper_wins_after_child_text_align(self):
+        r = convert(
+            "<style>.time { display:flex; font-size:16px; line-height:1; }"
+            ".num { text-align:left; padding:2px 4px; }</style>"
+            '<div class="time"><span class="num">02</span></div>'
+        )
+        self.assertGreater(
+            r.uss.rfind("-unity-text-align: middle-center"),
+            r.uss.rfind("-unity-text-align: middle-left"),
+        )
+
     def test_line_height_display_label_gets_centered_line_box(self):
         r = convert(
             '<div class="score">6.812</div>',
@@ -272,6 +283,55 @@ class ConvertBasicsTest(unittest.TestCase):
         self.assertIn("margin-left: 8px", r.uss)
         self.assertIn('<odd:Html2UxmlElement class="dot"', r.uxml)
         self.assertNotIn('text="TAP TO READY UP"', r.uxml)
+
+    def test_flattened_spaced_text_wrapper_does_not_preserve_used_text_width(self):
+        r = convert(
+            '<button class="ready"><span class="dot"></span>'
+            '<span data-h2u-name="ready-text" '
+            'style="display:block;width:113px;inline-size:113px;height:17px">'
+            '<span>TAP TO READY UP</span></span></button>',
+            ".ready { display: flex; flex-direction: row; align-items: center; "
+            "column-gap: 8px; font-family: 'Saira Condensed', sans-serif; "
+            "font-style: italic; font-weight: 800; font-size: 11px; "
+            "letter-spacing: 3px; color: #ffbf13; }"
+            ".dot { width: 5px; height: 5px; border-radius: 999px; background: #ffbf13; }",
+        )
+        self.assertIn("margin-left: 8px", r.uss)
+        self.assertIn("width: 113px", r.uss)
+        self.assertGreater(r.uss.rfind("width: auto"), r.uss.rfind("width: 113px"))
+        self.assertNotIn('text="TAP TO READY UP"', r.uxml)
+
+    def test_centered_spaced_text_wrapper_uses_generated_intrinsic_width(self):
+        r = convert(
+            '<div class="countdown"><div class="label">'
+            '<span data-h2u-name="event-label">EVENT STARTS IN</span>'
+            '</div><div class="time">02 : 14</div></div>',
+            ".countdown { display: flex; flex-direction: column; align-items: center; }"
+            ".label { display: block; width: 79px; height: 13px; "
+            "background-image: none; background-color: rgba(0, 0, 0, 0); "
+            "font-family: 'Saira Condensed', sans-serif; font-style: italic; "
+            "font-weight: 800; font-size: 8px; letter-spacing: 2px; color: white; }"
+            ".label span { display: inline; }",
+        )
+        self.assertNotIn('text="EVENT STARTS IN"', r.uxml)
+        self.assertIn('class="label h2u-label"', r.uxml)
+        self.assertIn("width: 79px", r.uss)
+        self.assertIn(".h2u-label {\n    width: auto;\n}", r.uss)
+
+    def test_centered_spaced_text_wrapper_keeps_painted_width(self):
+        r = convert(
+            '<div class="countdown"><div class="label">'
+            '<span data-h2u-name="event-label">EVENT STARTS IN</span>'
+            '</div></div>',
+            ".countdown { display: flex; flex-direction: column; align-items: center; }"
+            ".label { display: block; width: 79px; height: 13px; background-color: #111; "
+            "font-family: 'Saira Condensed', sans-serif; font-style: italic; "
+            "font-weight: 800; font-size: 8px; letter-spacing: 2px; color: white; }"
+            ".label span { display: inline; }",
+        )
+        self.assertIn('class="label"', r.uxml)
+        self.assertNotIn('class="label h2u-label"', r.uxml)
+        self.assertNotIn(".h2u-label {\n    width: auto;\n}", r.uss)
 
     def test_static_flex_gap_bakes_child_margin_without_panel_promotion(self):
         r = convert(
@@ -857,6 +917,19 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         self.assertIn("height: 14px", r.uss)
         self.assertNotIn("max-height: 10px", r.uss)
+        self.assertNotIn("-unity-paragraph-spacing: 0", r.uss)
+
+    def test_computed_height_display_label_clears_paragraph_spacing(self):
+        r = convert(
+            '<div class="name" style="display:block; width:71.3304px; height:11.3661px; '
+            'inline-size:71.3304px; block-size:11.3661px; font-size:9px; '
+            'font-style:italic; font-weight:900; letter-spacing:0.6px; '
+            'overflow-x:hidden; overflow-y:hidden; text-overflow:ellipsis; '
+            'text-align:start; padding-top:0px; padding-bottom:0px;">GREAT CLIPS MW</div>'
+        )
+        self.assertIn("height: 11.3661px", r.uss)
+        self.assertIn("-unity-paragraph-spacing: 0", r.uss)
+        self.assertNotIn("max-height: 12px", r.uss)
 
     def test_midsize_nameplate_label_gets_compact_line_box(self):
         # Nameplate-sized 16px label with the explicit single-line
