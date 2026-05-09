@@ -1408,6 +1408,72 @@ _INTERACTIVE_TAGS = {
     "option", "label",
 }
 
+_FORM_CONTROL_LABEL_ATTR = "data-h2u-control-label"
+_FORM_CONTROL_LABEL_SKIP_ATTR = "data-h2u-skip-control-label"
+
+
+def _input_type(node: Node) -> str:
+    return (node.attrs.get("type") or "text").strip().lower()
+
+
+def _is_checkable_input(node: Node) -> bool:
+    return not node.is_text and node.tag == "input" and _input_type(node) in ("checkbox", "radio")
+
+
+def _is_range_input(node: Node) -> bool:
+    return not node.is_text and node.tag == "input" and _input_type(node) == "range"
+
+
+def _associated_label_index(children: list[Node], input_index: int) -> int | None:
+    node = children[input_index]
+    input_id = node.attrs.get("id", "")
+    for idx in range(input_index + 1, len(children)):
+        child = children[idx]
+        if child.is_text:
+            if (child.text or "").strip():
+                return None
+            continue
+        if child.tag == "label":
+            label_for = child.attrs.get("for", "")
+            if input_id and label_for and label_for != input_id:
+                return None
+            return idx
+        return None
+    return None
+
+
+def _prepare_form_control_labels(children: list[Node]) -> bool:
+    """Attach immediate <label for=...> text to check/radio controls.
+
+    Browsers keep checkable inputs and their following labels in the same inline
+    formatting context. Unity Toggle/RadioButton already expose a text slot, so
+    using it gives a closer layout and click target than emitting a separate
+    sibling Label in UI Toolkit's default column flow.
+    """
+    found_checkable = False
+    for idx, child in enumerate(children):
+        if not _is_checkable_input(child):
+            continue
+        found_checkable = True
+        label_idx = _associated_label_index(children, idx)
+        if label_idx is None:
+            continue
+        label = children[label_idx]
+        text = _gather_inline_text(label)
+        if not text:
+            continue
+        child.attrs[_FORM_CONTROL_LABEL_ATTR] = text
+        label.attrs[_FORM_CONTROL_LABEL_SKIP_ATTR] = "1"
+    return found_checkable
+
+
+def _is_skipped_form_control_label(node: Node) -> bool:
+    return (
+        not node.is_text
+        and node.tag == "label"
+        and node.attrs.get(_FORM_CONTROL_LABEL_SKIP_ATTR) == "1"
+    )
+
 
 def _z_index_overlay_clones(
     parent: Node,
@@ -2035,6 +2101,14 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         uxml_tag = "ui:VisualElement"
         text_mode = None
 
+    if (
+        uxml_tag == "ui:Label"
+        and text_mode == "text"
+        and _inline_text_needs_child_elements(node, resolved)
+    ):
+        uxml_tag = "ui:VisualElement"
+        text_mode = "label"
+
     if uxml_tag == "ui:Button" and _style_has_nonzero_flex_gap(style):
         uxml_tag = "odd:Html2UxmlButton"
         state.used_bridge = True
@@ -2083,6 +2157,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     # Text handling.
     text_attr = None
     inner_children = [] if node.tag in SKIP_TAGS else list(node.children)
+    inline_form_controls = _prepare_form_control_labels(inner_children)
 
     # Prefer a single Label for text-only wrappers. This preserves class-based
     # typography rules on the element itself instead of creating a styled
@@ -2164,6 +2239,11 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
 
     direct_text_label_class: str | None = inline_label_class
     direct_text_label_decls: list[tuple[str, str]] = inline_label_decls
+    preserve_inline_whitespace = (
+        text_mode == "label"
+        and uxml_tag in ("ui:VisualElement", "odd:Html2UxmlPanel", "ui:ScrollView")
+        and _has_inline_text_run(node)
+    )
     if (
         uxml_tag in ("ui:VisualElement", "odd:Html2UxmlPanel", "ui:ScrollView", "ui:Button", "odd:Html2UxmlButton")
         and any(c.is_text and (c.text or "").strip() for c in inner_children)
@@ -2213,6 +2293,25 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     if normal_flow_decls:
         normal_flow_class, created = state.class_for_generated_decls(normal_flow_decls, name_hint)
         own_classes.append(normal_flow_class)
+        if created:
+            state.stats.inline_overrides += 1
+    if inline_form_controls and uxml_tag in ("ui:VisualElement", "odd:Html2UxmlPanel", "ui:ScrollView"):
+        form_controls_class, created = state.class_for_generated_decls([
+            ("display", "flex"),
+            ("flex-direction", "row"),
+            ("flex-wrap", "wrap"),
+            ("align-items", "center"),
+        ], name_hint)
+        own_classes.append(form_controls_class)
+        if created:
+            state.stats.inline_overrides += 1
+    if _is_range_input(node) and _inline_or_resolved_value(node, style, "width") is None:
+        range_default_class, created = state.class_for_generated_decls([
+            ("width", "180px"),
+            ("flex-grow", "0"),
+            ("flex-shrink", "0"),
+        ], name_hint)
+        own_classes.append(range_default_class)
         if created:
             state.stats.inline_overrides += 1
 
@@ -2366,6 +2465,10 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
     if text_attr is not None:
         state.record_font_text(text_attr, effective_text_raw, dynamic=dynamic_font)
         attrs_out.append(("text", _maybe_wrap_text_gradient(text_attr, text_gradient_name)))
+    if node.attrs.get(_FORM_CONTROL_LABEL_ATTR) and uxml_tag in ("ui:Toggle", "ui:RadioButton"):
+        control_text = node.attrs[_FORM_CONTROL_LABEL_ATTR]
+        state.record_font_text(control_text, effective_text_raw, dynamic=dynamic_font)
+        attrs_out.append(("text", control_text))
     for k, v in progress_attrs:
         attrs_out.append((k, v))
     if select_choices is not None and select_choices:
@@ -2468,13 +2571,32 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
         bake_gap = _bakes_flex_gap(uxml_tag, style)
         visual_child_index = 0
         for child in ordered_inner:
+            if _is_skipped_form_control_label(child):
+                continue
             if child.is_text:
                 t = (child.text or "").strip()
+                if not t and preserve_inline_whitespace and (child.text or ""):
+                    space_class, created = state.class_for_generated_decls([
+                        ("width", _format_px(_inline_space_width_px(effective_text_raw))),
+                        ("height", "1px"),
+                        ("flex-shrink", "0"),
+                    ])
+                    if created:
+                        state.stats.inline_overrides += 1
+                    rendered_children.append(
+                        f'{" " * (indent + 2)}<odd:Html2UxmlElement class="{_xml_escape(space_class)}" />\n'
+                    )
+                    visual_child_index += 1
+                    continue
                 if t and uxml_tag in ("ui:VisualElement", "odd:Html2UxmlPanel", "ui:ScrollView", "ui:Button", "odd:Html2UxmlButton"):
                     if text_transform:
                         t = _apply_text_transform(t, text_transform)
                     if text_decoration and "underline" in text_decoration.lower():
                         t = f"<u>{t}</u>"
+                    text_gap_decls = (
+                        _inline_run_spacing_decls(effective_text_raw, None, visual_child_index)
+                        if preserve_inline_whitespace and not bake_gap else []
+                    )
                     rendered_children.append(
                         _emit_generated_text_label(
                             t,
@@ -2488,7 +2610,7 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
                             dynamic_font=dynamic_font,
                             extra_container_decls=(
                                 _static_gap_decls(style, None, visual_child_index)
-                                if bake_gap else None
+                                if bake_gap else (text_gap_decls or None)
                             ),
                         )
                     )
@@ -2497,6 +2619,25 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
             gap_decls = (
                 _static_gap_decls(style, resolved.get(id(child)), visual_child_index)
                 if bake_gap else []
+            )
+            inline_gap_decls = (
+                _inline_run_spacing_decls(
+                    effective_text_raw,
+                    resolved.get(id(child)),
+                    visual_child_index,
+                )
+                if preserve_inline_whitespace and not bake_gap else []
+            )
+            form_break_decls = (
+                [
+                    ("width", "100%"),
+                    ("height", "0"),
+                    ("min-height", "0"),
+                    ("flex-basis", "100%"),
+                    ("flex-shrink", "0"),
+                ]
+                if inline_form_controls and child.tag == "br"
+                else []
             )
             opacity_decls = (
                 [("opacity", _opacity_for_child_after_parent_isolation(
@@ -2508,7 +2649,11 @@ def _emit_node(node: Node, resolved: dict[int, ResolvedStyle],
                 and not _is_absolute_painted_overlay(child, resolved)
                 else []
             )
-            child_extra_decls = _combine_generated_decls(opacity_decls, gap_decls)
+            child_extra_decls = _combine_generated_decls(
+                _combine_generated_decls(opacity_decls, gap_decls),
+                inline_gap_decls,
+                form_break_decls,
+            )
             rendered_children.append(
                 _emit_node(child, resolved, state, rule_bridge_flags, indent + 2,
                            parent=node, li_index=inner_li,
@@ -3835,6 +3980,97 @@ def _can_flatten_text_attr(
     if not _is_button_tag(uxml_tag):
         return True
     return not _button_has_structured_inline_text(node, resolved)
+
+
+def _inline_text_needs_child_elements(
+    node: Node,
+    resolved: dict[int, ResolvedStyle],
+) -> bool:
+    if not _has_only_inline_text(node):
+        return False
+    for child in node.children:
+        if child.is_text or child.tag == "br":
+            continue
+        if _inline_element_needs_own_element(child, resolved):
+            return True
+    return False
+
+
+def _inline_element_needs_own_element(
+    node: Node,
+    resolved: dict[int, ResolvedStyle],
+) -> bool:
+    if node.tag == "br":
+        return False
+    if any(node.attrs.get(attr) for attr in ("class", "id", "style", "title", "role")):
+        return True
+    if any(k.startswith(("aria-", "data-")) for k in node.attrs):
+        return True
+    style = resolved.get(id(node))
+    if _text_raw_from_style(style):
+        return True
+    if _inline_style_has_visual_box(style):
+        return True
+    for child in node.children:
+        if not child.is_text and _inline_element_needs_own_element(child, resolved):
+            return True
+    return False
+
+
+def _inline_style_has_visual_box(style) -> bool:
+    if style is None:
+        return False
+    display = (_resolved_value(style, "display") or "").strip().lower()
+    if display in ("inline-block", "inline-flex", "flex"):
+        return True
+    for prop in (
+        "background",
+        "background-color",
+        "background-image",
+        "border",
+        "border-top",
+        "border-right",
+        "border-bottom",
+        "border-left",
+        "border-radius",
+        "padding",
+        "padding-left",
+        "padding-right",
+        "padding-top",
+        "padding-bottom",
+        "margin",
+        "margin-left",
+        "margin-right",
+        "width",
+        "height",
+        "min-width",
+        "min-height",
+        "box-shadow",
+    ):
+        value = _resolved_value(style, prop)
+        if value is None:
+            continue
+        if prop.startswith("background") and _is_transparent_css_color(value):
+            continue
+        if value.strip().lower() in ("0", "0px", "none", "auto", "transparent"):
+            continue
+        return True
+    return False
+
+
+def _inline_space_width_px(text_raw: dict[str, str]) -> float:
+    return max(3.0, (_css_length_px(text_raw.get("font-size")) or 16.0) * 0.25)
+
+
+def _inline_run_spacing_decls(
+    text_raw: dict[str, str],
+    child_style: ResolvedStyle | None,
+    visual_index: int,
+) -> list[tuple[str, str]]:
+    if visual_index <= 0:
+        return []
+    gap = _inline_space_width_px(text_raw)
+    return [("margin-left", _format_px(_box_px(child_style, "margin-left") + gap))]
 
 
 def _button_has_structured_inline_text(

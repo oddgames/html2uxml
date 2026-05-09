@@ -95,10 +95,16 @@ def map_input(attrs: dict) -> tuple[str, dict, str | None]:
     """Map an <input> based on its `type=`."""
     t = (attrs.get("type") or "text").lower()
     value = attrs.get("value", "")
+    placeholder = attrs.get("placeholder", "")
+    text_attrs = {}
+    if value:
+        text_attrs["value"] = value
+    if placeholder:
+        text_attrs["placeholder"] = placeholder
     if t in ("text", "email", "search", "url", "tel"):
-        return "ui:TextField", ({"value": value} if value else {}), None
+        return "ui:TextField", text_attrs, None
     if t == "password":
-        return "ui:TextField", {"password": "true", **({"value": value} if value else {})}, None
+        return "ui:TextField", {"password": "true", **text_attrs}, None
     if t == "number":
         return "ui:FloatField", ({"value": value} if value else {}), None
     if t == "range":
@@ -134,6 +140,12 @@ SKIP_TAGS = {"svg", "canvas", "video", "audio", "iframe", "embed", "object",
 def map_element(tag: str, attrs: dict) -> tuple[str, dict, str | None]:
     if tag == "input":
         return map_input(attrs)
+    if tag == "textarea":
+        text_attrs = {"multiline": "true"}
+        placeholder = attrs.get("placeholder", "")
+        if placeholder:
+            text_attrs["placeholder"] = placeholder
+        return "ui:TextField", text_attrs, "text"
     if tag in SKIP_TAGS:
         # Replace with a placeholder VisualElement; children dropped at the
         # converter level via the SKIP_TAGS guard.

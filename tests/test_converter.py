@@ -1652,6 +1652,56 @@ class ConvertBasicsTest(unittest.TestCase):
         )
         self.assertNotIn('name="struck" text="struck"', r.uxml)
 
+    def test_text_inputs_preserve_placeholder_text(self):
+        r = convert('<input type="text" id="name" placeholder="Enter your name">')
+        self.assertIn('placeholder="Enter your name"', r.uxml)
+        self.assertIn('<odd:Html2UxmlTextField', r.uxml)
+
+    def test_password_inputs_preserve_placeholder_text(self):
+        r = convert('<input type="password" id="pwd" placeholder="secret">')
+        self.assertIn('password="true"', r.uxml)
+        self.assertIn('placeholder="secret"', r.uxml)
+
+    def test_textarea_preserves_placeholder_text(self):
+        r = convert('<textarea id="msg" placeholder="Your message..."></textarea>')
+        self.assertIn('multiline="true"', r.uxml)
+        self.assertIn('placeholder="Your message..."', r.uxml)
+
+    def test_checkable_input_uses_associated_label_text(self):
+        r = convert(
+            '<div class="checkbox-group">'
+            '<input type="checkbox" id="c1"><label for="c1">Checkbox option</label><br>'
+            '<input type="radio" name="r" id="r1"><label for="r1">Radio option 1</label>'
+            '<input type="radio" name="r" id="r2"><label for="r2">Radio option 2</label>'
+            '</div>'
+        )
+        self.assertIn('<odd:Html2UxmlToggle', r.uxml)
+        self.assertIn('text="Checkbox option"', r.uxml)
+        self.assertIn('text="Radio option 1"', r.uxml)
+        self.assertIn('text="Radio option 2"', r.uxml)
+        self.assertNotIn('name="checkbox-option"', r.uxml)
+        self.assertIn("flex-wrap: wrap", r.uss)
+        self.assertIn("flex-basis: 100%", r.uss)
+
+    def test_range_input_gets_browser_default_width_when_unstyled(self):
+        r = convert('<input type="range" id="range" min="0" max="100" value="50">')
+        self.assertIn('<odd:Html2UxmlSlider', r.uxml)
+        self.assertIn("width: 180px", r.uss)
+
+    def test_styled_inline_spans_preserve_child_elements(self):
+        r = convert(
+            '<style>.badge { display: inline-block; padding: 2px 8px; '
+            'border-radius: 12px; background: #2563eb; color: white; }</style>'
+            '<p>Inline badge example: <span class="badge">New</span> '
+            '<span class="badge">42</span></p>'
+        )
+        self.assertIn('text="Inline badge example:"', r.uxml)
+        self.assertIn('class="badge', r.uxml)
+        self.assertIn('text="New"', r.uxml)
+        self.assertIn('text="42"', r.uxml)
+        self.assertIn("margin-left: 4px", r.uss)
+        self.assertNotIn('text="Inline badge example: New42"', r.uxml)
+
     def test_cli_can_fail_on_inline_styles(self):
         with TemporaryDirectory() as td:
             base = Path(td)
