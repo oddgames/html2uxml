@@ -700,7 +700,7 @@ namespace ODDGames.Html2Uxml.Editor
             return norm.Substring(root.Length + 1);
         }
 
-        static readonly string[] _allowedExt = { ".uxml", ".uss", ".ttf", ".otf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg" };
+        static readonly string[] _allowedExt = { ".uxml", ".uss", ".ttf", ".otf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".html" };
 
         static void CopyBundle(string source, string target)
         {
@@ -712,6 +712,11 @@ namespace ODDGames.Html2Uxml.Editor
             }
             CopyTree(Path.Combine(source, "Fonts"), Path.Combine(target, "Fonts"));
             CopyTree(Path.Combine(source, "Images"), Path.Combine(target, "Images"));
+            // CLI writes the source HTML to a sibling Src/ next to UI/ in the
+            // bundle. Look one level up since `source` is the UI/ subdir.
+            string parent = Path.GetDirectoryName(source);
+            if (!string.IsNullOrEmpty(parent))
+                CopyTree(Path.Combine(parent, "Src"), Path.Combine(target, "Src"));
         }
 
         static void CopyTree(string source, string target)

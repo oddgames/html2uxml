@@ -300,11 +300,36 @@ def main(argv: list[str] | None = None) -> int:
         if args.textcore_font_assets:
             _write_font_asset_manifest(result, family_to_path, fonts_dir)
 
+    # Stash a copy of the source HTML in a sibling Src/ folder so re-
+    # conversion or visual diffs against the browser have a stable
+    # filename. Reference it from both files via an in-band comment, so
+    # opening the .uxml/.uss in any editor leaves a breadcrumb back to
+    # the original input.
+    src_dir = out_dir / "Src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    source_path = src_dir / f"{base}.html"
+    source_path.write_text(html, encoding="utf-8")
+    source_ref = f"Src/{source_path.name}"
+    if not result.uxml.startswith("<?xml"):
+        result.uxml = f"<!-- source: {source_ref} -->\n" + result.uxml
+    else:
+        nl = result.uxml.find("\n")
+        if nl >= 0:
+            result.uxml = (
+                result.uxml[: nl + 1]
+                + f"<!-- source: {source_ref} -->\n"
+                + result.uxml[nl + 1 :]
+            )
+        else:
+            result.uxml = result.uxml + f"\n<!-- source: {source_ref} -->\n"
+    result.uss = f"/* source: {source_ref} */\n" + result.uss
+
     uxml_path.write_text(result.uxml, encoding="utf-8")
     uss_path.write_text(result.uss, encoding="utf-8")
 
     print(f"wrote {uxml_path}")
     print(f"wrote {uss_path}")
+    print(f"wrote {source_path}")  # Src/<base>.html
     if not args.quiet:
         _print_report(
             result,

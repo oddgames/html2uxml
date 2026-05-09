@@ -906,7 +906,24 @@ def _map_one(prop: str, value: str, warnings: list[str]) -> list[tuple[str, str]
     # text alignment
     if prop == "text-align":
         v = value.lower()
-        return [("-unity-text-align", TEXT_ALIGN_MAP.get(v, "middle-left"))]
+        out_decls = [("-unity-text-align", TEXT_ALIGN_MAP.get(v, "middle-left"))]
+        # Browsers honour `text-align` for inline children of a flex
+        # container (each line gets centered/right-aligned within the
+        # container). Unity USS doesn't propagate text-align that way,
+        # so mirror the alignment via `justify-content` on the parent.
+        # `justify-content` is inert on non-flex containers, so emitting
+        # it unconditionally is safe.
+        justify = {
+            "center": "center",
+            "right": "flex-end",
+            "end": "flex-end",
+            "left": "flex-start",
+            "start": "flex-start",
+            "justify": "space-between",
+        }.get(v)
+        if justify:
+            out_decls.append(("justify-content", justify))
+        return out_decls
 
     # font weight / style fold into -unity-font-style. Keep the numeric
     # weight as a custom property so the CLI can inject the closest real font
