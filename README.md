@@ -8,10 +8,35 @@ Package id: `au.com.oddgames.html2uxml`
 
 ## Install With Unity UPM
 
+### Option A — npmjs scoped registry (recommended)
+
+Each tagged release is published to npmjs.com. Add a scoped registry and the
+package to `Packages/manifest.json`:
+
+```json
+{
+  "scopedRegistries": [
+    {
+      "name": "ODD Games",
+      "url": "https://registry.npmjs.org",
+      "scopes": ["au.com.oddgames"]
+    }
+  ],
+  "dependencies": {
+    "au.com.oddgames.html2uxml": "0.1.0"
+  }
+}
+```
+
+Unity's Package Manager will then list the package under **My Registries**
+and show updates whenever a new version is published.
+
+### Option B — Git URL
+
 Use Unity Package Manager's **Add package from git URL** option:
 
 ```text
-https://github.com/oddgames/html2uxml.git
+https://github.com/oddgames/html2uxml.git#v0.1.0
 ```
 
 Or add it directly to `Packages/manifest.json`:
@@ -19,13 +44,12 @@ Or add it directly to `Packages/manifest.json`:
 ```json
 {
   "dependencies": {
-    "au.com.oddgames.html2uxml": "https://github.com/oddgames/html2uxml.git"
+    "au.com.oddgames.html2uxml": "https://github.com/oddgames/html2uxml.git#v0.1.0"
   }
 }
 ```
 
-Pin to a specific release with `#v0.1.0`. For local development use a file
-dependency that points at this folder:
+### Option C — Local file dependency (for development)
 
 ```json
 {
@@ -116,17 +140,20 @@ dependency that points at this folder:
     referencing package materials. Generated USS references them through
     package paths; no project-local filter assets are generated under
     `Assets/ODDGames`.
-- Editor import automation
-  - The HTML importer turns `.html` files in `Assets/` into UXML/USS plus
-    sibling image, font, and gradient assets.
-  - `TextGradientImporter` turns generated `UI/TextGradients/*.h2utg.json`
-    files into TextCore `TextColorGradient` assets.
-  - `TextCoreFontAssetImporter` turns generated `UI/Fonts/*.ttf` and
-    `UI/Fonts/*.otf` files into sibling `* SDF.asset` TextCore FontAssets.
-    Generated UXML references those assets by default and writes
-    `UI/Fonts/html2uxml-fonts.json`; the importer bakes a default charset plus
-    detected screen text into static SDF atlases unless that manifest marks a
-    font as dynamic.
+## Converting HTML
+
+HTML conversion is manual and runs in the Editor. With one or more `.html` /
+`.htm` files selected in the Project window, either:
+
+- Use the **HTML to UXML** panel in the Inspector header (toggles for font
+  download, TextCore SDF font bake, and bundle layout, plus a **Convert**
+  button), or
+- Right-click ▸ **Convert HTML to UXML**.
+
+Each conversion's outcome (timestamp, warnings, errors, and resulting
+`.uxml` / `.uss` paths) is cached under `Library/Html2UxmlResults/` and
+re-rendered in the inspector panel after domain reloads, so failures don't
+get lost in the Console.
 
 ## Generated UXML Namespace
 
