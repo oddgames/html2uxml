@@ -8,30 +8,7 @@ Package id: `au.com.oddgames.html2uxml`
 
 ## Install With Unity UPM
 
-### Option A — npmjs scoped registry (recommended)
-
-Each tagged release is published to npmjs.com. Add a scoped registry and the
-package to `Packages/manifest.json`:
-
-```json
-{
-  "scopedRegistries": [
-    {
-      "name": "ODD Games",
-      "url": "https://registry.npmjs.org",
-      "scopes": ["au.com.oddgames"]
-    }
-  ],
-  "dependencies": {
-    "au.com.oddgames.html2uxml": "0.1.0"
-  }
-}
-```
-
-Unity's Package Manager will then list the package under **My Registries**
-and show updates whenever a new version is published.
-
-### Option B — Git URL
+### Option A — Git URL (recommended)
 
 Use Unity Package Manager's **Add package from git URL** option:
 
@@ -49,7 +26,7 @@ Or add it directly to `Packages/manifest.json`:
 }
 ```
 
-### Option C — Local file dependency (for development)
+### Option B — Local file dependency (for development)
 
 ```json
 {
