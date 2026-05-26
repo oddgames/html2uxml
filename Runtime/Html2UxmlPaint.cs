@@ -1,0 +1,3157 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace ODDGames.Html2Uxml
+{
+    // Manipulator that paints CSS features USS doesn't support natively.
+    // Attach via target.AddManipulator(new Html2UxmlPaintManipulator()) on any
+    // VisualElement (or typed Unity control like Label/Button/ScrollView/Toggle)
+    // to give it the full CSS paint pipeline: outset/inset shadows (legacy and
+    // multi-layer --odd-box-shadows), linear and radial gradients, repeating
+    // linear and tiled radial patterns, vector icons, mask fades, and clip
+    // polygons.
+    //
+    // Reads these USS custom properties when present:
+    //
+    //   --odd-shadow-offset-x, --odd-shadow-offset-y, --odd-shadow-blur (unitless px floats)
+    //   --odd-shadow-color (color)
+    //   --odd-box-shadows (string: kind|x|y|blur|spread|color;...)
+    //   --odd-inner-shadow-offset-x/-y/-blur/-spread (unitless px floats)
+    //   --odd-inner-shadow-color (color)
+    //   --odd-gradient (string: linear-gradient(...))
+    //   --odd-radial-gradient (string: radial-gradient(...))
+    //   --odd-radial-gradient-2 (string: radial-gradient(...))
+    //   --odd-repeating-linear-gradient (string: repeating-linear-gradient(...))
+    //   --odd-tiled-radial-gradient (string: radial-gradient(...) paired with background-size)
+    //   --odd-background-pattern-size / --odd-background-pattern-position (strings)
+    //   --odd-mask-image (string: linear-gradient(...))
+    //   --odd-mask-fade-color (color)
+    //   --odd-clip-polygon (string)
+    //   --odd-vector-icon (string)
+    //   --odd-background-color (color)
+    //
+    // If none are set the element behaves exactly like a plain VisualElement.
+    internal sealed class Html2UxmlPaintManipulator : Manipulator
+    {
+        static readonly CustomStyleProperty<float> ShadowOffsetX = new CustomStyleProperty<float>("--odd-shadow-offset-x");
+        static readonly CustomStyleProperty<float> ShadowOffsetY = new CustomStyleProperty<float>("--odd-shadow-offset-y");
+        static readonly CustomStyleProperty<float> ShadowBlur    = new CustomStyleProperty<float>("--odd-shadow-blur");
+        static readonly CustomStyleProperty<Color> ShadowColor   = new CustomStyleProperty<Color>("--odd-shadow-color");
+        static readonly CustomStyleProperty<string> BoxShadows = new CustomStyleProperty<string>("--odd-box-shadows");
+        static readonly CustomStyleProperty<float> InnerShadowOffsetX = new CustomStyleProperty<float>("--odd-inner-shadow-offset-x");
+        static readonly CustomStyleProperty<float> InnerShadowOffsetY = new CustomStyleProperty<float>("--odd-inner-shadow-offset-y");
+        static readonly CustomStyleProperty<float> InnerShadowBlur    = new CustomStyleProperty<float>("--odd-inner-shadow-blur");
+        static readonly CustomStyleProperty<float> InnerShadowSpread  = new CustomStyleProperty<float>("--odd-inner-shadow-spread");
+        static readonly CustomStyleProperty<Color> InnerShadowColor   = new CustomStyleProperty<Color>("--odd-inner-shadow-color");
+        static readonly CustomStyleProperty<string> Gradient     = new CustomStyleProperty<string>("--odd-gradient");
+        static readonly CustomStyleProperty<string> RadialGradient = new CustomStyleProperty<string>("--odd-radial-gradient");
+        static readonly CustomStyleProperty<string> RadialGradient2 = new CustomStyleProperty<string>("--odd-radial-gradient-2");
+        static readonly CustomStyleProperty<string> RepeatingLinearGradient = new CustomStyleProperty<string>("--odd-repeating-linear-gradient");
+        static readonly CustomStyleProperty<string> TiledRadialGradient = new CustomStyleProperty<string>("--odd-tiled-radial-gradient");
+        static readonly CustomStyleProperty<string> BackgroundPatternSize = new CustomStyleProperty<string>("--odd-background-pattern-size");
+        static readonly CustomStyleProperty<string> BackgroundPatternPosition = new CustomStyleProperty<string>("--odd-background-pattern-position");
+        static readonly CustomStyleProperty<Color> SolidBackground = new CustomStyleProperty<Color>("--odd-background-color");
+        static readonly CustomStyleProperty<string> MaskImage = new CustomStyleProperty<string>("--odd-mask-image");
+        static readonly CustomStyleProperty<Color> MaskFadeColor = new CustomStyleProperty<Color>("--odd-mask-fade-color");
+        static readonly CustomStyleProperty<string> ClipPolygon  = new CustomStyleProperty<string>("--odd-clip-polygon");
+        static readonly CustomStyleProperty<string> VectorIcon    = new CustomStyleProperty<string>("--odd-vector-icon");
+        static readonly CustomStyleProperty<string> EffectRenderer = new CustomStyleProperty<string>("--odd-effect-renderer");
+
+        VisualElement _target;
+
+        Vector2 _shadowOffset;
+        float   _shadowBlur;
+        Color   _shadowColor;
+        bool    _hasShadow;
+
+        Vector2 _innerShadowOffset;
+        float   _innerShadowBlur;
+        float   _innerShadowSpread;
+        Color   _innerShadowColor;
+        bool    _hasInnerShadow;
+        List<ShadowLayer> _shadowLayers = new List<ShadowLayer>();
+
+        LinearGradient _gradient;
+        RadialGradient _radialGradient;
+        RadialGradient _radialGradient2;
+        RepeatingLinearPattern _repeatingLinearPattern;
+        TiledRadialPattern _tiledRadialPattern;
+        Vector2 _patternSize = new Vector2(8f, 8f);
+        Vector2 _patternPosition = Vector2.zero;
+        Color _solidBackgroundColor;
+        bool _hasSolidBackground;
+        bool _hasPaintWork;
+        bool _useGpuEffects = true;
+
+        PolygonCorner[] _clipPoints;
+        Color _clipCoverColor;
+        CssGradientLayer _gradientLayer;
+        InsetShadowOverlay _insetShadowOverlay;
+        OuterShadowOverlay _outerShadowOverlay;
+        VectorIconOverlay _iconOverlay;
+        ClipMaskOverlay _clipOverlay;
+        MaskFadeOverlay _maskOverlay;
+
+        protected override void RegisterCallbacksOnTarget()
+        {
+            _target = target;
+            target.RegisterCallback<CustomStyleResolvedEvent>(OnStylesResolved);
+            target.generateVisualContent += OnGenerateVisualContent;
+        }
+
+        protected override void UnregisterCallbacksFromTarget()
+        {
+            target.UnregisterCallback<CustomStyleResolvedEvent>(OnStylesResolved);
+            target.generateVisualContent -= OnGenerateVisualContent;
+            RemoveClipOverlay();
+            RemoveGradientLayer();
+            RemoveInsetShadowOverlay();
+            RemoveOuterShadowOverlay();
+            RemoveVectorIconOverlay();
+            RemoveMaskOverlay();
+            _target = null;
+        }
+
+        void OnStylesResolved(CustomStyleResolvedEvent evt)
+        {
+            var style = evt.customStyle;
+            float ox = 0f, oy = 0f, blur = 0f;
+            Color color = Color.black;
+            bool any = false;
+            if (style.TryGetValue(ShadowOffsetX, out var x)) { ox = x; any = true; }
+            if (style.TryGetValue(ShadowOffsetY, out var y)) { oy = y; any = true; }
+            if (style.TryGetValue(ShadowBlur, out var b))    { blur = b; any = true; }
+            if (style.TryGetValue(ShadowColor, out var c))   { color = c; any = true; }
+            _shadowOffset = new Vector2(ox, oy);
+            _shadowBlur = Mathf.Max(0f, blur);
+            _shadowColor = color;
+            _hasShadow = any && color.a > 0f;
+
+            float iox = 0f, ioy = 0f, iblur = 0f, ispread = 0f;
+            Color icolor = Color.clear;
+            bool innerAny = false;
+            if (style.TryGetValue(InnerShadowOffsetX, out var ix)) { iox = ix; innerAny = true; }
+            if (style.TryGetValue(InnerShadowOffsetY, out var iy)) { ioy = iy; innerAny = true; }
+            if (style.TryGetValue(InnerShadowBlur, out var ib))    { iblur = ib; innerAny = true; }
+            if (style.TryGetValue(InnerShadowSpread, out var isp)) { ispread = isp; innerAny = true; }
+            if (style.TryGetValue(InnerShadowColor, out var ic))   { icolor = ic; innerAny = true; }
+            _innerShadowOffset = new Vector2(iox, ioy);
+            _innerShadowBlur = Mathf.Max(0f, iblur);
+            _innerShadowSpread = ispread;
+            _innerShadowColor = icolor;
+            _hasInnerShadow = innerAny && icolor.a > 0f;
+
+            string shadowsStr;
+            _shadowLayers = style.TryGetValue(BoxShadows, out shadowsStr)
+                ? ShadowLayerParser.Parse(shadowsStr, _target.resolvedStyle.color)
+                : new List<ShadowLayer>();
+            if (_shadowLayers.Count == 0)
+            {
+                if (_hasShadow)
+                {
+                    _shadowLayers.Add(new ShadowLayer
+                    {
+                        Inset = false,
+                        Offset = _shadowOffset,
+                        Blur = _shadowBlur,
+                        Spread = 0f,
+                        Color = _shadowColor
+                    });
+                }
+                if (_hasInnerShadow)
+                {
+                    _shadowLayers.Add(new ShadowLayer
+                    {
+                        Inset = true,
+                        Offset = _innerShadowOffset,
+                        Blur = _innerShadowBlur,
+                        Spread = _innerShadowSpread,
+                        Color = _innerShadowColor
+                    });
+                }
+            }
+
+            string gradStr;
+            _gradient = style.TryGetValue(Gradient, out gradStr)
+                ? GradientParser.ParseLinear(gradStr)
+                : null;
+
+            string radialStr;
+            _radialGradient = style.TryGetValue(RadialGradient, out radialStr)
+                ? GradientParser.ParseRadial(radialStr)
+                : null;
+
+            string radial2Str;
+            _radialGradient2 = style.TryGetValue(RadialGradient2, out radial2Str)
+                ? GradientParser.ParseRadial(radial2Str)
+                : null;
+
+            string repeatingLinearStr;
+            _repeatingLinearPattern = style.TryGetValue(RepeatingLinearGradient, out repeatingLinearStr)
+                ? CssPatternParser.ParseRepeatingLinear(repeatingLinearStr)
+                : null;
+
+            string tiledRadialStr;
+            _tiledRadialPattern = style.TryGetValue(TiledRadialGradient, out tiledRadialStr)
+                ? CssPatternParser.ParseTiledRadial(tiledRadialStr)
+                : null;
+
+            string patternSizeStr;
+            _patternSize = style.TryGetValue(BackgroundPatternSize, out patternSizeStr)
+                ? CssPatternParser.ParseSize(patternSizeStr, new Vector2(8f, 8f))
+                : new Vector2(8f, 8f);
+
+            string patternPositionStr;
+            _patternPosition = style.TryGetValue(BackgroundPatternPosition, out patternPositionStr)
+                ? CssPatternParser.ParsePosition(patternPositionStr)
+                : Vector2.zero;
+
+            _hasSolidBackground = style.TryGetValue(SolidBackground, out _solidBackgroundColor)
+                && _solidBackgroundColor.a > 0.001f;
+
+            string effectRenderer;
+            _useGpuEffects = !style.TryGetValue(EffectRenderer, out effectRenderer)
+                || !string.Equals(NormalizeQuotedString(effectRenderer), "cpu", System.StringComparison.OrdinalIgnoreCase);
+
+            string clipStr;
+            _clipPoints = style.TryGetValue(ClipPolygon, out clipStr)
+                ? PolygonParser.Parse(clipStr)
+                : null;
+            // Cover masks UITK's own background paint that bleeds outside the
+            // polygon. It must NOT paint with an ancestor's color: ancestors
+            // can sit behind unrelated siblings (e.g. a portrait disc the
+            // polygon's notch is meant to reveal). Only mask when this element
+            // has its own opaque resolved background.
+            _clipCoverColor = _target.resolvedStyle.backgroundColor;
+            EnsureClipOverlay();
+            EnsureGradientLayer();
+            EnsureInsetShadowOverlay();
+            EnsureOuterShadowOverlay();
+
+            string iconStr;
+            if (style.TryGetValue(VectorIcon, out iconStr))
+                EnsureVectorIconOverlay(iconStr);
+            else
+                RemoveVectorIconOverlay();
+
+            string maskStr;
+            if (style.TryGetValue(MaskImage, out maskStr))
+            {
+                Color fadeColor;
+                if (!style.TryGetValue(MaskFadeColor, out fadeColor))
+                {
+                    fadeColor = _target.resolvedStyle.backgroundColor;
+                    if (fadeColor.a <= 0f && _target.parent != null)
+                        fadeColor = _target.parent.resolvedStyle.backgroundColor;
+                }
+                EnsureMaskOverlay(maskStr, fadeColor);
+            }
+            else
+            {
+                RemoveMaskOverlay();
+            }
+
+            // CSS gap / row-gap / column-gap is baked into per-child margins at
+            // conversion time (see html2uxml._static_gap_decls). No runtime
+            // mutation needed, which avoids "VisualElements cannot change render
+            // data ... during visual tree rendering" errors that fire when style
+            // writes land mid-render in UI Builder previews.
+
+            _hasPaintWork = ComputeHasPaintWork();
+        }
+
+        bool ComputeHasPaintWork()
+        {
+            return (_shadowLayers != null && _shadowLayers.Count > 0)
+                || _hasSolidBackground
+                || _gradient != null
+                || _radialGradient != null
+                || _radialGradient2 != null
+                || _tiledRadialPattern != null
+                || _repeatingLinearPattern != null
+                || (_clipOverlay == null && _clipPoints != null && _clipPoints.Length >= 3 && _clipCoverColor.a > 0.001f);
+        }
+
+        void RemoveChildDeferred(VisualElement child, System.Action afterRemove = null)
+        {
+            if (child == null)
+            {
+                afterRemove?.Invoke();
+                return;
+            }
+
+            System.Action removeNow = null;
+            removeNow = () =>
+            {
+                try
+                {
+                    if (child.parent != null)
+                        child.RemoveFromHierarchy();
+                    afterRemove?.Invoke();
+                }
+                catch (System.InvalidOperationException)
+                {
+                    if (_target != null)
+                        _target.schedule.Execute(removeNow).ExecuteLater(16);
+                }
+            };
+
+            if (_target == null || _target.panel == null)
+                removeNow();
+            else
+                _target.schedule.Execute(removeNow).ExecuteLater(0);
+        }
+
+
+        void EnsureMaskOverlay(string maskStr, Color fadeColor)
+        {
+            if (_maskOverlay == null)
+            {
+                _maskOverlay = new MaskFadeOverlay();
+                _target.Add(_maskOverlay);
+            }
+            _maskOverlay.Configure(maskStr, fadeColor);
+            _maskOverlay.BringToFront();
+        }
+
+        void RemoveMaskOverlay()
+        {
+            if (_maskOverlay == null) return;
+            var overlay = _maskOverlay;
+            _maskOverlay = null;
+            RemoveChildDeferred(overlay, overlay.DisposeMaterial);
+        }
+
+        void EnsureGradientLayer()
+        {
+            // Shader-driven CSS gradient layer replaces the per-element
+            // PaintGradient mesh path (which built ~1-2K vertices per element).
+            // One quad + fragment shader does the same job at a fraction of
+            // the CPU/upload cost.
+            bool hasGrad = _useGpuEffects && (_gradient != null
+                || _radialGradient != null
+                || _radialGradient2 != null);
+            // Skip the layer for text-bearing elements (Button, Label) —
+            // UI Toolkit paints the element's own text mesh BEFORE its
+            // children, so a child gradient layer would cover the text.
+            // Fall back to in-element mesh PaintGradient via OnGenerateVisualContent.
+            bool isTextElement = (_target is TextElement te && !string.IsNullOrEmpty(te.text))
+                || (_target is Button button && !string.IsNullOrEmpty(button.text));
+            if (!hasGrad || isTextElement)
+            {
+                RemoveGradientLayer();
+                return;
+            }
+            if (_gradientLayer == null)
+            {
+                _gradientLayer = new CssGradientLayer();
+                _target.hierarchy.Add(_gradientLayer);
+            }
+            else if (_gradientLayer.parent != _target)
+            {
+                _target.hierarchy.Add(_gradientLayer);
+            }
+            Color fallback = _hasSolidBackground
+                ? _solidBackgroundColor
+                : _target.resolvedStyle.backgroundColor;
+            float radius = _target.resolvedStyle.borderTopLeftRadius;
+            bool ok = _gradientLayer.Configure(
+                _gradient, _radialGradient, _radialGradient2,
+                fallback, radius, _clipPoints);
+            if (!ok)
+            {
+                // Shader missing or material setup failed — fall back to mesh.
+                RemoveGradientLayer();
+                return;
+            }
+            _gradientLayer.SendToBack();
+        }
+
+        void RemoveGradientLayer()
+        {
+            if (_gradientLayer == null) return;
+            var layer = _gradientLayer;
+            _gradientLayer = null;
+            RemoveChildDeferred(layer, layer.DisposeMaterial);
+        }
+
+        void EnsureInsetShadowOverlay()
+        {
+            if (!_useGpuEffects || _shadowLayers == null || _shadowLayers.Count == 0)
+            {
+                RemoveInsetShadowOverlay();
+                return;
+            }
+
+            var insetLayers = new List<ShadowLayer>();
+            for (int i = 0; i < _shadowLayers.Count; i++)
+            {
+                if (_shadowLayers[i].Inset && _shadowLayers[i].Color.a > 0f)
+                    insetLayers.Add(_shadowLayers[i]);
+            }
+
+            if (insetLayers.Count == 0)
+            {
+                RemoveInsetShadowOverlay();
+                return;
+            }
+
+            if (_insetShadowOverlay == null)
+            {
+                _insetShadowOverlay = new InsetShadowOverlay();
+                _target.Add(_insetShadowOverlay);
+            }
+            else if (_insetShadowOverlay.parent != _target)
+            {
+                _target.Add(_insetShadowOverlay);
+            }
+
+            _insetShadowOverlay.Configure(insetLayers, _target.resolvedStyle.borderTopLeftRadius, _useGpuEffects);
+            _insetShadowOverlay.SendToBack();
+            if (_gradientLayer != null && _gradientLayer.parent == _target)
+                _gradientLayer.SendToBack();
+        }
+        void RemoveInsetShadowOverlay()
+        {
+            if (_insetShadowOverlay == null) return;
+            var overlay = _insetShadowOverlay;
+            _insetShadowOverlay = null;
+            RemoveChildDeferred(overlay, overlay.DisposeMaterial);
+        }
+
+        void EnsureOuterShadowOverlay()
+        {
+            if (!HasOutsetShadow())
+            {
+                RemoveOuterShadowOverlay();
+                return;
+            }
+
+            var parent = _target.hierarchy.parent;
+            if (parent == null)
+            {
+                RemoveOuterShadowOverlay();
+                return;
+            }
+
+            if (_outerShadowOverlay == null)
+                _outerShadowOverlay = new OuterShadowOverlay(_target);
+            if (_outerShadowOverlay.parent != parent)
+            {
+                if (_outerShadowOverlay.parent != null)
+                    _outerShadowOverlay.RemoveFromHierarchy();
+                parent.hierarchy.Add(_outerShadowOverlay);
+            }
+
+            int targetIdx = parent.hierarchy.IndexOf(_target);
+            int overlayIdx = parent.hierarchy.IndexOf(_outerShadowOverlay);
+            if (overlayIdx > targetIdx)
+            {
+                _outerShadowOverlay.RemoveFromHierarchy();
+                parent.hierarchy.Insert(targetIdx, _outerShadowOverlay);
+            }
+
+            var outsetLayers = new List<ShadowLayer>();
+            for (int i = 0; i < _shadowLayers.Count; i++)
+            {
+                if (!_shadowLayers[i].Inset && _shadowLayers[i].Color.a > 0f)
+                    outsetLayers.Add(_shadowLayers[i]);
+            }
+            _outerShadowOverlay.Configure(outsetLayers, _target.resolvedStyle.borderTopLeftRadius, _useGpuEffects);
+        }
+
+        void RemoveOuterShadowOverlay()
+        {
+            if (_outerShadowOverlay == null) return;
+            var overlay = _outerShadowOverlay;
+            _outerShadowOverlay = null;
+            RemoveChildDeferred(overlay, overlay.DisposeMaterial);
+        }
+
+        void EnsureVectorIconOverlay(string iconStr)
+        {
+            string icon = NormalizeQuotedString(iconStr);
+            if (string.IsNullOrEmpty(icon))
+            {
+                RemoveVectorIconOverlay();
+                return;
+            }
+            if (_iconOverlay == null)
+            {
+                _iconOverlay = new VectorIconOverlay();
+                _target.Add(_iconOverlay);
+            }
+            _iconOverlay.Configure(icon, _target.resolvedStyle.color);
+            _iconOverlay.BringToFront();
+        }
+
+        void RemoveVectorIconOverlay()
+        {
+            if (_iconOverlay == null) return;
+            var overlay = _iconOverlay;
+            _iconOverlay = null;
+            RemoveChildDeferred(overlay);
+        }
+
+        void EnsureClipOverlay()
+        {
+            if (_clipPoints == null || _clipPoints.Length < 3 || _clipCoverColor.a <= 0.001f)
+            {
+                RemoveClipOverlay();
+                return;
+            }
+            if (_clipOverlay == null)
+            {
+                _clipOverlay = new ClipMaskOverlay();
+                _target.Add(_clipOverlay);
+            }
+            _clipOverlay.Configure(_clipPoints, _clipCoverColor);
+            _clipOverlay.BringToFront();
+        }
+
+        void RemoveClipOverlay()
+        {
+            if (_clipOverlay == null) return;
+            var overlay = _clipOverlay;
+            _clipOverlay = null;
+            RemoveChildDeferred(overlay);
+        }
+
+        void OnGenerateVisualContent(MeshGenerationContext ctx)
+        {
+            if (!_hasPaintWork)
+                return;
+            var rect = BorderBoxRect();
+            var backgroundRect = BackgroundPaintRect(rect);
+            var painter = ctx.painter2D;
+            bool shaderGradient = _gradientLayer != null && _gradientLayer.parent == _target;
+            bool hasOutsetShadow = HasOutsetShadow();
+            bool outerShadowOverlay = _outerShadowOverlay != null && _outerShadowOverlay.parent != null;
+            if (!outerShadowOverlay)
+            {
+                for (int i = _shadowLayers.Count - 1; i >= 0; i--)
+                    if (!_shadowLayers[i].Inset && _shadowLayers[i].Color.a > 0f)
+                        PaintShadow(ctx, painter, rect, _shadowLayers[i]);
+            }
+            if (hasOutsetShadow && !_hasSolidBackground && !shaderGradient)
+            {
+                Color backgroundColor = _target.resolvedStyle.backgroundColor;
+                if (backgroundColor.a > 0.001f)
+                    PaintBackgroundColor(painter, backgroundRect, backgroundColor);
+            }
+            if (_hasSolidBackground && !shaderGradient)
+                PaintSolidBackground(painter, backgroundRect);
+            if (!shaderGradient)
+            {
+                if (_gradient != null) PaintGradient(ctx, backgroundRect);
+                if (_radialGradient2 != null) PaintRadialGradient(ctx, backgroundRect, _radialGradient2);
+                if (_radialGradient != null) PaintRadialGradient(ctx, backgroundRect, _radialGradient);
+            }
+            if (_tiledRadialPattern != null) PaintTiledRadialPattern(ctx, backgroundRect);
+            if (_repeatingLinearPattern != null) PaintRepeatingLinearPattern(ctx, backgroundRect);
+            if (_clipOverlay == null && _clipPoints != null && _clipPoints.Length >= 3)
+                PaintClipMask(painter, rect);
+            bool insetOverlay = _insetShadowOverlay != null && _insetShadowOverlay.parent == _target;
+            for (int i = _shadowLayers.Count - 1; i >= 0; i--)
+                if (!insetOverlay && _shadowLayers[i].Inset && _shadowLayers[i].Color.a > 0f)
+                {
+                    if (_clipPoints != null && _clipPoints.Length >= 3)
+                        PaintClippedInnerShadow(painter, backgroundRect, _shadowLayers[i]);
+                    else
+                        PaintInnerShadow(painter, backgroundRect, _shadowLayers[i]);
+                }
+        }
+
+        bool HasOutsetShadow()
+        {
+            for (int i = 0; i < _shadowLayers.Count; i++)
+                if (!_shadowLayers[i].Inset && _shadowLayers[i].Color.a > 0f)
+                    return true;
+            return false;
+        }
+
+        Rect BorderBoxRect()
+        {
+            var w = _target.layout.width;
+            var h = _target.layout.height;
+            if (w > 0f && h > 0f)
+                return new Rect(0f, 0f, w, h);
+            return _target.contentRect;
+        }
+
+        Rect BackgroundPaintRect(Rect borderRect)
+        {
+            var rs = _target.resolvedStyle;
+            return InsetRect(
+                borderRect,
+                Mathf.Max(0f, rs.borderLeftWidth),
+                Mathf.Max(0f, rs.borderTopWidth),
+                Mathf.Max(0f, rs.borderRightWidth),
+                Mathf.Max(0f, rs.borderBottomWidth));
+        }
+
+        static Rect InsetRect(Rect rect, float left, float top, float right, float bottom)
+        {
+            float xMin = rect.xMin + left;
+            float yMin = rect.yMin + top;
+            float xMax = rect.xMax - right;
+            float yMax = rect.yMax - bottom;
+            if (xMax < xMin)
+            {
+                float x = (xMin + xMax) * 0.5f;
+                xMin = xMax = x;
+            }
+            if (yMax < yMin)
+            {
+                float y = (yMin + yMax) * 0.5f;
+                yMin = yMax = y;
+            }
+            return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+        }
+
+        static Rect InflateRect(Rect rect, float amount)
+        {
+            float xMin = rect.xMin - amount;
+            float yMin = rect.yMin - amount;
+            float xMax = rect.xMax + amount;
+            float yMax = rect.yMax + amount;
+            if (xMax < xMin)
+            {
+                float x = (xMin + xMax) * 0.5f;
+                xMin = xMax = x;
+            }
+            if (yMax < yMin)
+            {
+                float y = (yMin + yMax) * 0.5f;
+                yMin = yMax = y;
+            }
+            return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+        }
+
+        void PaintClipMask(Painter2D p, Rect rect)
+        {
+            // Approximate a clip-path by painting OUTSIDE the polygon with the
+            // parent's resolved background color (or transparent black) so the
+            // visible area matches the polygon. A proper stencil would need a
+            // shader; this produces the right shape against solid backgrounds.
+            if (_clipCoverColor.a <= 0.001f) return;
+            p.fillColor = _clipCoverColor;
+            p.BeginPath();
+            // Draw the rect, then "subtract" the polygon by reversing winding.
+            p.MoveTo(new Vector2(rect.xMin, rect.yMin));
+            p.LineTo(new Vector2(rect.xMax, rect.yMin));
+            p.LineTo(new Vector2(rect.xMax, rect.yMax));
+            p.LineTo(new Vector2(rect.xMin, rect.yMax));
+            p.ClosePath();
+            // Polygon hole (counter-clockwise to act as a hole under non-zero fill rule)
+            for (int i = _clipPoints.Length - 1; i >= 0; i--)
+            {
+                var pt = PolygonParser.Resolve(_clipPoints[i], rect);
+                if (i == _clipPoints.Length - 1) p.MoveTo(pt);
+                else p.LineTo(pt);
+            }
+            p.ClosePath();
+            p.Fill(FillRule.NonZero);
+        }
+
+        Color ResolveAncestorBackgroundColor()
+        {
+            for (var p = _target.parent; p != null; p = p.parent)
+            {
+                var c = p.resolvedStyle.backgroundColor;
+                if (c.a > 0.001f)
+                    return c;
+            }
+            return Color.clear;
+        }
+
+        static string NormalizeQuotedString(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return string.Empty;
+            value = value.Trim();
+            if (value.Length >= 2
+                && ((value[0] == '"' && value[value.Length - 1] == '"')
+                    || (value[0] == '\'' && value[value.Length - 1] == '\'')))
+                return value.Substring(1, value.Length - 2);
+            return value;
+        }
+
+        void PaintSolidBackground(Painter2D p, Rect rect)
+        {
+            PaintBackgroundColor(p, rect, _solidBackgroundColor);
+        }
+
+        void PaintBackgroundColor(Painter2D p, Rect rect, Color color)
+        {
+            p.fillColor = color;
+            p.BeginPath();
+            if (_clipPoints != null && _clipPoints.Length >= 3)
+            {
+                for (int i = 0; i < _clipPoints.Length; i++)
+                {
+                    var pt = PolygonParser.Resolve(_clipPoints[i], rect);
+                    if (i == 0) p.MoveTo(pt);
+                    else p.LineTo(pt);
+                }
+                p.ClosePath();
+            }
+            else
+            {
+                RoundedRect(p, rect, _target.resolvedStyle.borderTopLeftRadius);
+            }
+            p.Fill();
+        }
+
+        void PaintShadow(MeshGenerationContext ctx, Painter2D p, Rect rect, ShadowLayer layer)
+        {
+            float radius = RoundedRadius(rect);
+            float spread = layer.Spread;
+            Rect baseRect = InflateRect(
+                new Rect(
+                    rect.x + layer.Offset.x,
+                    rect.y + layer.Offset.y,
+                    rect.width,
+                    rect.height),
+                spread);
+            if (baseRect.width <= 0.001f || baseRect.height <= 0.001f)
+                return;
+
+            if (layer.Blur <= 0f)
+            {
+                p.fillColor = layer.Color;
+                p.BeginPath();
+                RoundedRect(p, baseRect, radius + Mathf.Max(0f, spread));
+                RoundedRectReverse(p, rect, radius);
+                p.Fill(FillRule.NonZero);
+                return;
+            }
+
+            PaintSoftShadowMesh(ctx, baseRect, radius + spread, layer.Blur, layer.Color);
+        }
+
+        void PaintSoftShadowMesh(
+            MeshGenerationContext ctx,
+            Rect sourceRect,
+            float sourceRadius,
+            float blur,
+            Color color)
+        {
+            // UI Toolkit does not provide CSS box-shadow directly. Generate a
+            // feathered rounded-rect mesh around the shadow caster. The fade
+            // starts inside the caster and continues outward so offset shadows
+            // don't expose a hard strip at the element edge.
+            float blurExtent = Mathf.Max(0.5f, blur);
+            float outerRadius = Mathf.Max(0f, sourceRadius) + blurExtent;
+            // CSS box-shadow doesn't tint the element interior much — falloff
+            // is gaussian outward from the border. Cap inward feather to half
+            // the blur so the shadow doesn't read as a wider/denser halo than
+            // the browser draws at the same `blur` value.
+            float innerExtent = Mathf.Min(
+                blurExtent * 0.5f,
+                Mathf.Max(0f, Mathf.Min(sourceRect.width, sourceRect.height) * 0.5f - 0.5f));
+            int contourCount = Mathf.Clamp(Mathf.CeilToInt(blurExtent * 1.25f) + 5, 7, 24);
+            int segmentsPerCorner = Mathf.Clamp(Mathf.CeilToInt(outerRadius * 0.75f), 8, 32);
+            int pointsPerContour = segmentsPerCorner * 4;
+            int vertexCount = 1 + contourCount * pointsPerContour;
+            int indexCount = pointsPerContour * 3 + (contourCount - 1) * pointsPerContour * 6;
+            if (vertexCount <= 0 || vertexCount > ushort.MaxValue || indexCount <= 0)
+                return;
+
+            var vertices = new Vertex[vertexCount];
+            var indices = new ushort[indexCount];
+            Color centerColor = color;
+            vertices[0] = MakeVertex(sourceRect.center, centerColor);
+            int vi = 1;
+            int ii = 0;
+            for (int contour = 0; contour < contourCount; contour++)
+            {
+                float t = contour / (float)(contourCount - 1);
+                float expand = Mathf.Lerp(-innerExtent, blurExtent, t);
+                Rect contourRect = InflateRect(sourceRect, expand);
+                float contourRadius = Mathf.Max(0f, sourceRadius) + expand;
+                Color c = color;
+                float fade = Mathf.InverseLerp(-innerExtent, blurExtent, expand);
+                c.a = color.a * (1f - Mathf.SmoothStep(0f, 1f, fade));
+
+                var points = RoundedRectPoints(contourRect, contourRadius, segmentsPerCorner);
+                for (int i = 0; i < points.Length; i++)
+                    vertices[vi++] = MakeVertex(points[i], c);
+            }
+
+            int firstContour = 1;
+            for (int i = 0; i < pointsPerContour; i++)
+            {
+                int next = (i + 1) % pointsPerContour;
+                indices[ii++] = 0;
+                indices[ii++] = (ushort)(firstContour + i);
+                indices[ii++] = (ushort)(firstContour + next);
+            }
+
+            for (int contour = 0; contour < contourCount - 1; contour++)
+            {
+                int inner = 1 + contour * pointsPerContour;
+                int outer = 1 + (contour + 1) * pointsPerContour;
+                for (int i = 0; i < pointsPerContour; i++)
+                {
+                    int next = (i + 1) % pointsPerContour;
+                    indices[ii++] = (ushort)(inner + i);
+                    indices[ii++] = (ushort)(outer + i);
+                    indices[ii++] = (ushort)(outer + next);
+                    indices[ii++] = (ushort)(inner + i);
+                    indices[ii++] = (ushort)(outer + next);
+                    indices[ii++] = (ushort)(inner + next);
+                }
+            }
+
+            var data = ctx.Allocate(vertexCount, indexCount);
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(indices);
+        }
+
+        void PaintInnerShadow(Painter2D p, Rect rect, ShadowLayer layer)
+        {
+            float thickness = Mathf.Max(
+                1f,
+                Mathf.Abs(layer.Spread)
+                + Mathf.Max(Mathf.Abs(layer.Offset.x), Mathf.Abs(layer.Offset.y))
+                + layer.Blur);
+            int steps = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(1f, thickness) * 0.5f), 1, 8);
+            bool offsetH = Mathf.Abs(layer.Offset.x) > 0.001f;
+            bool offsetV = Mathf.Abs(layer.Offset.y) > 0.001f;
+            // 0/0 inset shadows render as a uniform ring (CSS draws an
+            // inward feather on every side). The previous behaviour of
+            // falling back to a single top strip produced a hard
+            // horizontal bar across small circular elements like
+            // border-radius:50% screws.
+            bool symmetric = !offsetH && !offsetV;
+            float outerRadius = _target.resolvedStyle.borderTopLeftRadius;
+            // 0/0 inset shadows render as a uniform inner ring so the
+            // shadow follows the element's rounded corners. Painting four
+            // axis-aligned strips here would draw a square inside a
+            // circular border-radius element (e.g. screws), which leaks
+            // sharp corners through the rounded bound.
+            if (symmetric)
+            {
+                float halfMin = Mathf.Min(rect.width, rect.height) * 0.5f;
+                if (halfMin <= 0.5f) return;
+                // On very small elements (e.g. 4×4 screws) the ring
+                // consumes most of the disc when rasterized at element
+                // size, but Chrome paints at the scaled-up screen DPI
+                // so the 1px feather is barely visible. Skip when the
+                // ring would dominate the element.
+                if (halfMin < thickness * 3f) return;
+                // Cap thickness to leave a visible inner core (>= 1px).
+                // Without this, the inner rect collapses to 0×0,
+                // RoundedRectReverse clamps its radius to 0, and the
+                // NonZero subtraction degenerates into a fully filled
+                // circle — the "black dot" artifact.
+                float ringThickness = Mathf.Min(thickness, halfMin - 0.5f);
+                if (ringThickness <= 0f) return;
+                for (int i = steps; i >= 1; i--)
+                {
+                    float t = i / (float)steps;
+                    Color c = layer.Color;
+                    c.a = layer.Color.a * t * 0.8f;
+                    p.fillColor = c;
+                    float band = ringThickness * (1f - (i - 1f) / steps);
+                    Rect inner = new Rect(
+                        rect.xMin + band,
+                        rect.yMin + band,
+                        Mathf.Max(0f, rect.width - band * 2f),
+                        Mathf.Max(0f, rect.height - band * 2f));
+                    p.BeginPath();
+                    RoundedRect(p, rect, outerRadius);
+                    RoundedRectReverse(p, inner, Mathf.Max(0f, outerRadius - band));
+                    p.Fill(FillRule.NonZero);
+                }
+                return;
+            }
+
+            bool top = offsetV && layer.Offset.y >= 0f;
+            bool bottom = offsetV && layer.Offset.y < 0f;
+            bool left = offsetH && layer.Offset.x >= 0f;
+            bool right = offsetH && layer.Offset.x < 0f;
+            for (int i = steps; i >= 1; i--)
+            {
+                float t = i / (float)steps;
+                Color c = layer.Color;
+                c.a = layer.Color.a * t * 0.8f;
+                p.fillColor = c;
+                float band = thickness * (1f - (i - 1f) / steps);
+                float r = Mathf.Min(outerRadius, band * 0.5f);
+                if (top)
+                    DrawInsetStrip(p, new Rect(rect.xMin, rect.yMin, rect.width, band), r);
+                if (bottom)
+                    DrawInsetStrip(p, new Rect(rect.xMin, rect.yMax - band, rect.width, band), r);
+                if (left)
+                    DrawInsetStrip(p, new Rect(rect.xMin, rect.yMin, band, rect.height), r);
+                if (right)
+                    DrawInsetStrip(p, new Rect(rect.xMax - band, rect.yMin, band, rect.height), r);
+            }
+        }
+
+        static void DrawInsetStrip(Painter2D p, Rect strip, float radius)
+        {
+            p.BeginPath();
+            RoundedRect(p, strip, radius);
+            p.Fill();
+        }
+
+        void PaintClippedInnerShadow(Painter2D p, Rect rect, ShadowLayer layer)
+        {
+            var polygon = ResolveClipPolygon(rect);
+            if (polygon.Count < 3)
+                return;
+
+            float thickness = Mathf.Max(
+                1f,
+                Mathf.Abs(layer.Spread)
+                + Mathf.Max(Mathf.Abs(layer.Offset.x), Mathf.Abs(layer.Offset.y))
+                + layer.Blur);
+            int steps = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(1f, thickness) * 0.5f), 1, 8);
+            bool horizontal = Mathf.Abs(layer.Offset.x) > 0.001f;
+            bool vertical = Mathf.Abs(layer.Offset.y) > 0.001f || !horizontal;
+            for (int i = steps; i >= 1; i--)
+            {
+                float t = i / (float)steps;
+                Color c = layer.Color;
+                c.a = layer.Color.a * t * 0.8f;
+                p.fillColor = c;
+                float band = thickness * (1f - (i - 1f) / steps);
+                if (vertical)
+                {
+                    var top = layer.Offset.y >= 0f;
+                    Rect strip = top
+                        ? new Rect(rect.xMin, rect.yMin, rect.width, band)
+                        : new Rect(rect.xMin, rect.yMax - band, rect.width, band);
+                    FillClippedPolygonBand(p, polygon, strip);
+                }
+                if (horizontal)
+                {
+                    var left = layer.Offset.x >= 0f;
+                    Rect strip = left
+                        ? new Rect(rect.xMin, rect.yMin, band, rect.height)
+                        : new Rect(rect.xMax - band, rect.yMin, band, rect.height);
+                    FillClippedPolygonBand(p, polygon, strip);
+                }
+            }
+        }
+
+        List<Vector2> ResolveClipPolygon(Rect rect)
+        {
+            var polygon = new List<Vector2>(_clipPoints.Length);
+            for (int i = 0; i < _clipPoints.Length; i++)
+                polygon.Add(PolygonParser.Resolve(_clipPoints[i], rect));
+            return polygon;
+        }
+
+        static void FillClippedPolygonBand(Painter2D p, List<Vector2> polygon, Rect band)
+        {
+            var clipped = ClipPolygonToRect(polygon, band);
+            if (clipped.Count < 3)
+                return;
+
+            p.BeginPath();
+            p.MoveTo(clipped[0]);
+            for (int i = 1; i < clipped.Count; i++)
+                p.LineTo(clipped[i]);
+            p.ClosePath();
+            p.Fill();
+        }
+
+        static List<Vector2> ClipPolygonToRect(List<Vector2> polygon, Rect rect)
+        {
+            var output = new List<Vector2>(polygon);
+            output = ClipPolygonEdge(output, v => v.x >= rect.xMin, (a, b) => IntersectVertical(a, b, rect.xMin));
+            output = ClipPolygonEdge(output, v => v.x <= rect.xMax, (a, b) => IntersectVertical(a, b, rect.xMax));
+            output = ClipPolygonEdge(output, v => v.y >= rect.yMin, (a, b) => IntersectHorizontal(a, b, rect.yMin));
+            output = ClipPolygonEdge(output, v => v.y <= rect.yMax, (a, b) => IntersectHorizontal(a, b, rect.yMax));
+            return output;
+        }
+
+        static List<Vector2> ClipPolygonEdge(
+            List<Vector2> input,
+            System.Func<Vector2, bool> inside,
+            System.Func<Vector2, Vector2, Vector2> intersect)
+        {
+            var output = new List<Vector2>();
+            if (input.Count == 0)
+                return output;
+
+            Vector2 prev = input[input.Count - 1];
+            bool prevInside = inside(prev);
+            for (int i = 0; i < input.Count; i++)
+            {
+                Vector2 curr = input[i];
+                bool currInside = inside(curr);
+                if (currInside)
+                {
+                    if (!prevInside)
+                        output.Add(intersect(prev, curr));
+                    output.Add(curr);
+                }
+                else if (prevInside)
+                {
+                    output.Add(intersect(prev, curr));
+                }
+                prev = curr;
+                prevInside = currInside;
+            }
+            return output;
+        }
+
+        static Vector2 IntersectVertical(Vector2 a, Vector2 b, float x)
+        {
+            float dx = b.x - a.x;
+            if (Mathf.Abs(dx) <= 0.0001f)
+                return new Vector2(x, a.y);
+            float t = Mathf.Clamp01((x - a.x) / dx);
+            return new Vector2(x, Mathf.Lerp(a.y, b.y, t));
+        }
+
+        static Vector2 IntersectHorizontal(Vector2 a, Vector2 b, float y)
+        {
+            float dy = b.y - a.y;
+            if (Mathf.Abs(dy) <= 0.0001f)
+                return new Vector2(a.x, y);
+            float t = Mathf.Clamp01((y - a.y) / dy);
+            return new Vector2(Mathf.Lerp(a.x, b.x, t), y);
+        }
+
+        void PaintGradient(MeshGenerationContext ctx, Rect rect)
+        {
+            if (!_gradient.IsValid || rect.width <= 0f || rect.height <= 0f)
+                return;
+
+            if (_clipPoints != null && _clipPoints.Length >= 3)
+            {
+                PaintPolygonLinearGradient(ctx, rect);
+                return;
+            }
+
+            float radius = RoundedRadius(rect);
+            if (radius > 0.001f)
+            {
+                PaintRoundedLinearGradient(ctx, rect, radius);
+                return;
+            }
+
+            int angle = Mathf.RoundToInt(NormalizeAngle(_gradient.AngleDegrees));
+            if (angle == 0 || angle == 90 || angle == 180 || angle == 270)
+            {
+                PaintAxisAlignedLinearGradient(ctx, rect, angle);
+                return;
+            }
+
+            Vector2[] corners = {
+                new Vector2(rect.xMin, rect.yMin),
+                new Vector2(rect.xMax, rect.yMin),
+                new Vector2(rect.xMax, rect.yMax),
+                new Vector2(rect.xMin, rect.yMax),
+            };
+            float rad = angle * Mathf.Deg2Rad;
+            Vector2 dir = new Vector2(Mathf.Sin(rad), -Mathf.Cos(rad));
+            float pMin = float.PositiveInfinity, pMax = float.NegativeInfinity;
+            foreach (var c in corners)
+            {
+                float pr = Vector2.Dot(c, dir);
+                pMin = Mathf.Min(pMin, pr);
+                pMax = Mathf.Max(pMax, pr);
+            }
+
+            var data = ctx.Allocate(4, 6);
+            var vertices = new Vertex[4];
+            for (int i = 0; i < 4; i++)
+            {
+                float t = Mathf.InverseLerp(pMin, pMax, Vector2.Dot(corners[i], dir));
+                vertices[i] = MakeVertex(corners[i], SampleGradient(_gradient, t));
+            }
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(new ushort[] { 0, 1, 2, 2, 3, 0 });
+        }
+
+        void PaintRoundedLinearGradient(MeshGenerationContext ctx, Rect rect, float radius)
+        {
+            var points = RoundedRectPoints(rect, radius);
+            var vertices = new Vertex[points.Length + 1];
+            var indices = new ushort[points.Length * 3];
+            float angle = NormalizeAngle(_gradient.AngleDegrees);
+            float rad = angle * Mathf.Deg2Rad;
+            Vector2 dir = new Vector2(Mathf.Sin(rad), -Mathf.Cos(rad));
+            Vector2[] corners = {
+                new Vector2(rect.xMin, rect.yMin),
+                new Vector2(rect.xMax, rect.yMin),
+                new Vector2(rect.xMax, rect.yMax),
+                new Vector2(rect.xMin, rect.yMax),
+            };
+            float pMin = float.PositiveInfinity;
+            float pMax = float.NegativeInfinity;
+            foreach (var c in corners)
+            {
+                float pr = Vector2.Dot(c, dir);
+                pMin = Mathf.Min(pMin, pr);
+                pMax = Mathf.Max(pMax, pr);
+            }
+
+            vertices[0] = MakeVertex(rect.center, SampleLinearGradientAtPoint(rect.center, dir, pMin, pMax));
+            for (int i = 0; i < points.Length; i++)
+            {
+                Vector2 pt = points[i];
+                vertices[i + 1] = MakeVertex(pt, SampleLinearGradientAtPoint(pt, dir, pMin, pMax));
+                indices[i * 3 + 0] = 0;
+                indices[i * 3 + 1] = (ushort)(i + 1);
+                indices[i * 3 + 2] = (ushort)(((i + 1) % points.Length) + 1);
+            }
+
+            var data = ctx.Allocate(vertices.Length, indices.Length);
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(indices);
+        }
+
+        // Paint the linear gradient inside the clip polygon by fan-triangulating
+        // from the polygon's centroid and sampling the gradient at each polygon
+        // vertex. Assumes the polygon is convex (all bridged clip-path uses are).
+        // The gradient axis still uses the element rect's diagonal extent so the
+        // CSS-spec stop positions stay consistent with non-clipped paints.
+        void PaintPolygonLinearGradient(MeshGenerationContext ctx, Rect rect)
+        {
+            int n = _clipPoints.Length;
+            float angle = NormalizeAngle(_gradient.AngleDegrees);
+            float rad = angle * Mathf.Deg2Rad;
+            Vector2 dir = new Vector2(Mathf.Sin(rad), -Mathf.Cos(rad));
+
+            Vector2[] corners = {
+                new Vector2(rect.xMin, rect.yMin),
+                new Vector2(rect.xMax, rect.yMin),
+                new Vector2(rect.xMax, rect.yMax),
+                new Vector2(rect.xMin, rect.yMax),
+            };
+            float pMin = float.PositiveInfinity, pMax = float.NegativeInfinity;
+            for (int i = 0; i < corners.Length; i++)
+            {
+                float pr = Vector2.Dot(corners[i], dir);
+                pMin = Mathf.Min(pMin, pr);
+                pMax = Mathf.Max(pMax, pr);
+            }
+
+            var polyPoints = new Vector2[n];
+            Vector2 centroid = Vector2.zero;
+            for (int i = 0; i < n; i++)
+            {
+                polyPoints[i] = PolygonParser.Resolve(_clipPoints[i], rect);
+                centroid += polyPoints[i];
+            }
+            centroid /= n;
+
+            var vertices = new Vertex[n + 1];
+            var indices = new ushort[n * 3];
+            vertices[0] = MakeVertex(centroid, SampleLinearGradientAtPoint(centroid, dir, pMin, pMax));
+            for (int i = 0; i < n; i++)
+            {
+                Vector2 pt = polyPoints[i];
+                vertices[i + 1] = MakeVertex(pt, SampleLinearGradientAtPoint(pt, dir, pMin, pMax));
+                indices[i * 3 + 0] = 0;
+                indices[i * 3 + 1] = (ushort)(i + 1);
+                indices[i * 3 + 2] = (ushort)(((i + 1) % n) + 1);
+            }
+
+            var data = ctx.Allocate(vertices.Length, indices.Length);
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(indices);
+        }
+
+        void PaintAxisAlignedLinearGradient(MeshGenerationContext ctx, Rect rect, int angle)
+        {
+            var stops = NormalizedStops(_gradient.Stops);
+            int segments = Mathf.Max(1, stops.Count - 1);
+            var vertices = new Vertex[segments * 4];
+            var indices = new ushort[segments * 6];
+            int vi = 0;
+            int ii = 0;
+            for (int i = 0; i < segments; i++)
+            {
+                var a = stops[i];
+                var b = stops[i + 1];
+                Rect strip;
+                Color c0 = a.Color;
+                Color c1 = b.Color;
+                if (angle == 90 || angle == 270)
+                {
+                    float xA = GradientX(rect, angle, a.Position);
+                    float xB = GradientX(rect, angle, b.Position);
+                    float x0 = Mathf.Min(xA, xB);
+                    float x1 = Mathf.Max(xA, xB);
+                    strip = new Rect(x0, rect.yMin, Mathf.Max(0.001f, x1 - x0), rect.height);
+                    if (xA > xB)
+                    {
+                        c0 = b.Color;
+                        c1 = a.Color;
+                    }
+                    vertices[vi + 0] = MakeVertex(new Vector2(strip.xMin, strip.yMin), c0);
+                    vertices[vi + 1] = MakeVertex(new Vector2(strip.xMax, strip.yMin), c1);
+                    vertices[vi + 2] = MakeVertex(new Vector2(strip.xMax, strip.yMax), c1);
+                    vertices[vi + 3] = MakeVertex(new Vector2(strip.xMin, strip.yMax), c0);
+                }
+                else
+                {
+                    float yA = GradientY(rect, angle, a.Position);
+                    float yB = GradientY(rect, angle, b.Position);
+                    float y0 = Mathf.Min(yA, yB);
+                    float y1 = Mathf.Max(yA, yB);
+                    strip = new Rect(rect.xMin, y0, rect.width, Mathf.Max(0.001f, y1 - y0));
+                    if (yA > yB)
+                    {
+                        c0 = b.Color;
+                        c1 = a.Color;
+                    }
+                    vertices[vi + 0] = MakeVertex(new Vector2(strip.xMin, strip.yMin), c0);
+                    vertices[vi + 1] = MakeVertex(new Vector2(strip.xMax, strip.yMin), c0);
+                    vertices[vi + 2] = MakeVertex(new Vector2(strip.xMax, strip.yMax), c1);
+                    vertices[vi + 3] = MakeVertex(new Vector2(strip.xMin, strip.yMax), c1);
+                }
+                indices[ii + 0] = (ushort)(vi + 0);
+                indices[ii + 1] = (ushort)(vi + 1);
+                indices[ii + 2] = (ushort)(vi + 2);
+                indices[ii + 3] = (ushort)(vi + 2);
+                indices[ii + 4] = (ushort)(vi + 3);
+                indices[ii + 5] = (ushort)(vi + 0);
+                vi += 4;
+                ii += 6;
+            }
+
+            var data = ctx.Allocate(vertices.Length, indices.Length);
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(indices);
+        }
+
+        void PaintRadialGradient(MeshGenerationContext ctx, Rect rect, RadialGradient radialGradient)
+        {
+            if (radialGradient == null || !radialGradient.IsValid || rect.width <= 0f || rect.height <= 0f)
+                return;
+            Vector2 center = new Vector2(
+                rect.xMin + rect.width * radialGradient.Center.x,
+                rect.yMin + rect.height * radialGradient.Center.y);
+
+            float left = Mathf.Abs(center.x - rect.xMin);
+            float right = Mathf.Abs(rect.xMax - center.x);
+            float top = Mathf.Abs(center.y - rect.yMin);
+            float bottom = Mathf.Abs(rect.yMax - center.y);
+            float rx = Mathf.Max(left, right);
+            float ry = Mathf.Max(top, bottom);
+            if (radialGradient.HasExplicitRadius)
+            {
+                rx = radialGradient.RadiusXIsPercent
+                    ? radialGradient.Radius.x * rect.width
+                    : radialGradient.Radius.x;
+                ry = radialGradient.RadiusYIsPercent
+                    ? radialGradient.Radius.y * rect.height
+                    : radialGradient.Radius.y;
+            }
+            else if (radialGradient.IsCircle)
+            {
+                float farthest = 0f;
+                farthest = Mathf.Max(farthest, Vector2.Distance(center, new Vector2(rect.xMin, rect.yMin)));
+                farthest = Mathf.Max(farthest, Vector2.Distance(center, new Vector2(rect.xMax, rect.yMin)));
+                farthest = Mathf.Max(farthest, Vector2.Distance(center, new Vector2(rect.xMax, rect.yMax)));
+                farthest = Mathf.Max(farthest, Vector2.Distance(center, new Vector2(rect.xMin, rect.yMax)));
+                rx = ry = farthest;
+            }
+            else
+            {
+                // CSS radial-gradient() defaults to ellipse farthest-corner.
+                // Using side distances directly makes edge-origin washes end
+                // too early and produces a hard visible oval in UITK. Expanding
+                // both axes reaches the farthest corner and restores the long
+                // browser-like feather.
+                const float FarthestCornerEllipse = 1.41421356f;
+                rx *= FarthestCornerEllipse;
+                ry *= FarthestCornerEllipse;
+            }
+            rx = Mathf.Max(0.001f, rx);
+            ry = Mathf.Max(0.001f, ry);
+
+            if (IsCircleLikePaintRect(rect))
+            {
+                PaintCircularClippedRadialGradient(ctx, rect, radialGradient, center, rx, ry);
+                return;
+            }
+
+            PaintRectClippedRadialGradient(ctx, rect, radialGradient, center, rx, ry);
+        }
+
+        static void PaintRectClippedRadialGradient(
+            MeshGenerationContext ctx,
+            Rect rect,
+            RadialGradient radialGradient,
+            Vector2 center,
+            float rx,
+            float ry)
+        {
+            // Paint via Painter2D ring annuli. ctx.Allocate() with a custom
+            // Vertex format silently emits zero visible mesh under Unity 6
+            // UI Toolkit (no atlas texture is bound for the colour-only
+            // path). Rings paint outer-first so inner stops composite on
+            // top. The element's overflow:hidden clips ellipses bleeding
+            // past the rect (set on the host element for paint-only).
+            var p = ctx.painter2D;
+            int steps = 32;
+            for (int i = steps; i >= 1; i--)
+            {
+                float tOuter = i / (float)steps;
+                float tInner = (i - 1) / (float)steps;
+                float midT = (tOuter + tInner) * 0.5f;
+                Color c = SampleStops(radialGradient.Stops, midT);
+                if (c.a <= 0.001f)
+                    continue;
+                float roxOuter = rx * tOuter;
+                float royOuter = ry * tOuter;
+                float roxInner = rx * tInner;
+                float royInner = ry * tInner;
+                p.fillColor = c;
+                p.BeginPath();
+                EllipsePath(p, center, roxOuter, royOuter);
+                if (i > 1)
+                {
+                    EllipsePathReverse(p, center, roxInner, royInner);
+                    p.Fill(FillRule.NonZero);
+                }
+                else
+                {
+                    p.Fill();
+                }
+            }
+        }
+
+        static void EllipsePathReverse(Painter2D p, Vector2 center, float rx, float ry)
+        {
+            int segments = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(rx, ry) * 0.5f), 24, 96);
+            for (int i = 0; i < segments; i++)
+            {
+                float a = -i / (float)segments * Mathf.PI * 2f;
+                var pt = new Vector2(
+                    center.x + Mathf.Cos(a) * rx,
+                    center.y + Mathf.Sin(a) * ry);
+                if (i == 0) p.MoveTo(pt);
+                else p.LineTo(pt);
+            }
+            p.ClosePath();
+        }
+
+        bool IsCircleLikePaintRect(Rect rect)
+        {
+            float min = Mathf.Min(rect.width, rect.height);
+            float max = Mathf.Max(rect.width, rect.height);
+            if (min <= 0f || max - min > Mathf.Max(1f, min * 0.08f))
+                return false;
+
+            var rs = _target.resolvedStyle;
+            float radius = Mathf.Min(
+                Mathf.Min(rs.borderTopLeftRadius, rs.borderTopRightRadius),
+                Mathf.Min(rs.borderBottomRightRadius, rs.borderBottomLeftRadius));
+            return radius >= min * 0.45f;
+        }
+
+        static void PaintCircularClippedRadialGradient(
+            MeshGenerationContext ctx,
+            Rect rect,
+            RadialGradient radialGradient,
+            Vector2 gradientCenter,
+            float rx,
+            float ry)
+        {
+            float circleRadius = Mathf.Min(rect.width, rect.height) * 0.5f;
+            if (circleRadius <= 0f)
+                return;
+
+            int segments = Mathf.Clamp(Mathf.CeilToInt(circleRadius * 8f), 20, 64);
+            int rings = Mathf.Clamp(Mathf.CeilToInt(circleRadius * 2f), 3, 12);
+            int vertexCount = 1 + rings * segments;
+            int indexCount = segments * 3 + (rings - 1) * segments * 6;
+            var vertices = new Vertex[vertexCount];
+            var indices = new ushort[indexCount];
+            Vector2 shapeCenter = rect.center;
+            vertices[0] = MakeVertex(
+                shapeCenter,
+                SampleRadialGradientAtPoint(shapeCenter, gradientCenter, rx, ry, radialGradient));
+
+            int vi = 1;
+            for (int ring = 1; ring <= rings; ring++)
+            {
+                float r = circleRadius * ring / rings;
+                for (int s = 0; s < segments; s++)
+                {
+                    float a = s / (float)segments * Mathf.PI * 2f;
+                    var pt = new Vector2(
+                        shapeCenter.x + Mathf.Cos(a) * r,
+                        shapeCenter.y + Mathf.Sin(a) * r);
+                    vertices[vi++] = MakeVertex(
+                        pt,
+                        SampleRadialGradientAtPoint(pt, gradientCenter, rx, ry, radialGradient));
+                }
+            }
+
+            int ii = 0;
+            for (int s = 0; s < segments; s++)
+            {
+                indices[ii++] = 0;
+                indices[ii++] = (ushort)(1 + s);
+                indices[ii++] = (ushort)(1 + ((s + 1) % segments));
+            }
+            for (int ring = 2; ring <= rings; ring++)
+            {
+                int prev = 1 + (ring - 2) * segments;
+                int curr = 1 + (ring - 1) * segments;
+                for (int s = 0; s < segments; s++)
+                {
+                    int sn = (s + 1) % segments;
+                    indices[ii++] = (ushort)(prev + s);
+                    indices[ii++] = (ushort)(curr + s);
+                    indices[ii++] = (ushort)(curr + sn);
+                    indices[ii++] = (ushort)(curr + sn);
+                    indices[ii++] = (ushort)(prev + sn);
+                    indices[ii++] = (ushort)(prev + s);
+                }
+            }
+
+            var data = ctx.Allocate(vertices.Length, indices.Length);
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(indices);
+        }
+
+        static Color SampleRadialGradientAtPoint(
+            Vector2 point,
+            Vector2 center,
+            float rx,
+            float ry,
+            RadialGradient radialGradient)
+        {
+            float dx = (point.x - center.x) / Mathf.Max(0.001f, rx);
+            float dy = (point.y - center.y) / Mathf.Max(0.001f, ry);
+            return SampleGradient(radialGradient, Mathf.Sqrt(dx * dx + dy * dy));
+        }
+
+        void PaintTiledRadialPattern(MeshGenerationContext ctx, Rect rect)
+        {
+            if (_tiledRadialPattern == null || _tiledRadialPattern.Color.a <= 0f)
+                return;
+
+            float tileW = Mathf.Max(1f, _patternSize.x);
+            float tileH = Mathf.Max(1f, _patternSize.y);
+            // CSS radial-dot textures such as
+            // radial-gradient(rgba(...) 1px, transparent 1px) are antialiased
+            // circular image tiles in the browser. A full 2r square quad reads
+            // much larger/heavier in UI Toolkit, so draw a small radial fan
+            // with a transparent edge instead.
+            float radius = Mathf.Max(0.25f, _tiledRadialPattern.RadiusPx * 0.85f);
+            float centerX = tileW * _tiledRadialPattern.Center.x;
+            float centerY = tileH * _tiledRadialPattern.Center.y;
+            const int DotSegments = 6;
+            int verticesPerDot = DotSegments + 1;
+            int indicesPerDot = DotSegments * 3;
+
+            int columns = Mathf.CeilToInt(rect.width / tileW) + 3;
+            int rows = Mathf.CeilToInt(rect.height / tileH) + 3;
+            if (columns <= 0 || rows <= 0)
+                return;
+
+            float firstX = rect.xMin + _patternPosition.x + centerX;
+            float firstY = rect.yMin + _patternPosition.y + centerY;
+            while (firstX > rect.xMin - radius) firstX -= tileW;
+            while (firstY > rect.yMin - radius) firstY -= tileH;
+
+            int dotCount = 0;
+            for (int row = 0; row < rows; row++)
+            {
+                float y = firstY + row * tileH;
+                if (y < rect.yMin - radius || y > rect.yMax + radius)
+                    continue;
+                for (int col = 0; col < columns; col++)
+                {
+                    float x = firstX + col * tileW;
+                    if (x < rect.xMin - radius || x > rect.xMax + radius)
+                        continue;
+                    dotCount++;
+                }
+            }
+            if (dotCount <= 0 || dotCount * verticesPerDot > 65000)
+                return;
+
+            var data = ctx.Allocate(dotCount * verticesPerDot, dotCount * indicesPerDot);
+            var vertices = new Vertex[dotCount * verticesPerDot];
+            var indices = new ushort[dotCount * indicesPerDot];
+            int vi = 0;
+            int ii = 0;
+            Color color = _tiledRadialPattern.Color;
+            Color edgeColor = color;
+            edgeColor.a = 0f;
+            for (int row = 0; row < rows; row++)
+            {
+                float y = firstY + row * tileH;
+                if (y < rect.yMin - radius || y > rect.yMax + radius)
+                    continue;
+                for (int col = 0; col < columns; col++)
+                {
+                    float x = firstX + col * tileW;
+                    if (x < rect.xMin - radius || x > rect.xMax + radius)
+                        continue;
+                    int centerIndex = vi;
+                    vertices[vi++] = MakeVertex(new Vector2(x, y), color);
+                    for (int s = 0; s < DotSegments; s++)
+                    {
+                        float angle = (s / (float)DotSegments) * Mathf.PI * 2f;
+                        vertices[vi++] = MakeVertex(
+                            new Vector2(
+                                x + Mathf.Cos(angle) * radius,
+                                y + Mathf.Sin(angle) * radius),
+                            edgeColor);
+                    }
+                    for (int s = 0; s < DotSegments; s++)
+                    {
+                        indices[ii++] = (ushort)centerIndex;
+                        indices[ii++] = (ushort)(centerIndex + 1 + s);
+                        indices[ii++] = (ushort)(centerIndex + 1 + ((s + 1) % DotSegments));
+                    }
+                }
+            }
+            data.SetAllVertices(vertices);
+            data.SetAllIndices(indices);
+        }
+
+        void PaintRepeatingLinearPattern(MeshGenerationContext ctx, Rect rect)
+        {
+            if (_repeatingLinearPattern == null || !_repeatingLinearPattern.IsValid)
+                return;
+
+            int angle = Mathf.RoundToInt(NormalizeAngle(_repeatingLinearPattern.AngleDegrees));
+            bool vertical = angle == 90 || angle == 270;
+            bool horizontal = angle == 0 || angle == 180;
+            if (!vertical && !horizontal)
+                return;
+
+            float axisLength = vertical ? rect.width : rect.height;
+            if (axisLength <= 0f)
+                return;
+
+            var stops = _repeatingLinearPattern.ResolveStops(axisLength);
+            if (stops.Count < 2)
+                return;
+
+            float period = Mathf.Max(0.001f, stops[stops.Count - 1].PositionPx);
+            float offset = vertical ? _patternPosition.x : _patternPosition.y;
+            offset %= period;
+            if (offset > 0f)
+                offset -= period;
+
+            int repeatCount = Mathf.CeilToInt(axisLength / period) + 3;
+            int maxQuads = repeatCount * (stops.Count - 1);
+            if (maxQuads <= 0 || maxQuads > 4096)
+                return;
+
+            var vertices = new List<Vertex>(maxQuads * 4);
+            var indices = new List<ushort>(maxQuads * 6);
+            for (int repeat = 0; repeat < repeatCount; repeat++)
+            {
+                float basePos = offset + repeat * period;
+                for (int i = 0; i < stops.Count - 1; i++)
+                {
+                    var a = stops[i];
+                    var b = stops[i + 1];
+                    float p0 = Mathf.Max(0f, basePos + a.PositionPx);
+                    float p1 = Mathf.Min(axisLength, basePos + b.PositionPx);
+                    if (p1 <= 0f || p0 >= axisLength || p1 - p0 <= 0.001f)
+                        continue;
+                    if (a.Color.a <= 0f && b.Color.a <= 0f)
+                        continue;
+                    AddPatternQuad(vertices, indices, rect, vertical, p0, p1, a.Color, b.Color);
+                }
+            }
+
+            if (vertices.Count == 0)
+                return;
+            var data = ctx.Allocate(vertices.Count, indices.Count);
+            data.SetAllVertices(vertices.ToArray());
+            data.SetAllIndices(indices.ToArray());
+        }
+
+        static void AddPatternQuad(
+            List<Vertex> vertices,
+            List<ushort> indices,
+            Rect rect,
+            bool vertical,
+            float p0,
+            float p1,
+            Color c0,
+            Color c1)
+        {
+            if (vertices.Count > ushort.MaxValue - 4)
+                return;
+            ushort vi = (ushort)vertices.Count;
+            if (vertical)
+            {
+                float x0 = rect.xMin + p0;
+                float x1 = rect.xMin + p1;
+                vertices.Add(MakeVertex(new Vector2(x0, rect.yMin), c0));
+                vertices.Add(MakeVertex(new Vector2(x1, rect.yMin), c1));
+                vertices.Add(MakeVertex(new Vector2(x1, rect.yMax), c1));
+                vertices.Add(MakeVertex(new Vector2(x0, rect.yMax), c0));
+            }
+            else
+            {
+                float y0 = rect.yMin + p0;
+                float y1 = rect.yMin + p1;
+                vertices.Add(MakeVertex(new Vector2(rect.xMin, y0), c0));
+                vertices.Add(MakeVertex(new Vector2(rect.xMax, y0), c0));
+                vertices.Add(MakeVertex(new Vector2(rect.xMax, y1), c1));
+                vertices.Add(MakeVertex(new Vector2(rect.xMin, y1), c1));
+            }
+            indices.Add(vi);
+            indices.Add((ushort)(vi + 1));
+            indices.Add((ushort)(vi + 2));
+            indices.Add((ushort)(vi + 2));
+            indices.Add((ushort)(vi + 3));
+            indices.Add(vi);
+        }
+
+        static float NormalizeAngle(float angle)
+        {
+            return (angle % 360f + 360f) % 360f;
+        }
+
+        static float GradientX(Rect r, int angle, float t)
+        {
+            return angle == 270
+                ? r.xMax - r.width * t
+                : r.xMin + r.width * t;
+        }
+
+        static float GradientY(Rect r, int angle, float t)
+        {
+            return angle == 0
+                ? r.yMax - r.height * t
+                : r.yMin + r.height * t;
+        }
+
+        static List<GradientStop> NormalizedStops(List<GradientStop> input)
+        {
+            var stops = new List<GradientStop>(input);
+            stops.Sort((a, b) => a.Position.CompareTo(b.Position));
+            if (stops.Count == 0)
+                return stops;
+            if (stops[0].Position > 0f)
+                stops.Insert(0, new GradientStop(stops[0].Color, 0f));
+            if (stops[stops.Count - 1].Position < 1f)
+                stops.Add(new GradientStop(stops[stops.Count - 1].Color, 1f));
+            return stops;
+        }
+
+        static Vertex MakeVertex(Vector2 position, Color color)
+        {
+            return new Vertex
+            {
+                position = new Vector3(position.x, position.y, Vertex.nearZ),
+                tint = (Color32)color,
+                uv = Vector2.zero,
+            };
+        }
+
+        static Color SampleGradient(LinearGradient g, float t)
+        {
+            return SampleStops(g.Stops, t);
+        }
+
+        Color SampleLinearGradientAtPoint(Vector2 point, Vector2 dir, float pMin, float pMax)
+        {
+            float t = Mathf.InverseLerp(pMin, pMax, Vector2.Dot(point, dir));
+            return SampleGradient(_gradient, t);
+        }
+
+        static Color SampleGradient(RadialGradient g, float t)
+        {
+            return SampleStops(g.Stops, t);
+        }
+
+        static Color SampleStops(System.Collections.Generic.List<GradientStop> stops, float t)
+        {
+            t = Mathf.Clamp01(t);
+            for (int i = 1; i < stops.Count; i++)
+            {
+                if (t <= stops[i].Position)
+                {
+                    var a = stops[i - 1];
+                    var b = stops[i];
+                    float span = Mathf.Max(0.0001f, b.Position - a.Position);
+                    float u = (t - a.Position) / span;
+                    return LerpPremultiplied(a.Color, b.Color, u);
+                }
+            }
+            return stops[stops.Count - 1].Color;
+        }
+
+        // Browsers interpolate gradient stops in premultiplied alpha so a
+        // `rgb(8,32,82) 0% → rgba(0,0,0,0) 55%` ramp stays vivid blue while
+        // alpha fades. Straight Color.Lerp instead pulls the live color
+        // toward the transparent stop's RGB (often black), which produces
+        // muddy mid-tones and washes out edge-origin radial backdrops.
+        static Color LerpPremultiplied(Color a, Color b, float u)
+        {
+            float ar = a.r * a.a, ag = a.g * a.a, ab = a.b * a.a, aa = a.a;
+            float br = b.r * b.a, bg = b.g * b.a, bb = b.b * b.a, ba = b.a;
+            float r = Mathf.Lerp(ar, br, u);
+            float g = Mathf.Lerp(ag, bg, u);
+            float bl = Mathf.Lerp(ab, bb, u);
+            float al = Mathf.Lerp(aa, ba, u);
+            if (al <= 0.0001f)
+                return new Color(0f, 0f, 0f, 0f);
+            return new Color(r / al, g / al, bl / al, al);
+        }
+
+        static void EllipsePath(Painter2D p, Vector2 center, float rx, float ry)
+        {
+            int segments = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(rx, ry) * 3f), 64, 192);
+            for (int i = 0; i < segments; i++)
+            {
+                float a = i / (float)segments * Mathf.PI * 2f;
+                var pt = new Vector2(
+                    center.x + Mathf.Cos(a) * rx,
+                    center.y + Mathf.Sin(a) * ry);
+                if (i == 0) p.MoveTo(pt);
+                else p.LineTo(pt);
+            }
+            p.ClosePath();
+        }
+
+        static void RoundedRect(Painter2D p, Rect r, float radius)
+        {
+            radius = Mathf.Clamp(radius, 0f, Mathf.Min(r.width, r.height) * 0.5f);
+            if (radius <= 0f)
+            {
+                p.MoveTo(new Vector2(r.xMin, r.yMin));
+                p.LineTo(new Vector2(r.xMax, r.yMin));
+                p.LineTo(new Vector2(r.xMax, r.yMax));
+                p.LineTo(new Vector2(r.xMin, r.yMax));
+                p.ClosePath();
+                return;
+            }
+            p.MoveTo(new Vector2(r.xMin + radius, r.yMin));
+            p.LineTo(new Vector2(r.xMax - radius, r.yMin));
+            p.Arc(new Vector2(r.xMax - radius, r.yMin + radius), radius, -90f, 0f);
+            p.LineTo(new Vector2(r.xMax, r.yMax - radius));
+            p.Arc(new Vector2(r.xMax - radius, r.yMax - radius), radius, 0f, 90f);
+            p.LineTo(new Vector2(r.xMin + radius, r.yMax));
+            p.Arc(new Vector2(r.xMin + radius, r.yMax - radius), radius, 90f, 180f);
+            p.LineTo(new Vector2(r.xMin, r.yMin + radius));
+            p.Arc(new Vector2(r.xMin + radius, r.yMin + radius), radius, 180f, 270f);
+            p.ClosePath();
+        }
+
+        float RoundedRadius(Rect rect)
+        {
+            return Mathf.Clamp(
+                _target.resolvedStyle.borderTopLeftRadius,
+                0f,
+                Mathf.Min(rect.width, rect.height) * 0.5f);
+        }
+
+        static Vector2[] RoundedRectPoints(Rect rect, float radius)
+        {
+            return RoundedRectPoints(rect, radius, RoundedCornerSegmentCount(radius));
+        }
+
+        static Vector2[] RoundedRectPoints(Rect rect, float radius, int segmentsPerCorner)
+        {
+            segmentsPerCorner = Mathf.Max(2, segmentsPerCorner);
+            radius = Mathf.Clamp(radius, 0f, Mathf.Min(rect.width, rect.height) * 0.5f);
+            var points = new Vector2[segmentsPerCorner * 4];
+            int i = 0;
+            AddArc(points, ref i, new Vector2(rect.xMin + radius, rect.yMin + radius), radius, 180f, 270f, segmentsPerCorner);
+            AddArc(points, ref i, new Vector2(rect.xMax - radius, rect.yMin + radius), radius, 270f, 360f, segmentsPerCorner);
+            AddArc(points, ref i, new Vector2(rect.xMax - radius, rect.yMax - radius), radius, 0f, 90f, segmentsPerCorner);
+            AddArc(points, ref i, new Vector2(rect.xMin + radius, rect.yMax - radius), radius, 90f, 180f, segmentsPerCorner);
+            return points;
+        }
+
+        static int RoundedCornerSegmentCount(float radius)
+        {
+            return Mathf.Clamp(Mathf.CeilToInt(radius * 0.75f), 12, 64);
+        }
+
+        static void AddArc(Vector2[] points, ref int index, Vector2 center, float radius, float fromDeg, float toDeg, int segments)
+        {
+            segments = Mathf.Max(2, segments);
+            for (int i = 0; i < segments; i++)
+            {
+                float t = i / (float)(segments - 1);
+                float a = Mathf.Lerp(fromDeg, toDeg, t) * Mathf.Deg2Rad;
+                points[index++] = new Vector2(center.x + Mathf.Cos(a) * radius, center.y + Mathf.Sin(a) * radius);
+            }
+        }
+
+        static void RoundedRectReverse(Painter2D p, Rect r, float radius)
+        {
+            radius = Mathf.Clamp(radius, 0f, Mathf.Min(r.width, r.height) * 0.5f);
+            if (radius <= 0f)
+            {
+                p.MoveTo(new Vector2(r.xMin, r.yMin));
+                p.LineTo(new Vector2(r.xMin, r.yMax));
+                p.LineTo(new Vector2(r.xMax, r.yMax));
+                p.LineTo(new Vector2(r.xMax, r.yMin));
+                p.ClosePath();
+                return;
+            }
+            p.MoveTo(new Vector2(r.xMin, r.yMin + radius));
+            p.LineTo(new Vector2(r.xMin, r.yMax - radius));
+            p.Arc(new Vector2(r.xMin + radius, r.yMax - radius), radius, 180f, 90f);
+            p.LineTo(new Vector2(r.xMax - radius, r.yMax));
+            p.Arc(new Vector2(r.xMax - radius, r.yMax - radius), radius, 90f, 0f);
+            p.LineTo(new Vector2(r.xMax, r.yMin + radius));
+            p.Arc(new Vector2(r.xMax - radius, r.yMin + radius), radius, 0f, -90f);
+            p.LineTo(new Vector2(r.xMin + radius, r.yMin));
+            p.Arc(new Vector2(r.xMin + radius, r.yMin + radius), radius, -90f, -180f);
+            p.ClosePath();
+        }
+
+        sealed class CssGradientLayer : VisualElement
+        {
+            const int MaxStops = 8;
+            const string ShaderName = "Hidden/ODDGames/html2uxml/CssGradient";
+
+            static readonly int FallbackColorId = Shader.PropertyToID("_FallbackColor");
+            static readonly int LinearEnabledId = Shader.PropertyToID("_LinearEnabled");
+            static readonly int LinearAngleId = Shader.PropertyToID("_LinearAngle");
+            static readonly int LinearCountId = Shader.PropertyToID("_LinearCount");
+            static readonly int LinearWidthId = Shader.PropertyToID("_LinearWidth");
+            static readonly int LinearHeightId = Shader.PropertyToID("_LinearHeight");
+            static readonly int Radial1EnabledId = Shader.PropertyToID("_Radial1Enabled");
+            static readonly int Radial1CountId = Shader.PropertyToID("_Radial1Count");
+            static readonly int Radial1CenterId = Shader.PropertyToID("_Radial1Center");
+            static readonly int Radial1RadiusId = Shader.PropertyToID("_Radial1Radius");
+            static readonly int Radial2EnabledId = Shader.PropertyToID("_Radial2Enabled");
+            static readonly int Radial2CountId = Shader.PropertyToID("_Radial2Count");
+            static readonly int Radial2CenterId = Shader.PropertyToID("_Radial2Center");
+            static readonly int Radial2RadiusId = Shader.PropertyToID("_Radial2Radius");
+
+            static readonly int[] LinearColorIds = StopIds("_LinearColor");
+            static readonly int[] LinearPosIds = StopIds("_LinearPos");
+            static readonly int[] Radial1ColorIds = StopIds("_Radial1Color");
+            static readonly int[] Radial1PosIds = StopIds("_Radial1Pos");
+            static readonly int[] Radial2ColorIds = StopIds("_Radial2Color");
+            static readonly int[] Radial2PosIds = StopIds("_Radial2Pos");
+
+            LinearGradient _linear;
+            RadialGradient _radial1;
+            RadialGradient _radial2;
+            Color _fallbackColor;
+            float _radius;
+            PolygonCorner[] _clipPoints;
+            Material _material;
+
+            public CssGradientLayer()
+            {
+                pickingMode = PickingMode.Ignore;
+                focusable = false;
+                style.position = Position.Absolute;
+                style.left = 0f;
+                style.top = 0f;
+                style.right = 0f;
+                style.bottom = 0f;
+                style.backgroundColor = Color.clear;
+                generateVisualContent += OnGenerateVisualContent;
+                // First paint can fire before layout has computed our rect
+                // (width/height = 0). When geometry settles, force a repaint
+                // so ApplyMaterialProperties runs with the real pixel dims —
+                // otherwise the gradient rolls in only after the next style
+                // bump (often "doesn't apply immediately").
+                RegisterCallback<GeometryChangedEvent>(_ => MarkDirtyRepaint());
+                RegisterCallback<DetachFromPanelEvent>(_ => DisposeMaterial());
+            }
+
+            public bool Configure(
+                LinearGradient linear,
+                RadialGradient radial1,
+                RadialGradient radial2,
+                Color fallbackColor,
+                float radius,
+                PolygonCorner[] clipPoints)
+            {
+                if (!EnsureMaterial())
+                    return false;
+                _linear = linear;
+                _radial1 = radial1;
+                _radial2 = radial2;
+                _fallbackColor = fallbackColor;
+                _radius = Mathf.Max(0f, radius);
+                _clipPoints = clipPoints;
+                // MarkDirtyRepaint elided: caller dispatches us from a style
+                // or attach path; Unity's own version bump covers the repaint
+                // and an explicit call here would throw "cannot change render
+                // data during visual tree rendering" inside UI Builder previews.
+                return true;
+            }
+
+            public void DisposeMaterial()
+            {
+                var material = _material;
+                _material = null;
+                try
+                {
+                    style.unityMaterial = null;
+                }
+                catch (MissingReferenceException)
+                {
+                    // UI Toolkit can keep a material reference in render data
+                    // for one frame after a style change. Treat stale editor
+                    // preview materials as already released.
+                }
+                catch (System.NullReferenceException)
+                {
+                }
+
+                if (material == null)
+                    return;
+                if (Application.isPlaying)
+                    UnityEngine.Object.Destroy(material);
+            }
+
+            bool EnsureMaterial()
+            {
+                if (_material != null)
+                    return true;
+                var shader = Shader.Find(ShaderName);
+                if (shader == null)
+                    return false;
+                _material = new Material(shader)
+                {
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                style.unityMaterial = _material;
+                return true;
+            }
+
+            void OnGenerateVisualContent(MeshGenerationContext ctx)
+            {
+                if (_material == null)
+                    return;
+                var rect = BorderBoxRect(this);
+                if (rect.width <= 0f || rect.height <= 0f)
+                    return;
+
+                ApplyMaterialProperties(rect);
+                if (_clipPoints != null && _clipPoints.Length >= 3)
+                {
+                    var polygonVertices = new Vertex[_clipPoints.Length + 1];
+                    var polygonIndices = new ushort[_clipPoints.Length * 3];
+                    var polygonTint = (Color32)Color.white;
+                    polygonVertices[0] = MakeUvVertex(rect.center.x, rect.center.y, 0.5f, 0.5f, polygonTint);
+                    float invW = rect.width > 0f ? 1f / rect.width : 0f;
+                    float invH = rect.height > 0f ? 1f / rect.height : 0f;
+                    for (int i = 0; i < _clipPoints.Length; i++)
+                    {
+                        var pt = PolygonParser.Resolve(_clipPoints[i], rect);
+                        float u = (pt.x - rect.xMin) * invW;
+                        float v = (pt.y - rect.yMin) * invH;
+                        polygonVertices[i + 1] = MakeUvVertex(pt.x, pt.y, u, v, polygonTint);
+                        polygonIndices[i * 3 + 0] = 0;
+                        polygonIndices[i * 3 + 1] = (ushort)(i + 1);
+                        polygonIndices[i * 3 + 2] = (ushort)(((i + 1) % _clipPoints.Length) + 1);
+                    }
+                    var polygonData = ctx.Allocate(polygonVertices.Length, polygonIndices.Length, (Texture)null);
+                    polygonData.SetAllVertices(polygonVertices);
+                    polygonData.SetAllIndices(polygonIndices);
+                    return;
+                }
+
+                float radius = Mathf.Clamp(_radius, 0f, Mathf.Min(rect.width, rect.height) * 0.5f);
+                if (radius <= 0.001f)
+                {
+                    var data = ctx.Allocate(4, 6, (Texture)null);
+                    var tint = (Color32)Color.white;
+                    data.SetAllVertices(new[]
+                    {
+                        MakeUvVertex(rect.xMin, rect.yMin, 0f, 0f, tint),
+                        MakeUvVertex(rect.xMax, rect.yMin, 1f, 0f, tint),
+                        MakeUvVertex(rect.xMax, rect.yMax, 1f, 1f, tint),
+                        MakeUvVertex(rect.xMin, rect.yMax, 0f, 1f, tint),
+                    });
+                    data.SetAllIndices(new ushort[] { 0, 1, 2, 2, 3, 0 });
+                    return;
+                }
+
+                var points = RoundedRectPoints(rect, radius);
+                var vertices = new Vertex[points.Length + 1];
+                var indices = new ushort[points.Length * 3];
+                var white = (Color32)Color.white;
+                vertices[0] = MakeUvVertex(rect.center.x, rect.center.y, 0.5f, 0.5f, white);
+                for (int i = 0; i < points.Length; i++)
+                {
+                    Vector2 pt = points[i];
+                    vertices[i + 1] = MakeUvVertex(
+                        pt.x,
+                        pt.y,
+                        Mathf.InverseLerp(rect.xMin, rect.xMax, pt.x),
+                        Mathf.InverseLerp(rect.yMin, rect.yMax, pt.y),
+                        white);
+                    indices[i * 3 + 0] = 0;
+                    indices[i * 3 + 1] = (ushort)(i + 1);
+                    indices[i * 3 + 2] = (ushort)(((i + 1) % points.Length) + 1);
+                }
+                var roundedData = ctx.Allocate(vertices.Length, indices.Length, (Texture)null);
+                roundedData.SetAllVertices(vertices);
+                roundedData.SetAllIndices(indices);
+            }
+
+            void ApplyMaterialProperties(Rect rect)
+            {
+                _material.SetColor(FallbackColorId, _fallbackColor);
+                if (_linear != null && _linear.IsValid)
+                {
+                    _material.SetFloat(LinearEnabledId, 1f);
+                    _material.SetFloat(LinearAngleId, _linear.AngleDegrees);
+                    _material.SetFloat(LinearWidthId, Mathf.Max(1f, rect.width));
+                    _material.SetFloat(LinearHeightId, Mathf.Max(1f, rect.height));
+                    SetStops(_material, _linear.Stops, LinearCountId, LinearColorIds, LinearPosIds);
+                }
+                else
+                {
+                    _material.SetFloat(LinearEnabledId, 0f);
+                    _material.SetFloat(LinearCountId, 0f);
+                }
+
+                ApplyRadial(_material, _radial1, rect, Radial1EnabledId, Radial1CountId,
+                    Radial1CenterId, Radial1RadiusId, Radial1ColorIds, Radial1PosIds);
+                ApplyRadial(_material, _radial2, rect, Radial2EnabledId, Radial2CountId,
+                    Radial2CenterId, Radial2RadiusId, Radial2ColorIds, Radial2PosIds);
+            }
+
+            static void ApplyRadial(
+                Material material,
+                RadialGradient radial,
+                Rect rect,
+                int enabledId,
+                int countId,
+                int centerId,
+                int radiusId,
+                int[] colorIds,
+                int[] posIds)
+            {
+                if (radial == null || !radial.IsValid)
+                {
+                    material.SetFloat(enabledId, 0f);
+                    material.SetFloat(countId, 0f);
+                    return;
+                }
+
+                material.SetFloat(enabledId, 1f);
+                material.SetVector(centerId, new Vector4(radial.Center.x, radial.Center.y, 0f, 0f));
+                material.SetVector(radiusId, RadiusUv(radial, rect));
+                SetStops(material, radial.Stops, countId, colorIds, posIds);
+            }
+
+            static Vector4 RadiusUv(RadialGradient radial, Rect rect)
+            {
+                float rx;
+                float ry;
+                if (radial.HasExplicitRadius)
+                {
+                    rx = radial.RadiusXIsPercent
+                        ? radial.Radius.x
+                        : radial.Radius.x / Mathf.Max(0.001f, rect.width);
+                    ry = radial.RadiusYIsPercent
+                        ? radial.Radius.y
+                        : radial.Radius.y / Mathf.Max(0.001f, rect.height);
+                }
+                else if (radial.IsCircle)
+                {
+                    Vector2 centerPx = new Vector2(radial.Center.x * rect.width, radial.Center.y * rect.height);
+                    float farthest = 0f;
+                    farthest = Mathf.Max(farthest, Vector2.Distance(centerPx, new Vector2(0f, 0f)));
+                    farthest = Mathf.Max(farthest, Vector2.Distance(centerPx, new Vector2(rect.width, 0f)));
+                    farthest = Mathf.Max(farthest, Vector2.Distance(centerPx, new Vector2(rect.width, rect.height)));
+                    farthest = Mathf.Max(farthest, Vector2.Distance(centerPx, new Vector2(0f, rect.height)));
+                    rx = farthest / Mathf.Max(0.001f, rect.width);
+                    ry = farthest / Mathf.Max(0.001f, rect.height);
+                }
+                else
+                {
+                    const float FarthestCornerEllipse = 1.41421356f;
+                    rx = Mathf.Max(radial.Center.x, 1f - radial.Center.x) * FarthestCornerEllipse;
+                    ry = Mathf.Max(radial.Center.y, 1f - radial.Center.y) * FarthestCornerEllipse;
+                }
+
+                return new Vector4(Mathf.Max(0.001f, rx), Mathf.Max(0.001f, ry), 0f, 0f);
+            }
+
+            static void SetStops(
+                Material material,
+                List<GradientStop> sourceStops,
+                int countId,
+                int[] colorIds,
+                int[] posIds)
+            {
+                var stops = NormalizedStops(sourceStops);
+                int count = Mathf.Min(MaxStops, stops.Count);
+                material.SetFloat(countId, count);
+                for (int i = 0; i < MaxStops; i++)
+                {
+                    Color color = Color.clear;
+                    float pos = 1f;
+                    if (i < count)
+                    {
+                        if (stops.Count > MaxStops)
+                        {
+                            pos = i / Mathf.Max(1f, MaxStops - 1f);
+                            color = SampleStops(stops, pos);
+                        }
+                        else
+                        {
+                            color = stops[i].Color;
+                            pos = stops[i].Position;
+                        }
+                    }
+                    material.SetColor(colorIds[i], color);
+                    material.SetFloat(posIds[i], pos);
+                }
+            }
+
+            static Rect BorderBoxRect(VisualElement element)
+            {
+                var w = element.layout.width;
+                var h = element.layout.height;
+                if (w > 0f && h > 0f)
+                    return new Rect(0f, 0f, w, h);
+                return element.contentRect;
+            }
+
+            static Vertex MakeUvVertex(float x, float y, float u, float v, Color32 tint)
+            {
+                return new Vertex
+                {
+                    position = new Vector3(x, y, Vertex.nearZ),
+                    uv = new Vector2(u, v),
+                    tint = tint,
+                };
+            }
+
+            static Vector2[] RoundedRectPoints(Rect rect, float radius)
+            {
+                int segmentsPerCorner = RoundedCornerSegmentCount(radius);
+                var points = new Vector2[(segmentsPerCorner + 1) * 4];
+                int i = 0;
+                AddArc(points, ref i, new Vector2(rect.xMin + radius, rect.yMin + radius), radius, 180f, 270f, segmentsPerCorner);
+                AddArc(points, ref i, new Vector2(rect.xMax - radius, rect.yMin + radius), radius, 270f, 360f, segmentsPerCorner);
+                AddArc(points, ref i, new Vector2(rect.xMax - radius, rect.yMax - radius), radius, 0f, 90f, segmentsPerCorner);
+                AddArc(points, ref i, new Vector2(rect.xMin + radius, rect.yMax - radius), radius, 90f, 180f, segmentsPerCorner);
+                return points;
+            }
+
+            static int RoundedCornerSegmentCount(float radius)
+            {
+                return Mathf.Clamp(Mathf.CeilToInt(radius * 0.75f), 12, 64);
+            }
+
+            static void AddArc(Vector2[] points, ref int index, Vector2 center, float radius, float fromDeg, float toDeg, int segments)
+            {
+                segments = Mathf.Max(2, segments);
+                for (int s = 0; s <= segments; s++)
+                {
+                    float t = s / (float)segments;
+                    float a = Mathf.Lerp(fromDeg, toDeg, t) * Mathf.Deg2Rad;
+                    points[index++] = new Vector2(center.x + Mathf.Cos(a) * radius, center.y + Mathf.Sin(a) * radius);
+                }
+            }
+
+            static int[] StopIds(string prefix)
+            {
+                var ids = new int[MaxStops];
+                for (int i = 0; i < MaxStops; i++)
+                    ids[i] = Shader.PropertyToID(prefix + i);
+                return ids;
+            }
+        }
+
+        sealed class ClipMaskOverlay : VisualElement
+        {
+            PolygonCorner[] _points;
+            Color _coverColor;
+
+            public ClipMaskOverlay()
+            {
+                pickingMode = PickingMode.Ignore;
+                focusable = false;
+                style.position = Position.Absolute;
+                style.left = 0f;
+                style.top = 0f;
+                style.right = 0f;
+                style.bottom = 0f;
+                generateVisualContent += OnGenerateVisualContent;
+            }
+
+            public void Configure(PolygonCorner[] points, Color coverColor)
+            {
+                _points = points;
+                _coverColor = coverColor;
+                // MarkDirtyRepaint elided: caller dispatches us from a style
+                // or attach path; Unity's own version bump covers the repaint
+                // and an explicit call here would throw "cannot change render
+                // data during visual tree rendering" inside UI Builder previews.
+            }
+
+            void OnGenerateVisualContent(MeshGenerationContext ctx)
+            {
+                if (_points == null || _points.Length < 3 || _coverColor.a <= 0.001f)
+                    return;
+                var rect = BorderBoxRect(this);
+                if (rect.width <= 0f || rect.height <= 0f)
+                    return;
+
+                var p = ctx.painter2D;
+                p.fillColor = _coverColor;
+                p.BeginPath();
+                p.MoveTo(new Vector2(rect.xMin, rect.yMin));
+                p.LineTo(new Vector2(rect.xMax, rect.yMin));
+                p.LineTo(new Vector2(rect.xMax, rect.yMax));
+                p.LineTo(new Vector2(rect.xMin, rect.yMax));
+                p.ClosePath();
+                for (int i = _points.Length - 1; i >= 0; i--)
+                {
+                    var pt = PolygonParser.Resolve(_points[i], rect);
+                    if (i == _points.Length - 1) p.MoveTo(pt);
+                    else p.LineTo(pt);
+                }
+                p.ClosePath();
+                p.Fill(FillRule.NonZero);
+            }
+
+            static Rect BorderBoxRect(VisualElement element)
+            {
+                var w = element.layout.width;
+                var h = element.layout.height;
+                if (w > 0f && h > 0f)
+                    return new Rect(0f, 0f, w, h);
+                return element.contentRect;
+            }
+        }
+
+        sealed class OuterShadowOverlay : VisualElement
+        {
+            const int MaxGpuShadowLayers = 8;
+            const string ShadowShapeShaderName = "Hidden/ODDGames/html2uxml/BoxShadowShape";
+
+            static readonly int OverlaySizeId = Shader.PropertyToID("_OverlaySize");
+            static readonly int SourceRectId = Shader.PropertyToID("_SourceRect");
+            static readonly int RadiusId = Shader.PropertyToID("_Radius");
+            static readonly int LayerCountId = Shader.PropertyToID("_LayerCount");
+            static readonly int[] ShadowIds = PropertyIds("_Shadow");
+            static readonly int[] ShadowColorIds = PropertyIds("_ShadowColor");
+
+            readonly VisualElement _track;
+            List<ShadowLayer> _layers = new List<ShadowLayer>();
+            float _radius;
+            bool _preferGpu = true;
+            bool _gpuUnavailable;
+            Material _material;
+            bool _materialBound;
+
+            public OuterShadowOverlay(VisualElement track)
+            {
+                _track = track;
+                pickingMode = PickingMode.Ignore;
+                focusable = false;
+                style.position = Position.Absolute;
+                generateVisualContent += OnGenerateVisualContent;
+                _track.RegisterCallback<GeometryChangedEvent>(OnTrackGeometry);
+                RegisterCallback<DetachFromPanelEvent>(_ => DisposeMaterial());
+                Sync();
+            }
+
+            public void Configure(List<ShadowLayer> layers, float radius, bool preferGpu)
+            {
+                _layers = layers ?? new List<ShadowLayer>();
+                _radius = Mathf.Max(0f, radius);
+                _preferGpu = preferGpu;
+                SyncMaterialBinding();
+                Sync();
+            }
+
+            void OnTrackGeometry(GeometryChangedEvent _)
+            {
+                Sync();
+            }
+
+            float MaxBlurExtent()
+            {
+                float pad = 0f;
+                for (int i = 0; i < _layers.Count; i++)
+                {
+                    var l = _layers[i];
+                    pad = Mathf.Max(pad, Mathf.Abs(l.Offset.x) + l.Blur + Mathf.Abs(l.Spread));
+                    pad = Mathf.Max(pad, Mathf.Abs(l.Offset.y) + l.Blur + Mathf.Abs(l.Spread));
+                }
+                return pad + 4f;
+            }
+
+            void Sync()
+            {
+                var trackRect = _track.layout;
+                if (trackRect.width <= 0 || trackRect.height <= 0)
+                    return;
+                float pad = MaxBlurExtent();
+                style.left = trackRect.xMin - pad;
+                style.top = trackRect.yMin - pad;
+                style.width = trackRect.width + pad * 2f;
+                style.height = trackRect.height + pad * 2f;
+            }
+
+            void OnGenerateVisualContent(MeshGenerationContext ctx)
+            {
+                if (_layers == null || _layers.Count == 0)
+                    return;
+                var trackRect = _track.layout;
+                if (trackRect.width <= 0 || trackRect.height <= 0)
+                    return;
+
+                float pad = MaxBlurExtent();
+                var sourceRect = new Rect(pad, pad, trackRect.width, trackRect.height);
+                if (_preferGpu && _materialBound && _material != null)
+                {
+                    PaintGpuShadowQuad(ctx, sourceRect);
+                    return;
+                }
+
+                for (int i = _layers.Count - 1; i >= 0; i--)
+                {
+                    var layer = _layers[i];
+                    if (layer.Color.a <= 0f) continue;
+                    PaintGaussianShadowMesh(ctx, sourceRect, _radius, layer);
+                }
+            }
+
+            bool EnsureMaterial()
+            {
+                if (_material != null)
+                    return true;
+                if (_gpuUnavailable)
+                    return false;
+
+                var shader = Shader.Find(ShadowShapeShaderName);
+                if (shader == null || !shader.isSupported)
+                {
+                    _gpuUnavailable = true;
+                    return false;
+                }
+
+                _material = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+                return true;
+            }
+
+            void SyncMaterialBinding()
+            {
+                Material material = (_preferGpu && EnsureMaterial()) ? _material : null;
+                if (material == null)
+                {
+                    if (!_materialBound)
+                        return;
+                    try
+                    {
+                        style.unityMaterial = null;
+                        _materialBound = false;
+                    }
+                    catch (System.InvalidOperationException)
+                    {
+                        schedule.Execute(SyncMaterialBinding).ExecuteLater(16);
+                    }
+                    return;
+                }
+
+                if (_materialBound)
+                    return;
+
+                try
+                {
+                    style.unityMaterial = material;
+                    _materialBound = true;
+                }
+                catch (System.InvalidOperationException)
+                {
+                    _materialBound = false;
+                    schedule.Execute(SyncMaterialBinding).ExecuteLater(16);
+                }
+            }
+
+            public void DisposeMaterial()
+            {
+                var material = _material;
+                _material = null;
+                try
+                {
+                    style.unityMaterial = null;
+                    _materialBound = false;
+                }
+                catch (MissingReferenceException)
+                {
+                }
+                catch (System.NullReferenceException)
+                {
+                }
+
+                if (material == null)
+                    return;
+                if (Application.isPlaying)
+                    Object.Destroy(material);
+                else
+                    Object.DestroyImmediate(material);
+            }
+
+            void PaintGpuShadowQuad(MeshGenerationContext ctx, Rect sourceRect)
+            {
+                if (_material == null)
+                    return;
+                var rect = BorderBoxRect(this);
+                if (rect.width <= 0f || rect.height <= 0f)
+                    return;
+
+                _material.SetVector(OverlaySizeId, new Vector4(rect.width, rect.height, 0f, 0f));
+                _material.SetVector(SourceRectId, new Vector4(sourceRect.x, sourceRect.y, sourceRect.width, sourceRect.height));
+                _material.SetFloat(RadiusId, Mathf.Max(0f, _radius));
+                int count = Mathf.Min(MaxGpuShadowLayers, _layers.Count);
+                _material.SetFloat(LayerCountId, count);
+                for (int i = 0; i < MaxGpuShadowLayers; i++)
+                {
+                    Vector4 shadow = Vector4.zero;
+                    Color color = Color.clear;
+                    if (i < count)
+                    {
+                        var layer = _layers[i];
+                        shadow = new Vector4(layer.Offset.x, layer.Offset.y, Mathf.Max(0f, layer.Blur), layer.Spread);
+                        color = layer.Color;
+                    }
+                    _material.SetVector(ShadowIds[i], shadow);
+                    _material.SetColor(ShadowColorIds[i], color);
+                }
+
+                var data = ctx.Allocate(4, 6, (Texture)null);
+                var tint = (Color32)Color.white;
+                data.SetAllVertices(new[]
+                {
+                    MakeUvVertex(rect.xMin, rect.yMin, 0f, 0f, tint),
+                    MakeUvVertex(rect.xMax, rect.yMin, 1f, 0f, tint),
+                    MakeUvVertex(rect.xMax, rect.yMax, 1f, 1f, tint),
+                    MakeUvVertex(rect.xMin, rect.yMax, 0f, 1f, tint),
+                });
+                data.SetAllIndices(new ushort[] { 0, 1, 2, 2, 3, 0 });
+            }
+
+            static void PaintGaussianShadowMesh(MeshGenerationContext ctx, Rect rect, float radius, ShadowLayer layer)
+            {
+                Rect baseRect = InflateRect(new Rect(rect.x + layer.Offset.x, rect.y + layer.Offset.y, rect.width, rect.height), layer.Spread);
+                if (baseRect.width <= 0.001f || baseRect.height <= 0.001f) return;
+
+                float blur = Mathf.Max(0.5f, layer.Blur);
+                float baseRadius = Mathf.Max(0f, radius + layer.Spread);
+                float outerRadius = baseRadius + blur;
+                float innerExtent = Mathf.Min(blur, Mathf.Max(0f, Mathf.Min(baseRect.width, baseRect.height) * 0.5f - 0.5f));
+                int contourCount = Mathf.Clamp(Mathf.CeilToInt(blur * 1.25f) + 5, 7, 24);
+                int segmentsPerCorner = Mathf.Clamp(Mathf.CeilToInt(outerRadius * 0.75f), 8, 32);
+                int pointsPerContour = segmentsPerCorner * 4;
+                int vertexCount = 1 + contourCount * pointsPerContour;
+                int indexCount = pointsPerContour * 3 + (contourCount - 1) * pointsPerContour * 6;
+                if (vertexCount <= 0 || vertexCount > ushort.MaxValue || indexCount <= 0)
+                    return;
+
+                var vertices = new Vertex[vertexCount];
+                var indices = new ushort[indexCount];
+                vertices[0] = MakeVertex(baseRect.center, layer.Color);
+                int vi = 1;
+                int ii = 0;
+                for (int c = 0; c < contourCount; c++)
+                {
+                    float t = c / (float)(contourCount - 1);
+                    float expand = Mathf.Lerp(-innerExtent, blur, t);
+                    Rect contourRect = InflateRect(baseRect, expand);
+                    float contourRadius = Mathf.Max(0f, baseRadius + expand);
+                    Color cc = layer.Color;
+                    float fade = Mathf.InverseLerp(-innerExtent, blur, expand);
+                    cc.a = layer.Color.a * (1f - Mathf.SmoothStep(0f, 1f, fade));
+                    var pts = RoundedRectPoints(contourRect, contourRadius, segmentsPerCorner);
+                    for (int i = 0; i < pts.Length; i++)
+                        vertices[vi++] = MakeVertex(pts[i], cc);
+                }
+
+                int firstContour = 1;
+                for (int i = 0; i < pointsPerContour; i++)
+                {
+                    int next = (i + 1) % pointsPerContour;
+                    indices[ii++] = 0;
+                    indices[ii++] = (ushort)(firstContour + i);
+                    indices[ii++] = (ushort)(firstContour + next);
+                }
+                for (int c = 0; c < contourCount - 1; c++)
+                {
+                    int inner = 1 + c * pointsPerContour;
+                    int outer = 1 + (c + 1) * pointsPerContour;
+                    for (int i = 0; i < pointsPerContour; i++)
+                    {
+                        int next = (i + 1) % pointsPerContour;
+                        indices[ii++] = (ushort)(inner + i);
+                        indices[ii++] = (ushort)(outer + i);
+                        indices[ii++] = (ushort)(outer + next);
+                        indices[ii++] = (ushort)(inner + i);
+                        indices[ii++] = (ushort)(outer + next);
+                        indices[ii++] = (ushort)(inner + next);
+                    }
+                }
+
+                var data = ctx.Allocate(vertexCount, indexCount);
+                data.SetAllVertices(vertices);
+                data.SetAllIndices(indices);
+            }
+
+            static Rect InflateRect(Rect r, float by)
+            {
+                return new Rect(r.x - by, r.y - by, r.width + by * 2f, r.height + by * 2f);
+            }
+
+            static Vertex MakeVertex(Vector2 pos, Color color)
+            {
+                return new Vertex
+                {
+                    position = new Vector3(pos.x, pos.y, Vertex.nearZ),
+                    tint = color,
+                };
+            }
+
+            static Vertex MakeUvVertex(float x, float y, float u, float v, Color32 tint)
+            {
+                return new Vertex
+                {
+                    position = new Vector3(x, y, Vertex.nearZ),
+                    uv = new Vector2(u, v),
+                    tint = tint,
+                };
+            }
+
+            static Rect BorderBoxRect(VisualElement element)
+            {
+                var w = element.layout.width;
+                var h = element.layout.height;
+                if (w > 0f && h > 0f)
+                    return new Rect(0f, 0f, w, h);
+                return element.contentRect;
+            }
+
+            static Vector2[] RoundedRectPoints(Rect r, float radius, int segmentsPerCorner)
+            {
+                radius = Mathf.Clamp(radius, 0f, Mathf.Min(r.width, r.height) * 0.5f);
+                int total = segmentsPerCorner * 4;
+                var pts = new Vector2[total];
+                int pi = 0;
+                AddCorner(pts, ref pi, new Vector2(r.xMax - radius, r.yMin + radius), radius, 270f, 360f, segmentsPerCorner);
+                AddCorner(pts, ref pi, new Vector2(r.xMax - radius, r.yMax - radius), radius, 0f, 90f, segmentsPerCorner);
+                AddCorner(pts, ref pi, new Vector2(r.xMin + radius, r.yMax - radius), radius, 90f, 180f, segmentsPerCorner);
+                AddCorner(pts, ref pi, new Vector2(r.xMin + radius, r.yMin + radius), radius, 180f, 270f, segmentsPerCorner);
+                return pts;
+            }
+
+            static void AddCorner(Vector2[] pts, ref int pi, Vector2 center, float radius, float startDeg, float endDeg, int segments)
+            {
+                for (int i = 0; i < segments; i++)
+                {
+                    float t = (i + 0.5f) / segments;
+                    float a = Mathf.Lerp(startDeg, endDeg, t) * Mathf.Deg2Rad;
+                    pts[pi++] = center + new Vector2(Mathf.Cos(a) * radius, Mathf.Sin(a) * radius);
+                }
+            }
+
+            static int[] PropertyIds(string prefix)
+            {
+                var ids = new int[MaxGpuShadowLayers];
+                for (int i = 0; i < MaxGpuShadowLayers; i++)
+                    ids[i] = Shader.PropertyToID(prefix + i);
+                return ids;
+            }
+        }
+
+        sealed class InsetShadowOverlay : VisualElement
+        {
+            const int MaxGpuShadowLayers = 8;
+            const string InsetShadowShaderName = "Hidden/ODDGames/html2uxml/InsetShadowShape";
+
+            static readonly int OverlaySizeId = Shader.PropertyToID("_OverlaySize");
+            static readonly int SourceRectId = Shader.PropertyToID("_SourceRect");
+            static readonly int RadiusId = Shader.PropertyToID("_Radius");
+            static readonly int LayerCountId = Shader.PropertyToID("_LayerCount");
+            static readonly int[] ShadowIds = PropertyIds("_Shadow");
+            static readonly int[] ShadowColorIds = PropertyIds("_ShadowColor");
+
+            List<ShadowLayer> _layers = new List<ShadowLayer>();
+            float _radius;
+            bool _preferGpu = true;
+            bool _gpuUnavailable;
+            Material _material;
+            bool _materialBound;
+
+            public InsetShadowOverlay()
+            {
+                pickingMode = PickingMode.Ignore;
+                focusable = false;
+                style.position = Position.Absolute;
+                style.left = 0f;
+                style.top = 0f;
+                style.right = 0f;
+                style.bottom = 0f;
+                generateVisualContent += OnGenerateVisualContent;
+                RegisterCallback<DetachFromPanelEvent>(_ => DisposeMaterial());
+            }
+
+            public void Configure(List<ShadowLayer> layers, float radius, bool preferGpu)
+            {
+                _layers = layers ?? new List<ShadowLayer>();
+                _radius = Mathf.Max(0f, radius);
+                _preferGpu = preferGpu;
+                SyncMaterialBinding();
+            }
+
+            public void DisposeMaterial()
+            {
+                var material = _material;
+                _material = null;
+                try
+                {
+                    style.unityMaterial = null;
+                    _materialBound = false;
+                }
+                catch (MissingReferenceException)
+                {
+                }
+                catch (System.NullReferenceException)
+                {
+                }
+
+                if (material == null)
+                    return;
+                if (Application.isPlaying)
+                    Object.Destroy(material);
+                else
+                    Object.DestroyImmediate(material);
+            }
+
+            bool EnsureMaterial()
+            {
+                if (_material != null)
+                    return true;
+                if (_gpuUnavailable)
+                    return false;
+
+                var shader = Shader.Find(InsetShadowShaderName);
+                if (shader == null || !shader.isSupported)
+                {
+                    _gpuUnavailable = true;
+                    return false;
+                }
+
+                _material = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+                return true;
+            }
+
+            void OnGenerateVisualContent(MeshGenerationContext ctx)
+            {
+                if (_layers == null || _layers.Count == 0)
+                    return;
+                var rect = BorderBoxRect(this);
+                if (rect.width <= 0f || rect.height <= 0f)
+                    return;
+
+                if (_preferGpu && _materialBound && _material != null)
+                {
+                    PaintGpuInsetQuad(ctx, rect);
+                    return;
+                }
+
+                var painter = ctx.painter2D;
+                for (int i = _layers.Count - 1; i >= 0; i--)
+                {
+                    if (_layers[i].Color.a > 0f)
+                        PaintInset(painter, rect, _layers[i], _radius);
+                }
+            }
+
+            void PaintGpuInsetQuad(MeshGenerationContext ctx, Rect rect)
+            {
+                _material.SetVector(OverlaySizeId, new Vector4(rect.width, rect.height, 0f, 0f));
+                _material.SetVector(SourceRectId, new Vector4(rect.x, rect.y, rect.width, rect.height));
+                _material.SetFloat(RadiusId, Mathf.Max(0f, _radius));
+                int count = Mathf.Min(MaxGpuShadowLayers, _layers.Count);
+                _material.SetFloat(LayerCountId, count);
+                for (int i = 0; i < MaxGpuShadowLayers; i++)
+                {
+                    Vector4 shadow = Vector4.zero;
+                    Color color = Color.clear;
+                    if (i < count)
+                    {
+                        var layer = _layers[i];
+                        shadow = new Vector4(layer.Offset.x, layer.Offset.y, Mathf.Max(0f, layer.Blur), layer.Spread);
+                        color = layer.Color;
+                    }
+                    _material.SetVector(ShadowIds[i], shadow);
+                    _material.SetColor(ShadowColorIds[i], color);
+                }
+
+                var data = ctx.Allocate(4, 6, (Texture)null);
+                var tint = (Color32)Color.white;
+                data.SetAllVertices(new[]
+                {
+                    MakeUvVertex(rect.xMin, rect.yMin, 0f, 0f, tint),
+                    MakeUvVertex(rect.xMax, rect.yMin, 1f, 0f, tint),
+                    MakeUvVertex(rect.xMax, rect.yMax, 1f, 1f, tint),
+                    MakeUvVertex(rect.xMin, rect.yMax, 0f, 1f, tint),
+                });
+                data.SetAllIndices(new ushort[] { 0, 1, 2, 2, 3, 0 });
+            }
+
+            void SyncMaterialBinding()
+            {
+                Material material = (_preferGpu && EnsureMaterial()) ? _material : null;
+                if (material == null)
+                {
+                    if (!_materialBound)
+                        return;
+                    try
+                    {
+                        style.unityMaterial = null;
+                        _materialBound = false;
+                    }
+                    catch (System.InvalidOperationException)
+                    {
+                        schedule.Execute(SyncMaterialBinding).ExecuteLater(16);
+                    }
+                    return;
+                }
+
+                if (_materialBound)
+                    return;
+
+                try
+                {
+                    style.unityMaterial = material;
+                    _materialBound = true;
+                }
+                catch (System.InvalidOperationException)
+                {
+                    _materialBound = false;
+                    schedule.Execute(SyncMaterialBinding).ExecuteLater(16);
+                }
+            }
+
+            static void PaintInset(Painter2D p, Rect rect, ShadowLayer layer, float radius)
+            {
+                float thickness = Mathf.Max(
+                    1f,
+                    Mathf.Abs(layer.Spread)
+                    + Mathf.Max(Mathf.Abs(layer.Offset.x), Mathf.Abs(layer.Offset.y))
+                    + layer.Blur);
+                int steps = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(1f, thickness) * 0.5f), 1, 8);
+                bool horizontal = Mathf.Abs(layer.Offset.x) > 0.001f;
+                bool vertical = Mathf.Abs(layer.Offset.y) > 0.001f || !horizontal;
+                for (int i = steps; i >= 1; i--)
+                {
+                    float t = i / (float)steps;
+                    Color c = layer.Color;
+                    c.a = layer.Color.a * t * 0.8f;
+                    p.fillColor = c;
+                    float band = thickness * (1f - (i - 1f) / steps);
+                    if (vertical)
+                    {
+                        var top = layer.Offset.y >= 0f;
+                        Rect strip = top
+                            ? new Rect(rect.xMin, rect.yMin, rect.width, band)
+                            : new Rect(rect.xMin, rect.yMax - band, rect.width, band);
+                        p.BeginPath();
+                        RoundedRect(p, strip, Mathf.Min(radius, band * 0.5f));
+                        p.Fill();
+                    }
+                    if (horizontal)
+                    {
+                        var left = layer.Offset.x >= 0f;
+                        Rect strip = left
+                            ? new Rect(rect.xMin, rect.yMin, band, rect.height)
+                            : new Rect(rect.xMax - band, rect.yMin, band, rect.height);
+                        p.BeginPath();
+                        RoundedRect(p, strip, Mathf.Min(radius, band * 0.5f));
+                        p.Fill();
+                    }
+                }
+            }
+
+            static Rect BorderBoxRect(VisualElement element)
+            {
+                var w = element.layout.width;
+                var h = element.layout.height;
+                if (w > 0f && h > 0f)
+                    return new Rect(0f, 0f, w, h);
+                return element.contentRect;
+            }
+
+            static Vertex MakeUvVertex(float x, float y, float u, float v, Color32 tint)
+            {
+                return new Vertex
+                {
+                    position = new Vector3(x, y, Vertex.nearZ),
+                    uv = new Vector2(u, v),
+                    tint = tint,
+                };
+            }
+
+            static int[] PropertyIds(string prefix)
+            {
+                var ids = new int[MaxGpuShadowLayers];
+                for (int i = 0; i < MaxGpuShadowLayers; i++)
+                    ids[i] = Shader.PropertyToID(prefix + i);
+                return ids;
+            }
+        }
+        sealed class VectorIconOverlay : VisualElement
+        {
+            string _icon;
+            Color _color = Color.black;
+
+            public VectorIconOverlay()
+            {
+                pickingMode = PickingMode.Ignore;
+                focusable = false;
+                style.position = Position.Absolute;
+                style.left = 0f;
+                style.top = 0f;
+                style.right = 0f;
+                style.bottom = 0f;
+                generateVisualContent += OnGenerateVisualContent;
+            }
+
+            public void Configure(string icon, Color color)
+            {
+                _icon = icon;
+                _color = color.a > 0.001f ? color : Color.black;
+                // MarkDirtyRepaint elided: caller dispatches us from a style
+                // or attach path; Unity's own version bump covers the repaint
+                // and an explicit call here would throw "cannot change render
+                // data during visual tree rendering" inside UI Builder previews.
+            }
+
+            void OnGenerateVisualContent(MeshGenerationContext ctx)
+            {
+                if (_icon != "star")
+                    return;
+                var rect = BorderBoxRect(this);
+                if (rect.width <= 0f || rect.height <= 0f)
+                    return;
+                var center = rect.center;
+                float outer = Mathf.Min(rect.width, rect.height) * 0.29f;
+                float inner = outer * 0.45f;
+
+                var p = ctx.painter2D;
+                p.fillColor = _color;
+                p.BeginPath();
+                for (int i = 0; i < 10; i++)
+                {
+                    float radius = (i % 2 == 0) ? outer : inner;
+                    float angle = (-90f + i * 36f) * Mathf.Deg2Rad;
+                    var pt = new Vector2(
+                        center.x + Mathf.Cos(angle) * radius,
+                        center.y + Mathf.Sin(angle) * radius);
+                    if (i == 0) p.MoveTo(pt);
+                    else p.LineTo(pt);
+                }
+                p.ClosePath();
+                p.Fill();
+            }
+
+            static Rect BorderBoxRect(VisualElement element)
+            {
+                var w = element.layout.width;
+                var h = element.layout.height;
+                if (w > 0f && h > 0f)
+                    return new Rect(0f, 0f, w, h);
+                return element.contentRect;
+            }
+        }
+
+        sealed class MaskFadeOverlay : VisualElement
+        {
+            const int MaxStops = 8;
+            const string ShaderName = "Hidden/ODDGames/html2uxml/CssGradient";
+
+            static readonly int FallbackColorId = Shader.PropertyToID("_FallbackColor");
+            static readonly int LinearEnabledId = Shader.PropertyToID("_LinearEnabled");
+            static readonly int LinearAngleId = Shader.PropertyToID("_LinearAngle");
+            static readonly int LinearCountId = Shader.PropertyToID("_LinearCount");
+            static readonly int LinearWidthId = Shader.PropertyToID("_LinearWidth");
+            static readonly int LinearHeightId = Shader.PropertyToID("_LinearHeight");
+            static readonly int Radial1EnabledId = Shader.PropertyToID("_Radial1Enabled");
+            static readonly int Radial1CountId = Shader.PropertyToID("_Radial1Count");
+            static readonly int Radial2EnabledId = Shader.PropertyToID("_Radial2Enabled");
+            static readonly int Radial2CountId = Shader.PropertyToID("_Radial2Count");
+            static readonly int[] LinearColorIds = StopIds("_LinearColor");
+            static readonly int[] LinearPosIds = StopIds("_LinearPos");
+
+            MaskGradient _mask;
+            Color _fadeColor;
+            bool _gpuUnavailable;
+            Material _material;
+            bool _materialBound;
+
+            public MaskFadeOverlay()
+            {
+                pickingMode = PickingMode.Ignore;
+                focusable = false;
+                style.position = Position.Absolute;
+                style.left = 0f;
+                style.top = 0f;
+                style.right = 0f;
+                style.bottom = 0f;
+                generateVisualContent += OnGenerateVisualContent;
+                RegisterCallback<DetachFromPanelEvent>(_ => DisposeMaterial());
+            }
+
+            public void Configure(string maskStr, Color fadeColor)
+            {
+                _mask = MaskGradientParser.Parse(maskStr);
+                _fadeColor = fadeColor;
+                SyncMaterialBinding();
+            }
+
+            public void DisposeMaterial()
+            {
+                var material = _material;
+                _material = null;
+                try
+                {
+                    style.unityMaterial = null;
+                    _materialBound = false;
+                }
+                catch (MissingReferenceException)
+                {
+                }
+                catch (System.NullReferenceException)
+                {
+                }
+
+                if (material == null)
+                    return;
+                if (Application.isPlaying)
+                    Object.Destroy(material);
+                else
+                    Object.DestroyImmediate(material);
+            }
+
+            bool EnsureMaterial()
+            {
+                if (_material != null)
+                    return true;
+                if (_gpuUnavailable)
+                    return false;
+                var shader = Shader.Find(ShaderName);
+                if (shader == null || !shader.isSupported)
+                {
+                    _gpuUnavailable = true;
+                    return false;
+                }
+                _material = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+                return true;
+            }
+
+            void SyncMaterialBinding()
+            {
+                Material material = (_mask != null && _mask.IsAxisAligned && _fadeColor.a > 0f && EnsureMaterial())
+                    ? _material
+                    : null;
+                if (material == null)
+                {
+                    if (!_materialBound)
+                        return;
+                    try
+                    {
+                        style.unityMaterial = null;
+                        _materialBound = false;
+                    }
+                    catch (System.InvalidOperationException)
+                    {
+                        schedule.Execute(SyncMaterialBinding).ExecuteLater(16);
+                    }
+                    return;
+                }
+
+                if (_materialBound)
+                    return;
+
+                try
+                {
+                    style.unityMaterial = material;
+                    _materialBound = true;
+                }
+                catch (System.InvalidOperationException)
+                {
+                    _materialBound = false;
+                    schedule.Execute(SyncMaterialBinding).ExecuteLater(16);
+                }
+            }
+
+            void OnGenerateVisualContent(MeshGenerationContext ctx)
+            {
+                if (_mask == null || !_mask.IsAxisAligned || _fadeColor.a <= 0f)
+                    return;
+                var rect = BorderBoxRect(this);
+                if (rect.width <= 0f || rect.height <= 0f)
+                    return;
+
+                if (_materialBound && _material != null)
+                {
+                    ApplyMaterialProperties(rect);
+                    var data = ctx.Allocate(4, 6, (Texture)null);
+                    var tint = (Color32)Color.white;
+                    data.SetAllVertices(new[]
+                    {
+                        MakeUvVertex(rect.xMin, rect.yMin, 0f, 0f, tint),
+                        MakeUvVertex(rect.xMax, rect.yMin, 1f, 0f, tint),
+                        MakeUvVertex(rect.xMax, rect.yMax, 1f, 1f, tint),
+                        MakeUvVertex(rect.xMin, rect.yMax, 0f, 1f, tint),
+                    });
+                    data.SetAllIndices(new ushort[] { 0, 1, 2, 2, 3, 0 });
+                    return;
+                }
+
+                PaintFallback(ctx, rect);
+            }
+
+            void ApplyMaterialProperties(Rect rect)
+            {
+                _material.SetColor(FallbackColorId, Color.clear);
+                _material.SetFloat(LinearEnabledId, 1f);
+                _material.SetFloat(LinearAngleId, _mask.AngleDegrees);
+                _material.SetFloat(LinearWidthId, Mathf.Max(1f, rect.width));
+                _material.SetFloat(LinearHeightId, Mathf.Max(1f, rect.height));
+                _material.SetFloat(Radial1EnabledId, 0f);
+                _material.SetFloat(Radial1CountId, 0f);
+                _material.SetFloat(Radial2EnabledId, 0f);
+                _material.SetFloat(Radial2CountId, 0f);
+
+                var stops = ResolveFadeStops(rect);
+                int count = Mathf.Min(MaxStops, stops.Count);
+                _material.SetFloat(LinearCountId, count);
+                for (int i = 0; i < MaxStops; i++)
+                {
+                    Color color = Color.clear;
+                    float pos = 1f;
+                    if (i < count)
+                    {
+                        color = stops[i].Color;
+                        pos = stops[i].Position;
+                    }
+                    _material.SetColor(LinearColorIds[i], color);
+                    _material.SetFloat(LinearPosIds[i], pos);
+                }
+            }
+
+            List<GradientStop> ResolveFadeStops(Rect rect)
+            {
+                float axisLength = IsHorizontal(_mask.AngleDegrees) ? rect.width : rect.height;
+                var stops = new List<GradientStop>(_mask.Stops.Count + 2);
+                for (int i = 0; i < _mask.Stops.Count; i++)
+                {
+                    float fallback = i / Mathf.Max(1f, _mask.Stops.Count - 1f);
+                    float position = _mask.Stops[i].HasPosition
+                        ? _mask.Stops[i].Position.Resolve(axisLength, fallback)
+                        : fallback;
+                    if (stops.Count > 0 && position < stops[stops.Count - 1].Position)
+                        position = stops[stops.Count - 1].Position;
+                    Color color = _fadeColor;
+                    color.a *= 1f - Mathf.Clamp01(_mask.Stops[i].Color.a);
+                    stops.Add(new GradientStop(color, Mathf.Clamp01(position)));
+                }
+                if (stops.Count == 0)
+                {
+                    stops.Add(new GradientStop(Color.clear, 0f));
+                    stops.Add(new GradientStop(_fadeColor, 1f));
+                }
+                else
+                {
+                    if (stops[0].Position > 0f)
+                        stops.Insert(0, new GradientStop(stops[0].Color, 0f));
+                    if (stops[stops.Count - 1].Position < 1f)
+                        stops.Add(new GradientStop(stops[stops.Count - 1].Color, 1f));
+                }
+                return stops;
+            }
+
+            void PaintFallback(MeshGenerationContext ctx, Rect rect)
+            {
+                var p = ctx.painter2D;
+                int angle = Mathf.RoundToInt((_mask.AngleDegrees % 360f + 360f) % 360f);
+                bool horizontal = angle == 90 || angle == 270;
+                float axisLength = horizontal ? rect.width : rect.height;
+                const int Bands = 32;
+                for (int i = 0; i < Bands; i++)
+                {
+                    float t0 = i / (float)Bands;
+                    float t1 = (i + 1) / (float)Bands;
+                    float sampleT = (t0 + t1) * 0.5f;
+                    float alpha = 1f - Mathf.Clamp01(_mask.SampleAlpha(sampleT, axisLength));
+                    if (alpha <= 0.001f) continue;
+                    Color c = _fadeColor;
+                    c.a *= alpha;
+                    p.fillColor = c;
+                    p.BeginPath();
+                    RoundedRect(p, BandRect(rect, angle, t0, t1), 0f);
+                    p.Fill();
+                }
+            }
+
+            static bool IsHorizontal(float angleDegrees)
+            {
+                int angle = Mathf.RoundToInt((angleDegrees % 360f + 360f) % 360f);
+                return angle == 90 || angle == 270;
+            }
+
+            static Rect BandRect(Rect rect, int angle, float t0, float t1)
+            {
+                switch (angle)
+                {
+                    case 0:
+                        return new Rect(rect.x, rect.y + rect.height * (1f - t1), rect.width, rect.height * (t1 - t0));
+                    case 90:
+                        return new Rect(rect.x + rect.width * t0, rect.y, rect.width * (t1 - t0), rect.height);
+                    case 270:
+                        return new Rect(rect.x + rect.width * (1f - t1), rect.y, rect.width * (t1 - t0), rect.height);
+                    default:
+                        return new Rect(rect.x, rect.y + rect.height * t0, rect.width, rect.height * (t1 - t0));
+                }
+            }
+
+            static Rect BorderBoxRect(VisualElement element)
+            {
+                var w = element.layout.width;
+                var h = element.layout.height;
+                if (w > 0f && h > 0f)
+                    return new Rect(0f, 0f, w, h);
+                return element.contentRect;
+            }
+
+            static Vertex MakeUvVertex(float x, float y, float u, float v, Color32 tint)
+            {
+                return new Vertex
+                {
+                    position = new Vector3(x, y, Vertex.nearZ),
+                    uv = new Vector2(u, v),
+                    tint = tint,
+                };
+            }
+
+            static int[] StopIds(string prefix)
+            {
+                var ids = new int[MaxStops];
+                for (int i = 0; i < MaxStops; i++)
+                    ids[i] = Shader.PropertyToID(prefix + i);
+                return ids;
+            }
+        }
+    }
+}

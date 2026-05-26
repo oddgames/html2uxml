@@ -1,27 +1,5 @@
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-.eggs/
-.venv/
-venv/
-build/
-dist/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.cache/
-*.uxml.out
-*.uss.out
-
-# Local conversion output and browser-render snapshots
-out_*/
-rendered-from-cli.html
-.tmp/
-sample/
-sample2/
-
-# Local Unity scratch projects and generated Unity caches
+# Local Unity scratch projects and generated caches. This repo IS the package,
+# but you may sometimes embed it inside a host Unity project living next to it.
 UnityProj_*/
 [Ll]ibrary/
 [Tt]emp/
@@ -30,8 +8,23 @@ UnityProj_*/
 [Bb]uilds/
 [Ll]ogs/
 [Uu]ser[Ss]ettings/
+
+# Visual Studio / Rider project files (Unity regenerates these)
 *.csproj
 *.sln
+*.slnx
+*.user
+*.suo
 
-# Local agent/editor state
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vs/
+.idea/
+
+# Local agent / editor state
 .claude/
+
+# Local scratch
+.tmp/
+dist/

@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate package.json
+        run: |
+          test -f package.json
+          node -e "
+            const pkg = require('./package.json');
+            if (!pkg.name) throw new Error('package.json missing name');
+            if (!pkg.version) throw new Error('package.json missing version');
+            if (!pkg.unity) throw new Error('package.json missing unity');
+            console.log('OK', pkg.name, pkg.version, 'unity', pkg.unity);
+          "
+
+      - name: Check package layout
+        run: |
+          test -d Runtime
+          test -d Editor
+          test -f LICENSE.md
+          test -f CHANGELOG.md
+          test -f README.md
+
+      - name: Check every asset has a .meta sibling
+        run: |
+          missing=0
+          while IFS= read -r f; do
+            case "$f" in
+              *.meta) continue ;;
+            esac
+            if [ ! -e "$f.meta" ]; then
+              echo "::error file=$f::Asset is missing a .meta file"
+              missing=$((missing+1))
+            fi
+          done < <(find Runtime Editor Shaders -type f 2>/dev/null)
+          if [ "$missing" -gt 0 ]; then
+            echo "Missing $missing .meta files"
+            exit 1
+          fi
+
+      - name: Check package.json version matches latest CHANGELOG entry
+        run: |
+          pkg_version=$(node -p "require('./package.json').version")
+          if ! grep -q "## \[${pkg_version}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$pkg_version]' section"
+            exit 1
+          fi
+          echo "OK ${pkg_version}"
