@@ -1,7 +1,7 @@
 {
   "name": "au.com.oddgames.html2uxml",
   "version": "0.1.0",
-  "displayName": "ODD Games html2uxml",
+  "displayName": "html2uxml",
   "description": "ODD Games html2uxml: Unity Editor importer plus runtime bridge elements, filters, and rendering resources for converting HTML/CSS into UI Toolkit UXML/USS.",
   "unity": "6000.3",
   "keywords": [
